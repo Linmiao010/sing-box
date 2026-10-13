@@ -44,20 +44,89 @@
 ### VPS专用一键脚本如下：快捷方式：```sb```
 
 ```
-bash <(wget -qO- https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh)
+bash <(wget -qO- https://raw.githubusercontent.com/Linmiao010/sing-box/main/sb.sh)
 ```
 或者
 ```
-bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/Linmiao010/sing-box/main/sb.sh)
 ```
 
-一键快捷命令现实本地IP订阅：```printf '3\n8\n1\n订阅密码' | sb```
+首次安装、`sb` 快捷命令的菜单 7 升级、版本检查和重新安装均使用本仓库 `Linmiao010/sing-box` 的 `main` 分支。
+
+一键创建本地 IP 订阅（将示例令牌换成自己的字母数字密码）：```printf '3\n8\n1\nmy_subscription_token_123\n\n' | sb```
 
 一键快捷命令现实Argo临时隧道：```printf '3\n3\n1\n1' | sb```
 
 一键快捷命令现实Argo固定隧道：```printf '3\n3\n2\n1\n固定密钥\n固定域名' | sb```
 
 一键快捷命令现实域名分流：```printf '5\n2\n1\n后缀域名1 后缀域名2' | sb```
+
+### 自定义域名 HTTPS 订阅（VPS）
+
+运行 `sb`，进入 **3 → 8** 管理订阅入口。域名订阅通过 Caddy 提供 HTTPS，订阅后台仅监听 `127.0.0.1`；节点协议及其端口沿用原配置。
+
+#### 安装与更新来源
+
+上面的 curl/wget 一键安装命令、`sb` 快捷命令及菜单 **7** 升级使用同一份 `Linmiao010/sing-box/main/sb.sh`。本地修改必须先推送到本仓库 `main`，远程安装或升级命令才能取得新版本。
+
+要在已安装的 VPS 上先验证未推送的改动，可将当前仓库的同一份 `sb.sh` 上传到 VPS，在该文件所在目录以 root 执行：
+
+```bash
+bash -n ./sb.sh && install -m 755 ./sb.sh /usr/bin/sb && sb
+```
+
+这会把当前文件安装为同一个 `sb` 快捷命令。之后菜单 **7** 仍从本仓库 `main` 下载；本地改动推送前执行升级，会被远程版本覆盖。
+
+#### 启用域名订阅
+
+1. 准备独立的订阅域名，例如 `sub.example.com`。将其 A/AAAA 记录指向当前 VPS；初次配置使用 DNS-only（仅 DNS 解析），并确保填写的 IPv4/IPv6 地址可达。
+2. 放行 VPS 防火墙与云平台安全组的 **TCP 80、443**。使用独立订阅后台端口，无需更改节点端口。
+3. 在 `sb` 的 **3 → 8 → 5** 中输入域名，仅填 `sub.example.com`，不带 `https://`、端口或路径。
+4. 输入至少 **16 个字符**的订阅令牌，只能使用字母、数字、`_`、`-`。直接回车会通过 `openssl rand -hex 24` 生成令牌，即 24 个随机字节编码为 48 个十六进制字符。
+5. 输入一个未占用的本机后台端口，或回车随机选择。脚本配置入口并检查 HTTPS；成功后显示订阅链接。
+
+三个订阅地址分别为：
+
+```text
+https://sub.example.com/<token>/sbox.json
+https://sub.example.com/<token>/clmi.yaml
+https://sub.example.com/<token>/jhsub.txt
+```
+
+`sbox.json` 用于 Sing-box 客户端，`clmi.yaml` 用于 Clash/Mihomo，`jhsub.txt` 为聚合节点。将 `<token>` 换成设置的令牌，或直接复制脚本显示的完整地址。持有链接即可下载订阅内容，请按凭据保管；泄露后通过菜单 **3 → 8 → 2** 轮换令牌，并更新客户端中的链接。
+
+#### 日常操作
+
+| 菜单 | 操作 |
+| --- | --- |
+| `3 → 8 → 5` | 启用域名订阅或更换域名 |
+| `3 → 8 → 2` | 轮换订阅令牌，回车随机生成 |
+| `3 → 8 → 3` | 更换订阅后台端口，自动更新 Caddy 转发配置 |
+| `3 → 8 → 6` | 显示当前订阅链接及二维码 |
+| `3 → 8 → 4` | 停用并卸载订阅入口，保留 GitLab 配置 |
+| 主菜单 `9` | 刷新节点和订阅文件，显示当前域名订阅链接 |
+
+刷新时保留现有文件格式，并逐个文件原子替换；生成或校验失败会保留原订阅文件。客户端需要手动刷新或按自身设置定时刷新订阅，服务端更新文件不会主动推送到客户端。
+
+域名模式下，主菜单 **9** 的刷新操作跳过自动 GitLab 推送；原来的 **3 → 7** GitLab 设置入口仍保留。TG 通知中的订阅链接也优先使用域名地址，已有通知脚本会在下次发送前迁移，保留其他通知内容和机器人凭据。
+
+停用订阅不会自动开放公网 HTTP。确需使用原 IP 订阅时，先选择 **3 → 8 → 4** 停用域名订阅，再选择 **3 → 8 → 1** 启用 HTTP 模式。
+
+#### 与现有网站共用 VPS
+
+脚本自行管理的 Caddy 仅启用 HTTP/1.1、HTTP/2，避免占用 UDP 443。若系统已有 `/etc/caddy/Caddyfile` 且能运行 `caddy` 命令，脚本会加入一条带 `# s-box subscription` 标记的独立订阅配置 `import`，共享现有 Caddy。配置校验后先尝试热加载；热加载失败（例如已有配置设置了 `admin off`）时，可能重启现有 Caddy 服务，现有网站连接可能短暂中断。
+
+若 TCP 80/443 被 Nginx、非标准安装的 Caddy 或其他入口占用，且脚本无法接入标准 Caddy 配置，脚本会报告冲突。需要在现有站点服务中自行接入订阅路由，或先调整入口配置；脚本不会停止这些服务来抢占端口。
+
+#### 本地验证范围
+
+在仓库目录运行离线行为测试：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+测试需要 Python 3、Bash、jq 和 Caddy；Windows 可使用 Git Bash。额外的 YAML 解析检查可使用 PyYAML，它仅用于测试。测试抽取相关 Bash 函数，在临时目录中检查安装、订阅生成、失败处理和通知内容，TG 请求由测试替身拦截。真实 Caddy 的 localhost 路由检查也只验证本机访问行为；这些结果不代表真实 VPS 的 systemd/OpenRC 服务、域名 DNS、公网 HTTPS 证书签发或客户端联网更新已经验证通过。
 
 
 ### Sing-box-yg脚本界面预览图（注：相关参数随意填写，仅供围观）
