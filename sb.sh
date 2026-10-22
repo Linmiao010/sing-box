@@ -3204,7 +3204,7 @@ changeserv(){
 sbactive
 echo
 green "Sing-box配置变更选择如下:"
-readp "1：更换Reality域名伪装地址、切换自签证书与Acme域名证书、开关TLS\n2：更换全协议UUID(密码)、Vmess-Path路径\n3：设置Argo临时隧道、固定隧道\n4：切换IPV4或IPV6的代理优先级 (仅 1.10.7 内核可用)\n5：设置Telegram推送节点通知\n6：更换Warp-wireguard出站账户\n7：设置Gitlab订阅分享链接\n8：设置自定义域名HTTPS订阅分享链接\n9：设置所有Vmess节点的CDN优选地址\n0：返回上层\n请选择【0-9】：" menu
+readp "1：更换Reality域名伪装地址、切换自签证书与Acme域名证书、开关TLS\n2：更换全协议UUID(密码)、Vmess-Path路径\n3：设置Argo临时隧道、固定隧道\n4：切换IPV4或IPV6的代理优先级 (仅 1.10.7 内核可用)\n5：设置Telegram推送节点通知\n6：更换Warp-wireguard出站账户\n7：设置Gitlab订阅分享链接\n8：管理订阅分享链接（本地IP/自定义域名HTTPS）\n9：设置所有Vmess节点的CDN优选地址\n10：设置自定义域名分发（HTTPS订阅）\n0：返回上层\n请选择【0-10】：" menu
 if [ "$menu" = "1" ];then
 changeym
 elif [ "$menu" = "2" ];then
@@ -3223,6 +3223,8 @@ elif [ "$menu" = "8" ];then
 ipsub
 elif [ "$menu" = "9" ];then
 vmesscfadd
+elif [ "$menu" = "10" ];then
+ipsub 5
 else 
 sing_box
 fi
@@ -3593,10 +3595,11 @@ done
 }
 
 ipsub(){
-local menu domain token port
+local menu=${1:-} domain token port
 domain=$(cat /etc/s-box/subdomain.log 2>/dev/null)
 token=$(cat /etc/s-box/subtoken.log 2>/dev/null)
 port=$(cat /etc/s-box/subport.log 2>/dev/null)
+if [[ -z "$menu" ]]; then
 yellow "1：重置安装本地IP订阅（HTTP）"
 yellow "2：更换订阅链接路径密码"
 yellow "3：更换订阅后台端口"
@@ -3605,6 +3608,7 @@ yellow "5：启用/更换自定义域名订阅（HTTPS）"
 yellow "6：查看订阅链接及二维码"
 yellow "0：返回上层"
 readp "请选择【0-6】：" menu
+fi
 case "$menu" in
 1)
 [[ -z "$domain" ]] || { red "请先选择 4 停用域名订阅"; return 1; }
@@ -4801,7 +4805,7 @@ echo
 green "sing-box 多协议部署与订阅管理脚本"
 blue "项目地址：https://github.com/$SB_REPO"
 blue "使用说明：https://github.com/$SB_REPO/blob/$SB_BRANCH/README.md"
-blue "管理命令：sing_box；订阅管理：3 → 8；刷新节点：9"
+blue "管理命令：sing_box；域名分发：3 → 10；订阅管理：3 → 8；刷新节点：9"
 echo
 }
 
@@ -4820,7 +4824,7 @@ red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 green " 1. 一键安装 Sing-box" 
 green " 2. 删除卸载 Sing-box"
 white "----------------------------------------------------------------------------------"
-green " 3. 变更配置 【双证书TLS/UUID路径/Argo/IP优先/TG通知/Warp/订阅/CDN优选】" 
+green " 3. 变更配置 【双证书TLS/UUID路径/Argo/IP优先/TG通知/Warp/订阅/域名分发/CDN优选】"
 green " 4. 更改主端口/添加多端口跳跃复用" 
 green " 5. 三通道域名分流"
 green " 6. 关闭/重启 Sing-box"   
