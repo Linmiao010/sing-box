@@ -143,11 +143,68 @@ fi
 fi
 fi
 v4v6(){
-v4=$(curl -s4m5 icanhazip.com -k)
-v6=$(curl -s6m5 icanhazip.com -k)
-#v4dq=$(curl -s4m5 -k https://myip.ipip.net | awk -F'来自于：' '{print $2}' 2>/dev/null)
-v4dq=$(curl -s4m5 -k https://ip.fm | sed -n 's/.*Location: //p' 2>/dev/null)
-v6dq=$(curl -s6m5 -k https://ip.fm | sed -n 's/.*Location: //p' 2>/dev/null)
+v4=$(public_ip 4)
+v6=$(public_ip 6)
+# Interface addresses show configuration, not proof of Internet connectivity.
+v6_local=$(ip -o -6 addr show scope global up 2>/dev/null | awk '
+$3 == "inet6" && / scope global / && !/ (tentative|dadfailed|deprecated)( |$)/ {
+    split($4, address, "/"); print address[1]; exit
+}')
+if [[ -n $v6 ]]; then
+v6_display="$v6"
+elif [[ -n $v6_local ]]; then
+v6_display="$v6_local（本机已配置；公网探测未成功）"
+else
+v6_display="未检测到全局IPv6地址；公网探测未成功"
+fi
+v4dq= v6dq=
+[[ -z $v4 ]] || v4dq=$(curl -fsS -4 --noproxy '*' --max-time 5 https://ip.fm 2>/dev/null | sed -n 's/.*Location: //p')
+[[ -z $v6 ]] || v6dq=$(curl -fsS -6 --noproxy '*' --max-time 5 https://ip.fm 2>/dev/null | sed -n 's/.*Location: //p')
+return 0
+}
+
+ip_literal_valid(){
+local family=$1 address=$2 part compressed=0
+local -a parts
+if [[ $family == 4 ]]; then
+[[ $address =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+IFS=. read -r -a parts <<< "$address"
+for part in "${parts[@]}"; do
+(( 10#$part <= 255 )) || return 1
+done
+else
+[[ $address =~ ^[0-9a-fA-F:]+$ && $address != *:::* ]] || return 1
+[[ $address != :* || $address == ::* ]] || return 1
+[[ $address != *: || $address == *:: ]] || return 1
+if [[ $address == *::* ]]; then
+compressed=1
+address=${address/::/:}
+[[ $address != *::* ]] || return 1
+address=${address#:}
+address=${address%:}
+else
+[[ $address != :* && $address != *: ]] || return 1
+fi
+IFS=: read -r -a parts <<< "$address"
+for part in "${parts[@]}"; do
+[[ $part =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+done
+(( (compressed && ${#parts[@]} < 8) || (!compressed && ${#parts[@]} == 8) )) || return 1
+fi
+}
+
+public_ip(){
+local family=$1 url address
+for url in https://icanhazip.com https://api64.ipify.org; do
+if address=$(curl -fsS "-$family" --noproxy '*' --max-time 5 "$url" 2>/dev/null); then
+address=${address%$'\r'}
+if ip_literal_valid "$family" "$address"; then
+printf '%s\n' "$address"
+return 0
+fi
+fi
+done
+return 1
 }
 warpcheck(){
 wgcfv6=$(curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
@@ -155,17 +212,25 @@ wgcfv4=$(curl -s4m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cu
 }
 
 v6(){
+local result
 v4orv6(){
-if [ -z "$(curl -s4m5 icanhazip.com -k)" ]; then
+local detected_v4 detected_v6
+detected_v4=$(public_ip 4)
+detected_v6=$(public_ip 6)
+if [[ -z $detected_v4 && -z $detected_v6 ]]; then
+red "公网IP探测均未成功，请检查网络或DNS；未修改DNS配置"
+return 1
+fi
+if [[ -z $detected_v4 ]]; then
 echo
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-yellow "检测到 纯IPV6 VPS，添加NAT64"
+yellow "IPv4公网探测未成功，IPv6探测成功，配置NAT64"
 echo -e "nameserver 2a00:1098:2b::1\nnameserver 2a00:1098:2c::1" > /etc/resolv.conf
 ipv=prefer_ipv6
 else
 ipv=prefer_ipv4
 fi
-if [ -n "$(curl -s6m5 icanhazip.com -k)" ]; then
+if [[ -n $detected_v6 ]]; then
 endip="2606:4700:d0::a29f:c001"
 else
 endip="162.159.192.1"
@@ -178,10 +243,12 @@ else
 systemctl stop wg-quick@wgcf >/dev/null 2>&1
 kill -15 $(pgrep warp-go) >/dev/null 2>&1 && sleep 2
 v4orv6
+result=$?
 systemctl start wg-quick@wgcf >/dev/null 2>&1
 systemctl restart warp-go >/dev/null 2>&1
 systemctl enable warp-go >/dev/null 2>&1
 systemctl start warp-go >/dev/null 2>&1
+return "$result"
 fi
 }
 
@@ -932,6 +999,10 @@ status_pattern="active"
 fi
 if [[ -n $($status_cmd 2>/dev/null | grep -w "$status_pattern") && -f '/etc/s-box/sb.json' ]]; then
 v4v6
+if [[ -z $v4 && -z $v6 ]]; then
+red "公网IP探测未成功，已保留原节点地址；本机配置了地址不代表公网可达"
+return 1
+fi
 if [[ -n $v4 && -n $v6 ]]; then
 green "调整IPv4/IPV6配置输出"
 yellow "1：刷新本地IP，使用IPV4配置输出 (回车默认) "
@@ -949,8 +1020,8 @@ server_ipcl="$v6"
 echo "$server_ipcl" > /etc/s-box/server_ipcl.log
 fi
 else
-yellow "VPS并不是双栈VPS，不支持IP配置输出的切换"
-serip=$(curl -s4m5 icanhazip.com -k || curl -s6m5 icanhazip.com -k)
+yellow "仅确认一个地址族的公网IP，使用已探测到的地址生成配置"
+serip=${v4:-$v6}
 if [[ "$serip" =~ : ]]; then
 server_ip="[$serip]"
 echo "$server_ip" > /etc/s-box/server_ip.log
@@ -969,6 +1040,7 @@ fi
 }
 
 wgcfgo(){
+local result
 warpcheck
 if [[ ! $wgcfv4 =~ on|plus && ! $wgcfv6 =~ on|plus ]]; then
 ipuuid
@@ -976,10 +1048,12 @@ else
 systemctl stop wg-quick@wgcf >/dev/null 2>&1
 kill -15 $(pgrep warp-go) >/dev/null 2>&1 && sleep 2
 ipuuid
+result=$?
 systemctl start wg-quick@wgcf >/dev/null 2>&1
 systemctl restart warp-go >/dev/null 2>&1
 systemctl enable warp-go >/dev/null 2>&1
 systemctl start warp-go >/dev/null 2>&1
+return "$result"
 fi
 }
 
@@ -2551,7 +2625,7 @@ if [[ -f '/etc/systemd/system/sing-box.service' ]]; then
 red "已安装Sing-box服务，无法再次安装" && exit
 fi
 mkdir -p /etc/s-box
-v6
+v6 || return 1
 openyn
 inssb
 inscertificate
@@ -2966,7 +3040,7 @@ rrpip="ipv4_only" && chip && v4_6="仅IPV4($v4)"
 elif [[ $choose == "4" && -n $v6 ]]; then
 rrpip="ipv6_only" && chip && v4_6="仅IPV6($v6)"
 else 
-red "当前不存在你选择的IPV4/IPV6地址，或者输入错误" && changeip
+red "所选地址族的公网探测未成功，或者输入错误" && changeip
 fi
 blue "当前已更换的IP优先级：${v4_6}" && sing_box
 else
@@ -3831,16 +3905,8 @@ warp_s4_ip='Socks5-IPV4可用'
 warp_s6_ip='Socks5-IPV6自测'
 fi
 v4v6
-if [[ -z $v4 ]]; then
-vps_ipv4='无本地IPV4，黑名单模式'      
-vps_ipv6="当前IP：$v6"
-elif [[ -n $v4 &&  -n $v6 ]]; then
-vps_ipv4="当前IP：$v4"    
-vps_ipv6="当前IP：$v6"
-else
-vps_ipv4="当前IP：$v4"    
-vps_ipv6='无本地IPV6，黑名单模式'
-fi
+vps_ipv4="当前IP：${v4:-公网IPv4探测未成功}"
+vps_ipv6="当前IP：$v6_display"
 unset swg4 swd4 swd6 swg6 ssd4 ssg4 ssd6 ssg6 sad4 sag4 sad6 sag6
 wd4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[1].domain_suffix | join(" ")')
 wg4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[1].geosite | join(" ")' 2>/dev/null)
@@ -4832,21 +4898,11 @@ fi
 if [[ "$v4" == "104.28"* ]]; then
 w4="【WARP】"
 fi
-[[ -z $v4 ]] && showv4='IPV4地址丢失，请切换至IPV6或者重装Sing-box' || showv4=$v4$w4
-[[ -z $v6 ]] && showv6='IPV6地址丢失，请切换至IPV4或者重装Sing-box' || showv6=$v6$w6
-if [[ -z $v4 ]]; then
-vps_ipv4='无IPV4'      
-vps_ipv6="$v6"
-location="$v6dq"
-elif [[ -n $v4 &&  -n $v6 ]]; then
-vps_ipv4="$v4"    
-vps_ipv6="$v6"
-location="$v4dq"
-else
-vps_ipv4="$v4"    
-vps_ipv6='无IPV6'
-location="$v4dq"
-fi
+showv4="${v4:-公网IPv4探测未成功}$w4"
+showv6="$v6_display$w6"
+vps_ipv4="${v4:-公网IPv4探测未成功}"
+vps_ipv6="$v6_display"
+location="${v4dq:-${v6dq:-地区查询未成功}}"
 echo -e "本地IPV4地址：$blue$vps_ipv4$w4$plain   本地IPV6地址：$blue$vps_ipv6$w6$plain"
 echo -e "服务器地区：$blue$location$plain"
 if [[ "$sbnh" == "1.10" ]]; then
