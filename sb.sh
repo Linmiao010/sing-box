@@ -3281,8 +3281,51 @@ $1 {
 EOF
 }
 
+sub_caddy_download(){
+(
+local arch=$1 api_arch=$1 download_dir binary asset url digest
+[[ "$arch" != armv7 ]] || api_arch='arm&arm=7'
+download_dir=$(mktemp -d /etc/s-box/.caddy.XXXXXX) || exit 1
+trap 'rm -rf -- "$download_dir"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+binary="$download_dir/caddy"
+blue "正在下载 Caddy（官网）；连续20秒低于1 KiB/s时切换官方备用源" >&2
+if ! curl -fL --connect-timeout 10 --max-time 120 --speed-limit 1024 --speed-time 20 --retry 0 \
+"https://caddyserver.com/api/download?os=linux&arch=$api_arch" -o "$binary" ||
+! chmod 755 "$binary" || ! "$binary" version >/dev/null 2>&1; then
+yellow "Caddy 官网下载或校验失败，正在获取 GitHub 官方发布信息" >&2
+if ! curl -fsSL --connect-timeout 10 --max-time 20 --retry 0 \
+https://api.github.com/repos/caddyserver/caddy/releases/latest -o "$download_dir/release.json" ||
+! asset=$(jq -cer --arg arch "$arch" '.tag_name as $tag | .assets[] |
+select(.name == ("caddy_" + ($tag | ltrimstr("v")) + "_linux_" + $arch + ".tar.gz"))' "$download_dir/release.json"); then
+red "无法获取 Caddy 官方发布包信息，请检查 VPS 到 api.github.com 的连接" >&2
+exit 1
+fi
+if ! url=$(jq -er '.browser_download_url' <<< "$asset") ||
+! digest=$(jq -er '.digest' <<< "$asset") ||
+[[ "$url" != https://github.com/caddyserver/caddy/releases/download/* || ! "$digest" =~ ^sha256:[a-fA-F0-9]{64}$ ]]; then
+red "Caddy 官方发布包地址或 SHA-256 信息无效" >&2
+exit 1
+fi
+blue "正在下载 Caddy（GitHub 官方发布包）；下载后校验 SHA-256" >&2
+binary="$download_dir/caddy-release"
+if ! curl -fL --connect-timeout 10 --max-time 120 --speed-limit 1024 --speed-time 20 --retry 0 \
+"$url" -o "$download_dir/caddy.tar.gz" ||
+! printf '%s  %s\n' "${digest#sha256:}" "$download_dir/caddy.tar.gz" | sha256sum -c - >/dev/null ||
+! tar -xzf "$download_dir/caddy.tar.gz" -O caddy > "$binary" ||
+! chmod 755 "$binary" || ! "$binary" version >/dev/null 2>&1; then
+red "Caddy 官方备用包下载或校验失败，未替换现有文件；请检查 GitHub 下载连通性及上方错误" >&2
+exit 1
+fi
+fi
+mv -f "$binary" /etc/s-box/caddy || { red "无法安装 Caddy 到 /etc/s-box/caddy" >&2; exit 1; }
+)
+}
+
 sub_caddy_prepare(){
-local mode arch download
+local mode arch
 mode=$(cat /etc/s-box/sub-caddy-mode 2>/dev/null)
 if [[ "$mode" == shared || ( -z "$mode" && -f /etc/caddy/Caddyfile ) ]]; then
 command -v caddy >/dev/null 2>&1 || { red "已有 /etc/caddy/Caddyfile，但未找到 caddy 命令" >&2; return 1; }
@@ -3300,16 +3343,10 @@ if [[ ! -x /etc/s-box/caddy ]]; then
 case "$(uname -m)" in
 x86_64) arch=amd64 ;;
 aarch64) arch=arm64 ;;
-armv7l) arch='arm&arm=7' ;;
+armv7l) arch=armv7 ;;
 *) red "Caddy 不支持当前架构" >&2; return 1 ;;
 esac
-download=$(mktemp /etc/s-box/.caddy.XXXXXX) || return 1
-if ! curl -fL --connect-timeout 15 --max-time 180 --retry 2 "https://caddyserver.com/api/download?os=linux&arch=$arch" -o "$download" ||
-! chmod 755 "$download" || ! "$download" version >/dev/null 2>&1 || ! mv -f "$download" /etc/s-box/caddy; then
-rm -f "$download"
-red "Caddy 下载或校验失败" >&2
-return 1
-fi
+sub_caddy_download "$arch" || return 1
 fi
 echo managed
 }
