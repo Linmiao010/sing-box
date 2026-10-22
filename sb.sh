@@ -442,7 +442,7 @@ yellow "2：自定义每个协议端口。请确保VPS后台已开放指定的�
 readp "请输入【1-2】：" port
 if [ -z "$port" ] || [ "$port" = "1" ] ; then
 ports=()
-for i in {1..5}; do
+for i in {1..7}; do
 while true; do
 port=$(shuf -i 10000-65535 -n 1)
 if ! [[ " ${ports[@]} " =~ " $port " ]] && \
@@ -458,6 +458,8 @@ port_vl_re=${ports[1]}
 port_hy2=${ports[2]}
 port_tu=${ports[3]}
 port_an=${ports[4]}
+port_tr=${ports[5]}
+port_sn=${ports[6]}
 if [[ $tlsyn == "true" ]]; then
 numbers=("2053" "2083" "2087" "2096" "8443")
 else
@@ -480,6 +482,14 @@ vlport && vmport && hy2port && tu5port
 if [[ "$sbnh" != "1.10" ]]; then
 anport
 fi
+readp "\n设置 Trojan + TLS 端口（回车随机）：" port
+chooseport
+port_tr=$port
+if snell_supported "$sbnh"; then
+readp "\n设置 Snell TCP 端口（回车随机）：" port
+chooseport
+port_sn=$port
+fi
 fi
 echo
 blue "各协议端口确认如下"
@@ -490,6 +500,8 @@ blue "Tuic-v5端口：$port_tu"
 if [[ "$sbnh" != "1.10" ]]; then
 blue "Anytls端口：$port_an"
 fi
+blue "Trojan + TLS 端口：$port_tr"
+snell_supported "$sbnh" && blue "Snell TCP 端口：$port_sn"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green "四、自动生成各个协议统一的uuid (密码)"
 uuid=$(/etc/s-box/sing-box generate uuid)
@@ -954,17 +966,270 @@ EOF
 cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
 }
 
+snell_supported(){
+local version=${1#v} major minor
+[[ "$version" =~ ^([0-9]+)\.([0-9]+)(\.|$) ]] || return 1
+major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]}
+(( major > 1 || (major == 1 && minor >= 14) )) || return 1
+[[ "$version" != 1.14.0-* ]]
+}
+
+extra_config_init(){
+if [[ ! -e /etc/s-box/sb_extra.json ]]; then
+(umask 077; printf '{"inbounds":[]}\n' > /etc/s-box/sb_extra.json) || return 1
+fi
+}
+
+extra_inbound(){
+local protocol=$1 port=$2 password=$3
+[[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) && [[ -n "$password" ]] || return 1
+case "$protocol" in
+trojan)
+jq -n --argjson port "$port" --arg password "$password" \
+    --arg cert "$4" --arg key "$5" --arg sni "$6" '
+    {type:"trojan",tag:"trojan-sb",listen:"::",listen_port:$port,
+     users:[{password:$password}],tls:{enabled:true,server_name:$sni,
+     certificate_path:$cert,key_path:$key}}'
+;;
+snell)
+# sing-box v5 inbound implements the TCP wire protocol used by v4 clients.
+jq -n --argjson port "$port" --arg psk "$password" '
+    {type:"snell",tag:"snell-sb",listen:"::",listen_port:$port,version:5,psk:$psk}'
+;;
+*) return 1 ;;
+esac
+}
+
+extra_port_available(){
+local protocol=$1 port=$2 current
+[[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || return 1
+sed 's://.*::g' /etc/s-box/sb.json | jq -e --argjson port "$port" \
+    '[.inbounds[]? | select(.listen_port == $port)] | length == 0' >/dev/null || return 1
+if [[ -s /etc/s-box/sb_extra.json ]]; then
+jq -e --arg protocol "$protocol" --argjson port "$port" \
+    '[.inbounds[]? | select(.type != $protocol and .listen_port == $port)] | length == 0' \
+    /etc/s-box/sb_extra.json >/dev/null || return 1
+current=$(jq -r --arg protocol "$protocol" '.inbounds[]? | select(.type == $protocol) | .listen_port' /etc/s-box/sb_extra.json) || return 1
+[[ "$current" != "$port" ]] || return 0
+fi
+! ss -ltnH | awk '{print $4}' | grep -Eq ":${port}$"
+}
+
+extra_random_port(){
+local candidate
+while true; do
+candidate=$(shuf -i 10000-65535 -n 1) || return 1
+if extra_port_available "$1" "$candidate"; then
+printf '%s\n' "$candidate"
+return 0
+fi
+done
+}
+
+extra_apply(){
+(
+local candidate=$1 backup restore=0
+if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json -c "$candidate"; then
+red "新协议配置校验失败，原配置未更改"
+exit 1
+fi
+backup=$(mktemp /etc/s-box/.extra-backup.XXXXXX) || exit 1
+extra_cleanup(){
+local status=$?
+trap - EXIT
+trap '' HUP INT TERM
+if (( restore )); then
+if ! mv -f -- "$backup" /etc/s-box/sb_extra.json; then
+red "恢复原配置失败，备份保留在 $backup"
+return 1
+fi
+restartsb >/dev/null 2>&1 || red "原配置已恢复，但服务重启失败，请查看运行日志"
+red "新协议应用未完成，已恢复原配置"
+fi
+rm -f -- "$backup"
+return "$status"
+}
+trap extra_cleanup EXIT
+trap 'exit 1' HUP INT TERM
+if [[ -f /etc/s-box/sb_extra.json ]]; then
+cp -p /etc/s-box/sb_extra.json "$backup" || exit 1
+else
+printf '{"inbounds":[]}\n' > "$backup" || exit 1
+fi
+chmod 600 "$candidate" || exit 1
+restore=1
+mv -f -- "$candidate" /etc/s-box/sb_extra.json || exit 1
+# Rewrite our service once here so an existing installation also loads the extra file.
+sbservice || exit 1
+restore=0
+)
+}
+
+extra_set(){
+local protocol=$1 port=$2 password=$3 node candidate
+if [[ "$protocol" == snell ]] && ! snell_supported "$sbnh"; then
+red "Snell 需要 sing-box 1.14.0 或更新的正式版内核，请先通过菜单8升级"
+return 1
+fi
+if ! extra_port_available "$protocol" "$port"; then
+red "端口无效或已被占用，请选择其他 TCP 端口"
+return 1
+fi
+node=$(extra_inbound "$@") || return 1
+candidate=$(mktemp /etc/s-box/.extra.XXXXXX) || return 1
+if [[ -f /etc/s-box/sb_extra.json ]]; then
+jq --argjson node "$node" '.inbounds = ([.inbounds[] | select(.tag != $node.tag)] + [$node])' \
+    /etc/s-box/sb_extra.json > "$candidate" || { rm -f -- "$candidate"; return 1; }
+else
+jq -n --argjson node "$node" '{inbounds:[$node]}' > "$candidate" || { rm -f -- "$candidate"; return 1; }
+fi
+if extra_apply "$candidate"; then
+return 0
+fi
+rm -f -- "$candidate"
+return 1
+}
+
+extra_remove(){
+local candidate
+[[ "$1" == trojan || "$1" == snell ]] || return 1
+[[ -f /etc/s-box/sb_extra.json ]] || return 0
+candidate=$(mktemp /etc/s-box/.extra.XXXXXX) || return 1
+if jq --arg protocol "$1" '.inbounds |= map(select(.type != $protocol))' \
+    /etc/s-box/sb_extra.json > "$candidate" && extra_apply "$candidate"; then
+return 0
+fi
+rm -f -- "$candidate"
+return 1
+}
+
+extra_install(){
+local trojan snell='null' sni psk candidate
+extra_port_available trojan "$port_tr" || { red "Trojan端口与其他协议冲突"; return 1; }
+if [[ "$certificatec_hy2" == /etc/s-box/cert.pem ]]; then
+sni=www.bing.com
+else
+sni=$(cat /root/ygkkkca/ca.log) || return 1
+fi
+trojan=$(extra_inbound trojan "$port_tr" "$uuid" "$certificatec_hy2" "$certificatep_hy2" "$sni") || return 1
+if snell_supported "$sbnh"; then
+[[ "$port_sn" != "$port_tr" ]] && extra_port_available snell "$port_sn" || { red "Snell端口与其他协议冲突"; return 1; }
+psk=$(/etc/s-box/sing-box generate rand --base64 32) || return 1
+snell=$(extra_inbound snell "$port_sn" "$psk") || return 1
+else
+yellow "当前内核不支持 Snell；升级至 1.14.0 或更新正式版后可在 3 → 11 启用"
+fi
+candidate=$(mktemp /etc/s-box/.extra.XXXXXX) || return 1
+if jq -n --argjson trojan "$trojan" --argjson snell "$snell" \
+    '{inbounds:([$trojan,$snell] | map(select(. != null)))}' > "$candidate" &&
+    /etc/s-box/sing-box check -c /etc/s-box/sb.json -c "$candidate" &&
+    chmod 600 "$candidate" && mv -f -- "$candidate" /etc/s-box/sb_extra.json; then
+return 0
+fi
+rm -f -- "$candidate"
+return 1
+}
+
+extra_client_data(){
+jq --arg server "$server_ipcl" --arg host "$hostname" --arg selfcert /etc/s-box/cert.pem '
+  [.inbounds[] | select(.type == "trojan" or .type == "snell") |
+    . as $in | (.type + "-" + $host) as $name |
+    if .type == "trojan" then
+      (.tls.certificate_path == $selfcert) as $insecure |
+      {singbox:{type:"trojan",tag:$name,server:$server,server_port:.listen_port,
+        password:.users[0].password,tls:{enabled:true,server_name:.tls.server_name,insecure:$insecure}},
+       mihomo:{type:"trojan",name:$name,server:$server,port:.listen_port,password:.users[0].password,
+        udp:true,sni:.tls.server_name,"skip-cert-verify":$insecure,"client-fingerprint":"chrome"}}
+    else
+      {singbox:{type:"snell",tag:$name,server:$server,server_port:.listen_port,version:4,psk:.psk},
+       mihomo:{type:"snell",name:$name,server:$server,port:.listen_port,version:4,psk:.psk,udp:true}}
+    end] | {singbox:map(.singbox),mihomo:map(.mihomo)}' /etc/s-box/sb_extra.json
+}
+
+extra_share(){
+local data link
+data=$(extra_client_data) || return 1
+link=$(printf '%s' "$data" | jq -r '.singbox[] | select(.type == "trojan") |
+    "trojan://" + (.password | @uri) + "@" +
+    (if (.server | contains(":")) then "[" + .server + "]" else .server end) +
+    ":" + (.server_port|tostring) + "?security=tls&type=tcp&sni=" + (.tls.server_name|@uri) +
+    "&allowInsecure=" + (if .tls.insecure then "1" else "0" end) + "#" + (.tag|@uri)') || return 1
+if [[ -n "$link" ]]; then
+printf '%s\n' "$link" > /etc/s-box/trojan.txt || return 1
+red "🚀【 Trojan + TLS 】分享链接"
+printf '%s\n' "$link"
+qrencode -o - -t ANSIUTF8 "$link"
+fi
+if printf '%s' "$data" | jq -e '.mihomo[] | select(.type == "snell")' >/dev/null; then
+red "🚀【 Snell 】请通过 clmi.yaml 订阅导入 Clash Verge，单节点 YAML 如下："
+printf '%s' "$data" | jq -cr '.mihomo[] | select(.type == "snell") | "- " + tojson' || return 1
+fi
+return 0
+}
+
+extra_menu(){
+local choice protocol old port password cert key sni cert_choice
+[[ -s /etc/s-box/sb.json ]] || { red "请先安装 sing-box"; return 1; }
+readp "1：启用/设置 Trojan + TLS（端口、密码、证书）\n2：启用/设置 Snell（端口、PSK）\n3：停用 Trojan\n4：停用 Snell\n0：返回\n请选择【0-4】：" choice || return 1
+case "$choice" in
+1|2)
+[[ "$choice" == 1 ]] && protocol=trojan || protocol=snell
+if [[ "$protocol" == snell ]] && ! snell_supported "$sbnh"; then
+red "Snell 需要 sing-box 1.14.0 或更新的正式版内核，请先通过菜单8升级"
+return 1
+fi
+old='{}'
+if [[ -s /etc/s-box/sb_extra.json ]]; then
+old=$(jq -c --arg protocol "$protocol" '[.inbounds[] | select(.type == $protocol)] | first // {}' /etc/s-box/sb_extra.json) || return 1
+fi
+port=$(printf '%s' "$old" | jq -r '.listen_port // empty') || return 1
+readp "TCP端口（回车保留 ${port:-随机端口}）：" choice || return 1
+port=${choice:-$port}
+[[ -n "$port" ]] || port=$(extra_random_port "$protocol") || return 1
+password=$(printf '%s' "$old" | jq -r '.users[0].password // .psk // empty') || return 1
+readp "密码/PSK（回车保留，首次设置则随机生成）：" choice || return 1
+password=${choice:-$password}
+[[ -n "$password" ]] || password=$(/etc/s-box/sing-box generate rand --base64 32) || return 1
+if [[ "$protocol" == trojan ]]; then
+cert=$(printf '%s' "$old" | jq -r '.tls.certificate_path // empty') || return 1
+key=$(printf '%s' "$old" | jq -r '.tls.key_path // empty') || return 1
+sni=$(printf '%s' "$old" | jq -r '.tls.server_name // empty') || return 1
+readp "Trojan证书：1 自签；2 已有ACME域名证书；回车保留当前，首次默认自签：" cert_choice || return 1
+case "$cert_choice" in
+1) cert=/etc/s-box/cert.pem; key=/etc/s-box/private.key; sni=www.bing.com ;;
+2) cert=/root/ygkkkca/cert.crt; key=/root/ygkkkca/private.key; sni=$(cat /root/ygkkkca/ca.log 2>/dev/null) ;;
+"") if [[ -z "$cert" ]]; then cert=/etc/s-box/cert.pem; key=/etc/s-box/private.key; sni=www.bing.com; fi ;;
+*) red "证书选项无效"; return 1 ;;
+esac
+[[ -s "$cert" && -s "$key" && -n "$sni" ]] || { red "证书、私钥或证书域名缺失，请先通过菜单12申请证书"; return 1; }
+fi
+extra_set "$protocol" "$port" "$password" "$cert" "$key" "$sni" || return 1
+;;
+3) extra_remove trojan || return 1 ;;
+4) extra_remove snell || return 1 ;;
+0) return 0 ;;
+*) red "选项无效"; return 1 ;;
+esac
+if ! sbshare; then
+red "协议配置已应用，但订阅刷新失败，请通过菜单9重试"
+return 1
+fi
+green "Trojan / Snell 配置已应用，请在 Clash Verge 中刷新 clmi.yaml 订阅"
+}
+
 sbservice(){
+extra_config_init || return 1
+/etc/s-box/sing-box check -c /etc/s-box/sb.json -c /etc/s-box/sb_extra.json || return 1
 if command -v apk >/dev/null 2>&1; then
 echo '#!/sbin/openrc-run
 description="sing-box service"
 command="/etc/s-box/sing-box"
-command_args="run -c /etc/s-box/sb.json"
+command_args="run -c /etc/s-box/sb.json -c /etc/s-box/sb_extra.json"
 command_background=true
 pidfile="/var/run/sing-box.pid"' > /etc/init.d/sing-box
 chmod +x /etc/init.d/sing-box
 rc-update add sing-box default
-rc-service sing-box start
+rc-service sing-box restart
 else
 cat > /etc/systemd/system/sing-box.service <<EOF
 [Unit]
@@ -974,7 +1239,7 @@ User=root
 WorkingDirectory=/root
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
-ExecStart=/etc/s-box/sing-box run -c /etc/s-box/sb.json
+ExecStart=/etc/s-box/sing-box run -c /etc/s-box/sb.json -c /etc/s-box/sb_extra.json
 ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=10
@@ -982,7 +1247,7 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
+systemctl daemon-reload || return 1
 systemctl enable sing-box >/dev/null 2>&1
 systemctl start sing-box
 systemctl restart sing-box
@@ -1295,7 +1560,7 @@ echo
 
 sb_client(){
 (
-local publish_dir sb_all sb_any1 sb_any2 cl_all cl_any1 cl_any2 sb_hy2ports vm_listen_port
+local publish_dir sb_all sb_any1 sb_any2 cl_all cl_any1 cl_any2 sb_hy2ports vm_listen_port extra_data extra_piece
 publish_dir=$(mktemp -d /etc/s-box/.client.XXXXXX) || exit 1
 trap 'rm -rf -- "$publish_dir"' EXIT
 trap 'exit 1' HUP INT TERM
@@ -1707,6 +1972,17 @@ sb_any2=$(sbany2) || exit 1
 cl_all=$(clall) || exit 1
 cl_any1=$(clany1) || exit 1
 cl_any2=$(clany2) || exit 1
+if [[ -s /etc/s-box/sb_extra.json ]]; then
+extra_data=$(extra_client_data) || exit 1
+extra_piece=$(printf '%s' "$extra_data" | jq -r '.singbox[] | (.tag|tojson) + ","') || exit 1
+sb_any1+=$'\n'"$extra_piece"
+extra_piece=$(printf '%s' "$extra_data" | jq -cr '.singbox[] | tojson + ","') || exit 1
+sb_any2+=$'\n'"$extra_piece"
+extra_piece=$(printf '%s' "$extra_data" | jq -r '.mihomo[] | "    - " + (.name|tojson)') || exit 1
+cl_any1+=$'\n'"$extra_piece"
+extra_piece=$(printf '%s' "$extra_data" | jq -cr '.mihomo[] | "- " + tojson') || exit 1
+cl_any2+=$'\n'"$extra_piece"
+fi
 if ps -ef 2>/dev/null | grep -q '[c]loudflared.*run' && ps -ef 2>/dev/null | grep "[l]ocalhost:$vm_listen_port" >/dev/null 2>&1 && [ "$tls" = "false" ]; then
 cat > "$publish_dir/sbox.json" <<EOF || exit 1
 $sb_all
@@ -2644,7 +2920,8 @@ red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 green "五、自动生成warp-wireguard出站账户" && sleep 2
 warpwg
 inssbjsonser
-sbservice
+extra_install || return 1
+sbservice || return 1
 sbactive
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 lnsb || return 1
@@ -2804,6 +3081,7 @@ tu5_ports=$(iptables -t nat -nL --line 2>/dev/null | grep -w "$tu5_port" | awk '
 changeport(){
 sbactive
 allports
+yellow "Trojan / Snell 的端口在 3 → 11 中设置"
 fports(){
 readp "\n请输入转发的端口范围 (1000-65535范围内，格式为 小数字:大数字)：" rangeport
 if [[ $rangeport =~ ^([1-9][0-9]{3,4}:[1-9][0-9]{3,4})$ ]]; then
@@ -2988,10 +3266,11 @@ changeuuid(){
 echo
 olduuid=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].users[0].uuid')
 oldvmpath=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].transport.path')
-green "全协议的uuid (密码)：$olduuid"
+green "原有协议的uuid (密码)：$olduuid"
+yellow "Trojan 密码和 Snell PSK 在 3 → 11 中独立管理"
 green "Vmess的path路径：$oldvmpath"
 echo
-yellow "1：自定义全协议的uuid (密码)"
+yellow "1：自定义原有协议的uuid (密码)"
 yellow "2：自定义Vmess的path路径"
 yellow "0：返回上层"
 readp "请选择【0-2】：" menu
@@ -3204,7 +3483,7 @@ changeserv(){
 sbactive
 echo
 green "Sing-box配置变更选择如下:"
-readp "1：更换Reality域名伪装地址、切换自签证书与Acme域名证书、开关TLS\n2：更换全协议UUID(密码)、Vmess-Path路径\n3：设置Argo临时隧道、固定隧道\n4：切换IPV4或IPV6的代理优先级 (仅 1.10.7 内核可用)\n5：设置Telegram推送节点通知\n6：更换Warp-wireguard出站账户\n7：设置Gitlab订阅分享链接\n8：管理订阅分享链接（本地IP/自定义域名HTTPS）\n9：设置所有Vmess节点的CDN优选地址\n10：设置自定义域名分发（HTTPS订阅）\n0：返回上层\n请选择【0-10】：" menu
+readp "1：更换Reality域名伪装地址、切换自签证书与Acme域名证书、开关TLS\n2：更换原有协议UUID(密码)、Vmess-Path路径\n3：设置Argo临时隧道、固定隧道\n4：切换IPV4或IPV6的代理优先级 (仅 1.10.7 内核可用)\n5：设置Telegram推送节点通知\n6：更换Warp-wireguard出站账户\n7：设置Gitlab订阅分享链接\n8：管理订阅分享链接（本地IP/自定义域名HTTPS）\n9：设置所有Vmess节点的CDN优选地址\n10：设置自定义域名分发（HTTPS订阅）\n11：管理Trojan / Snell（启停、端口、密码、证书）\n0：返回上层\n请选择【0-11】：" menu
 if [ "$menu" = "1" ];then
 changeym
 elif [ "$menu" = "2" ];then
@@ -3225,6 +3504,8 @@ elif [ "$menu" = "9" ];then
 vmesscfadd
 elif [ "$menu" = "10" ];then
 ipsub 5
+elif [ "$menu" = "11" ];then
+extra_menu
 else 
 sing_box
 fi
@@ -4278,6 +4559,9 @@ fi
 }
 
 restartsb(){
+local check_args=(-c /etc/s-box/sb.json)
+[[ ! -f /etc/s-box/sb_extra.json ]] || check_args+=(-c /etc/s-box/sb_extra.json)
+/etc/s-box/sing-box check "${check_args[@]}" || return 1
 if command -v apk >/dev/null 2>&1; then
 rc-service sing-box restart
 else
@@ -4383,6 +4667,63 @@ fi
 inscore=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}')
 }
 
+core_update(){
+(
+local requested=$1 work name candidate actual series template restore=0
+local check_args
+[[ "$requested" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]] || { red "内核版本号格式无效"; exit 1; }
+work=$(mktemp -d /etc/s-box/.core.XXXXXX) || exit 1
+core_cleanup(){
+local status=$?
+trap - EXIT
+trap '' HUP INT TERM
+if (( restore )); then
+if ! mv -f -- "$work/old-core" /etc/s-box/sing-box || ! cp -p "$work/old-config" /etc/s-box/sb.json; then
+red "恢复旧内核或配置失败，备份保留在 $work"
+return 1
+fi
+restartsb >/dev/null 2>&1 || red "旧内核及配置已恢复，但服务启动失败，请查看运行日志"
+red "内核切换未完成，已恢复旧内核及配置"
+fi
+rm -rf -- "$work"
+return "$status"
+}
+trap core_cleanup EXIT
+trap 'exit 1' HUP INT TERM
+name="sing-box-$requested-linux-$cpu"
+if ! curl -fL --retry 2 -o "$work/core.tar.gz" "https://github.com/SagerNet/sing-box/releases/download/v$requested/$name.tar.gz" ||
+   ! tar xzf "$work/core.tar.gz" -C "$work" "$name/sing-box"; then
+red "内核下载或解包失败，已保留当前内核"
+exit 1
+fi
+candidate="$work/$name/sing-box"
+chmod +x "$candidate" || exit 1
+actual=$("$candidate" version) || { red "候选内核无法运行，已保留当前内核"; exit 1; }
+actual=$(printf '%s\n' "$actual" | awk '/^sing-box version /{print $3; exit}')
+[[ "$actual" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || { red "候选内核版本检测失败"; exit 1; }
+series=$(printf '%s' "$actual" | cut -d . -f 1,2)
+[[ "$series" == 1.10 ]] && template=/etc/s-box/sb10.json || template=/etc/s-box/sb11.json
+check_args=(-c "$template")
+[[ ! -f /etc/s-box/sb_extra.json ]] || check_args+=(-c /etc/s-box/sb_extra.json)
+if ! "$candidate" check "${check_args[@]}"; then
+red "候选内核不兼容现有配置（Snell 需要 1.14.0+），已保留当前内核及配置"
+exit 1
+fi
+cp -p /etc/s-box/sing-box "$work/old-core" && cp -p /etc/s-box/sb.json "$work/old-config" || exit 1
+restore=1
+if mv -f -- "$candidate" /etc/s-box/sing-box && cp "$template" /etc/s-box/sb.json && restartsb; then
+restore=0
+sbnh=$series
+if ! sbshare > /dev/null 2>&1; then
+red "内核已切换，但订阅刷新失败，请通过菜单9重试"
+exit 1
+fi
+exit 0
+fi
+exit 1
+)
+}
+
 upsbcroe(){
 sbactive
 lapre
@@ -4398,7 +4739,7 @@ elif [ "$menu" = "2" ]; then
 upcore=$(curl -Ls https://github.com/SagerNet/sing-box/releases | grep -oP '/tag/v\K[0-9.]+-[^"]+' | head -n 1)
 elif [ "$menu" = "3" ]; then
 echo
-red "注意: 版本号在 https://github.com/SagerNet/sing-box/tags 可查，且有Downloads字样 (必须1.10系或者1.30系以上版本)"
+red "版本号可在 https://github.com/SagerNet/sing-box/tags 查询；启用 Snell 时需要 1.14.0 或更新正式版"
 green "正式版版本号格式：数字.数字.数字 (例：1.10.7   注意，1.10系列内核支持geosite分流，1.10以上内核不支持geosite分流"
 green "测试版版本号格式：数字.数字.数字-alpha或rc或beta.数字 (例：1.13.0-alpha或rc或beta.1)"
 readp "请输入Sing-box版本号：" upcore
@@ -4407,27 +4748,8 @@ sing_box
 fi
 if [[ -n $upcore ]]; then
 green "开始下载并更新Sing-box内核……请稍等"
-sbname="sing-box-$upcore-linux-$cpu"
-curl -L -o /etc/s-box/sing-box.tar.gz  -# --retry 2 https://github.com/SagerNet/sing-box/releases/download/v$upcore/$sbname.tar.gz
-if [[ -f '/etc/s-box/sing-box.tar.gz' ]]; then
-tar xzf /etc/s-box/sing-box.tar.gz -C /etc/s-box
-mv /etc/s-box/$sbname/sing-box /etc/s-box
-rm -rf /etc/s-box/{sing-box.tar.gz,$sbname}
-if [[ -f '/etc/s-box/sing-box' ]]; then
-chown root:root /etc/s-box/sing-box
-chmod +x /etc/s-box/sing-box
-sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
-[[ "$sbnh" == "1.10" ]] && num=10 || num=11
-rm -rf /etc/s-box/sb.json
-cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
-restartsb && sbshare > /dev/null 2>&1
+core_update "$upcore" || return 1
 blue "成功升级/切换 Sing-box 内核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')" && sleep 3 && sing_box
-else
-red "下载 Sing-box 内核不完整，安装失败，请重试" && upsbcroe
-fi
-else
-red "下载 Sing-box 内核失败或不存在，请重试" && upsbcroe
-fi
 else
 red "版本号检测出错，请重试" && upsbcroe
 fi
@@ -4484,15 +4806,18 @@ local publish_dir node_file v2sub
 publish_dir=$(mktemp -d /etc/s-box/.share.XXXXXX) || exit 1
 trap 'rm -rf -- "$publish_dir"' EXIT
 trap 'exit 1' HUP INT TERM
-rm -f /etc/s-box/{vl_reality,vm_ws_argols,vm_ws_argogd,vm_ws,vm_ws_tls,hy2,tuic5,an}.txt || exit 1
+rm -f /etc/s-box/{vl_reality,vm_ws_argols,vm_ws_argogd,vm_ws,vm_ws_tls,hy2,tuic5,an,trojan}.txt || exit 1
 result_vl_vm_hy_tu && resvless && resvmess && reshy2 && restu5 || exit 1
 if [[ "$sbnh" != "1.10" ]]; then
 resan || exit 1
 [ -s /etc/s-box/an.txt ] || exit 1
 fi
+if [[ -s /etc/s-box/sb_extra.json ]]; then
+extra_share || exit 1
+fi
 [ -s /etc/s-box/vl_reality.txt ] && [ -s /etc/s-box/hy2.txt ] && [ -s /etc/s-box/tuic5.txt ] || exit 1
 [ -s /etc/s-box/vm_ws.txt ] || [ -s /etc/s-box/vm_ws_tls.txt ] || exit 1
-for node_file in /etc/s-box/{vl_reality,vm_ws_argols,vm_ws_argogd,vm_ws,vm_ws_tls,hy2,tuic5,an}.txt; do
+for node_file in /etc/s-box/{vl_reality,vm_ws_argols,vm_ws_argogd,vm_ws,vm_ws_tls,hy2,tuic5,an,trojan}.txt; do
 if [ -e "$node_file" ]; then
 [ -s "$node_file" ] && cat "$node_file" >> "$publish_dir/jhdy.txt" || exit 1
 fi
@@ -4612,6 +4937,11 @@ echo -e "🚀【  Hysteria-2   】${yellow}端口:$hy2_port  证书形式:$hy2_z
 echo -e "🚀【    Tuic-v5    】${yellow}端口:$tu5_port  证书形式:$tu5_zs  转发多端口: $tu5zfport${plain}"
 if [[ "$sbnh" != "1.10" ]]; then
 echo -e "🚀【    Anytls     】${yellow}端口:$an_port  证书形式:$an_zs${plain}"
+fi
+if [[ -s /etc/s-box/sb_extra.json ]]; then
+jq -r '.inbounds[] | select(.type == "trojan" or .type == "snell") |
+    "🚀【 " + (if .type == "trojan" then "Trojan + TLS" else "Snell" end) +
+    " 】TCP端口:" + (.listen_port|tostring) + "  管理：3 → 11"' /etc/s-box/sb_extra.json
 fi
 if [[ -s /etc/s-box/subdomain.log && -s /etc/s-box/subtoken.log ]]; then
 sub_show_urls noqr
@@ -4842,7 +5172,7 @@ echo
 green "sing-box 多协议部署与订阅管理脚本"
 blue "项目地址：https://github.com/$SB_REPO"
 blue "使用说明：https://github.com/$SB_REPO/blob/$SB_BRANCH/README.md"
-blue "管理命令：sing_box；域名分发：3 → 10；订阅管理：3 → 8；刷新节点：9"
+blue "管理命令：sing_box；Trojan/Snell：3 → 11；域名分发：3 → 10；订阅管理：3 → 8；刷新节点：9"
 echo
 }
 
@@ -4855,13 +5185,13 @@ white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 white "sing-box 多协议部署与订阅管理"
 white "项目地址：https://github.com/$SB_REPO"
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-white "Vless-reality-vision、Vmess-ws(tls)+Argo、Hy2、Tuic、Anytls 五协议共存脚本"
+white "Vless-reality、Vmess-ws/Argo、Hy2、Tuic、Anytls、Trojan-TLS、Snell 多协议脚本"
 white "脚本快捷方式：sing_box（安装完成后可用）"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green " 1. 一键安装 Sing-box" 
 green " 2. 删除卸载 Sing-box"
 white "----------------------------------------------------------------------------------"
-green " 3. 变更配置 【双证书TLS/UUID路径/Argo/IP优先/TG通知/Warp/订阅/域名分发/CDN优选】"
+green " 3. 变更配置 【TLS/UUID/Argo/IP优先/TG/Warp/订阅/域名分发/CDN/Trojan/Snell】"
 green " 4. 更改主端口/添加多端口跳跃复用" 
 green " 5. 三通道域名分流"
 green " 6. 关闭/重启 Sing-box"   

@@ -4,7 +4,7 @@
 
 ## 主要功能
 
-- 部署 VLESS Reality Vision、VMess WebSocket（可选 TLS / Argo）、Hysteria2、TUIC v5 和 AnyTLS。
+- 部署 VLESS Reality Vision、VMess WebSocket（可选 TLS / Argo）、Hysteria2、TUIC v5、AnyTLS、Trojan + TLS 和 Snell。
 - 生成 sing-box、Clash/Mihomo 客户端配置及聚合节点链接，订阅内容在服务器本地生成。
 - 提供本地 IP HTTP 订阅、GitLab 订阅和自定义域名 HTTPS 订阅；域名模式支持令牌轮换和后台端口管理。
 - 管理协议端口、证书、Argo 隧道、域名分流、Telegram 通知以及 sing-box 内核版本。
@@ -70,6 +70,18 @@ printf '3\n3\n2\n1\n固定密钥\n固定域名' | sing_box
 ```bash
 printf '5\n2\n1\n后缀域名1 后缀域名2' | sing_box
 ```
+
+## Trojan + TLS 与 Snell（VPS）
+
+新安装会同时配置 Trojan + TLS；使用 sing-box 1.14.0 或更新的正式版内核时，也会配置 Snell。旧安装更新脚本后，进入 **3 → 11「管理 Trojan / Snell」**，可分别启用、设置端口和密码、切换 Trojan 证书或停用协议，无需重装。Trojan 密码和 Snell PSK 在这个菜单中独立管理。
+
+Clash Verge Rev 使用现有的 **`clmi.yaml` Mihomo 订阅**。启用后刷新订阅，两个节点会加入手动选择、自动选择和负载均衡组。Snell 使用 sing-box 服务端 `version: 5`、Mihomo / sing-box 客户端 `version: 4`；sing-box 的这个服务端模式兼容 v4，不启用 v5 的 QUIC 代理模式。客户端需要支持 Snell v4，sing-box 客户端还需要 1.14.0 或更新版本。
+
+Trojan 默认沿用安装时选用的证书，也可在 **3 → 11** 中选择已有 ACME 证书。使用脚本自签证书时，生成的客户端配置沿用现有自签模式，跳过证书校验；使用 ACME 证书时启用证书校验。使用自有域名时，确认 SNI 与证书名称匹配。两个协议的服务端监听均使用 TCP，需要放行所选 TCP 端口。
+
+Trojan 会生成 `trojan://` 分享链接并加入 `jhsub.txt`。Snell 通过完整 YAML / JSON 配置分发，不生成不通用的单节点 URI；在 Clash Verge 中使用 `clmi.yaml` 即可。
+
+额外入站保存在 `/etc/s-box/sb_extra.json`，服务与原有 `sb.json` 一起加载。设置新协议前会校验合并配置，失败时保留原配置；内核切换也会先用候选内核检查配置，不兼容时保留当前内核。原有五类协议仍使用原管理菜单。
 
 ## 自定义域名 HTTPS 订阅（VPS）
 
