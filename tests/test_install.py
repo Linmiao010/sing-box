@@ -13,7 +13,7 @@ class InstallTests(ShellTestCase):
         super().setUp()
         (self.root / "bin").mkdir()
         (self.root / "config").mkdir()
-        self.shortcut = self.root / "bin" / "sb"
+        self.shortcut = self.root / "bin" / "sing_box"
         self.shortcut.write_text("#!/bin/bash\necho old\n", encoding="utf-8")
         self.old_script = self.shortcut.read_bytes()
         self.version = self.root / "config" / "v"
@@ -31,7 +31,7 @@ class InstallTests(ShellTestCase):
 red() { printf '%s\n' "$*"; }
 green() { printf '%s\n' "$*"; }
 sleep() { :; }
-sb() { printf 'restarted\n' > restarted; }
+sing_box() { printf 'restarted\n' > restarted; }
 curl() {
     local target= url= argument
     printf '%s\n' "$*" >> curl.log
@@ -66,13 +66,13 @@ curl() {
     def assert_shortcut_preserved(self):
         self.assertTrue(self.shortcut.exists(), "The installed shortcut was removed")
         self.assertEqual(self.shortcut.read_bytes(), self.old_script)
-        self.assertEqual(sorted(p.name for p in (self.root / "bin").iterdir()), ["sb"])
+        self.assertEqual(sorted(p.name for p in (self.root / "bin").iterdir()), ["sing_box"])
 
     def test_install_uses_fork_and_keeps_shortcut_executable(self):
         result = self.run_install()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.shortcut.read_text(encoding="utf-8"), self.payload)
-        self.assertEqual(self.run_shell("test -x bin/sb && ./bin/sb").stdout, "upgraded\n")
+        self.assertEqual(self.run_shell("test -x bin/sing_box && ./bin/sing_box").stdout, "upgraded\n")
         requests = (self.root / "curl.log").read_text(encoding="utf-8")
         self.assertIn(SOURCE + "/sb.sh", requests)
         self.assertNotIn("--insecure", requests)
@@ -81,6 +81,34 @@ curl() {
         result = self.run_install(mode="download_failure")
         self.assertNotEqual(result.returncode, 0)
         self.assert_shortcut_preserved()
+
+    def test_legacy_install_upgrades_to_new_command_and_keeps_old_entry_working(self):
+        legacy = self.shortcut.with_name("sb")
+        self.shortcut.rename(legacy)
+        result = self.run_install("update_script")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.shortcut.exists())
+        self.assertEqual(self.shortcut.read_text(encoding="utf-8"), self.payload)
+        self.assertEqual(self.run_shell("./bin/sb").stdout, "upgraded\n")
+        self.assertTrue((self.root / "restarted").exists())
+
+    def test_failed_legacy_upgrade_keeps_old_entry_working(self):
+        legacy = self.shortcut.with_name("sb")
+        self.shortcut.rename(legacy)
+        result = self.run_install("update_script", mode="download_failure")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(legacy.read_bytes(), self.old_script)
+        self.assertFalse(self.shortcut.exists())
+        self.assertFalse((self.root / "restarted").exists())
+
+    def test_old_updater_entry_migrates_without_downloading_again(self):
+        legacy = self.shortcut.with_name("sb")
+        self.shortcut.rename(legacy)
+        result = self.run_install("migrate_shortcut")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.shortcut.read_bytes(), self.old_script)
+        self.assertEqual(self.run_shell("bash bin/sb").stdout, "old\n")
+        self.assertFalse((self.root / "curl.log").exists())
 
     def test_invalid_bash_keeps_previous_shortcut(self):
         (self.root / "payload").write_text("#!/bin/bash\nif then\n", encoding="utf-8")
@@ -95,7 +123,7 @@ curl() {
         self.assert_shortcut_preserved()
 
     def test_upgrade_failure_does_not_claim_success_or_restart(self):
-        result = self.run_install("upsbyg", mode="download_failure")
+        result = self.run_install("update_script", mode="download_failure")
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("升级成功", result.stdout)
         self.assertFalse((self.root / "restarted").exists())
@@ -103,7 +131,7 @@ curl() {
         self.assert_shortcut_preserved()
 
     def test_upgrade_uses_same_source_for_script_and_version(self):
-        result = self.run_install("upsbyg")
+        result = self.run_install("update_script")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.shortcut.read_text(encoding="utf-8"), self.payload)
         self.assertEqual(self.version.read_text(encoding="utf-8"), "v26.10.13\n")
@@ -114,7 +142,7 @@ curl() {
         self.assertIn(SOURCE + "/version", requests)
 
     def test_version_download_failure_preserves_installed_state(self):
-        result = self.run_install("upsbyg", mode="version_failure")
+        result = self.run_install("update_script", mode="version_failure")
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("升级成功", result.stdout)
         self.assertFalse((self.root / "restarted").exists())

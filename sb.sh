@@ -62,8 +62,12 @@ bbr="Openvz/Lxc"
 fi
 hostname=$(hostname)
 
-if [ ! -f sbyg_update ]; then
-green "首次安装Sing-box-yg脚本必要的依赖……"
+# Preserve the dependency marker when upgrading an existing installation.
+if [[ -f sbyg_update && ! -f sing_box_update ]]; then
+mv sbyg_update sing_box_update || exit 1
+fi
+if [ ! -f sing_box_update ]; then
+green "首次安装sing-box脚本必要的依赖……"
 if command -v apk >/dev/null 2>&1; then
 apk update
 apk add bash libc6-compat jq openssl procps busybox-extras iproute2 iputils coreutils expect git socat iptables grep tar tzdata util-linux
@@ -116,7 +120,7 @@ fi
 fi
 done
 fi
-touch sbyg_update
+touch sing_box_update
 fi
 
 if [[ $vi = openvz ]]; then
@@ -288,7 +292,7 @@ red "生成bing自签证书失败" && exit
 fi
 echo
 if [[ -f /root/ygkkkca/cert.crt && -f /root/ygkkkca/private.key && -s /root/ygkkkca/cert.crt && -s /root/ygkkkca/private.key ]]; then
-yellow "经检测，之前已使用Acme-yg脚本申请过Acme域名IP证书：$(cat /root/ygkkkca/ca.log) "
+yellow "经检测，之前已使用ACME 脚本申请过Acme域名IP证书：$(cat /root/ygkkkca/ca.log) "
 green "是否使用 $(cat /root/ygkkkca/ca.log) 域名IP证书？"
 yellow "1：否！使用自签的证书 (回车默认)"
 yellow "2：是！使用 $(cat /root/ygkkkca/ca.log) 域名IP证书"
@@ -301,7 +305,7 @@ fi
 else
 green "是否申请一个Acme域名IP证书？"
 yellow "1：否！继续使用自签的证书 (回车默认)"
-yellow "2：是！使用Acme-yg脚本申请Acme证书 (支持80端口域名IP证书模式与Dns API域名模式)"
+yellow "2：是！使用ACME 脚本申请Acme证书 (支持80端口域名IP证书模式与Dns API域名模式)"
 readp "请选择【1-2】：" menu
 if [ -z "$menu" ] || [ "$menu" = "1" ] ; then
 zqzs
@@ -2401,7 +2405,6 @@ aarch64) cpu=arm64;;
 x86_64) cpu=amd64;;
 esac
 curl -L -o /etc/s-box/cloudflared -# --retry 2 https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-$cpu
-#curl -L -o /etc/s-box/cloudflared -# --retry 2 https://gitlab.com/rwkgyg/sing-box-yg/-/raw/main/$cpu
 chmod +x /etc/s-box/cloudflared
 fi
 }
@@ -2510,14 +2513,14 @@ cat > /etc/local.d/alpineargo.start <<'EOF'
 sleep 10
 nohup /etc/s-box/cloudflared tunnel --url http://localhost:$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port') --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 &
 sleep 10
-printf "9\n1\n" | bash /usr/bin/sb > /dev/null 2>&1
+printf "9\n1\n" | bash /usr/bin/sing_box > /dev/null 2>&1
 EOF
 chmod +x /etc/local.d/alpineargo.start
 rc-update add local default >/dev/null 2>&1
 else
 crontab -l 2>/dev/null > /tmp/crontab.tmp
 sed -i '/url http/d' /tmp/crontab.tmp
-echo '@reboot sleep 10 && /bin/bash -c "nohup /etc/s-box/cloudflared tunnel --url http://localhost:$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port') --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 & sleep 10 && printf \"9\n1\n\" | bash /usr/bin/sb > /dev/null 2>&1"' >> /tmp/crontab.tmp
+echo '@reboot sleep 10 && /bin/bash -c "nohup /etc/s-box/cloudflared tunnel --url http://localhost:$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port') --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 & sleep 10 && printf \"9\n1\n\" | bash /usr/bin/sing_box > /dev/null 2>&1"' >> /tmp/crontab.tmp
 crontab /tmp/crontab.tmp >/dev/null 2>&1
 rm /tmp/crontab.tmp
 fi
@@ -2573,7 +2576,7 @@ printf '%s\n' "$installed_version" | awk -F "更新内容" '{print $1}' | head -
 else
 yellow "脚本版本信息获取失败，请稍后通过菜单7更新"
 fi
-blue "Sing-box-yg脚本安装成功，脚本快捷方式：sb" && cronsb
+blue "sing-box脚本安装成功，脚本快捷方式：sing_box" && cronsb
 echo
 wgcfgo
 sbshare
@@ -2647,7 +2650,7 @@ blue "当前Vmess-ws(tls)的端口：$vm_port"
 [[ "$tls" = "false" ]] && blue "切记：可进入主菜单选项4-2，将Vmess-ws端口更改为任意7个80系端口(80、8080、8880、2052、2082、2086、2095)，可实现CDN优选IP" || blue "切记：可进入主菜单选项4-2，将Vmess-ws-tls端口更改为任意6个443系的端口(443、8443、2053、2083、2087、2096)，可实现CDN优选IP"
 echo
 else
-red "当前未申请域名证书，不可切换。主菜单选择12，执行Acme证书申请" && sleep 2 && sb
+red "当前未申请域名证书，不可切换。主菜单选择12，执行Acme证书申请" && sleep 2 && sing_box
 fi
 elif [ "$menu" = "3" ]; then
 if [ -f /root/ygkkkca/ca.log ]; then
@@ -2665,7 +2668,7 @@ echo $sbfiles | xargs -n1 sed -i "80s#$d#$d_d#"
 restartsb && sbshare > /dev/null 2>&1
 blue "Hysteria2协议域名证书更换完毕"
 else
-red "当前未申请域名证书，不可切换。主菜单选择12，执行Acme证书申请" && sleep 2 && sb
+red "当前未申请域名证书，不可切换。主菜单选择12，执行Acme证书申请" && sleep 2 && sing_box
 fi
 elif [ "$menu" = "4" ]; then
 if [ -f /root/ygkkkca/ca.log ]; then
@@ -2683,7 +2686,7 @@ echo $sbfiles | xargs -n1 sed -i "103s#$d#$d_d#"
 restartsb && sbshare > /dev/null 2>&1
 blue "Tuic5协议域名证书更换完毕"
 else
-red "当前未申请域名证书，不可切换。主菜单选择12，执行Acme证书申请" && sleep 2 && sb
+red "当前未申请域名证书，不可切换。主菜单选择12，执行Acme证书申请" && sleep 2 && sing_box
 fi
 elif [ "$menu" = "5" ]; then
 if [ -f /root/ygkkkca/ca.log ]; then
@@ -2701,10 +2704,10 @@ echo $sbfiles | xargs -n1 sed -i "120s#$d#$d_d#"
 restartsb && sbshare > /dev/null 2>&1
 blue "Anytls协议域名证书更换完毕"
 else
-red "当前未申请域名证书，不可切换。主菜单选择12，执行Acme证书申请" && sleep 2 && sb
+red "当前未申请域名证书，不可切换。主菜单选择12，执行Acme证书申请" && sleep 2 && sing_box
 fi
 else
-sb
+sing_box
 fi
 }
 
@@ -2899,7 +2902,7 @@ else
 changeport
 fi
 else
-sb
+sing_box
 fi
 }
 
@@ -2961,7 +2964,7 @@ rrpip="ipv6_only" && chip && v4_6="仅IPV6($v6)"
 else 
 red "当前不存在你选择的IPV4/IPV6地址，或者输入错误" && changeip
 fi
-blue "当前已更换的IP优先级：${v4_6}" && sb
+blue "当前已更换的IP优先级：${v4_6}" && sing_box
 else
 red "仅支持1.10.7内核可用" && exit
 fi
@@ -3143,7 +3146,7 @@ ipsub
 elif [ "$menu" = "9" ];then
 vmesscfadd
 else 
-sb
+sing_box
 fi
 }
 
@@ -3569,7 +3572,6 @@ blue "cloudflare-ech.com"
 blue "www.visa.com.sg"
 blue "www.wto.org"
 blue "www.shopify.com"
-blue "yg1.ygkkk.dpdns.org (yg1中的1，可换为1-13中任意数字)"
 echo
 yellow "恢复默认操作：选项1设置为VPS的IP或者解析的域名，选项2设置为www.bing.com或者解析的域名"
 echo
@@ -4160,7 +4162,7 @@ else
 yellow "遗憾！如需要VPS本地ipv6分流，请切换1.10系列内核" && exit
 fi
 else
-sb
+sing_box
 fi
 }
 
@@ -4182,7 +4184,7 @@ readp "1：重启\n2：关闭\n请选择：" menu
 if [ "$menu" = "1" ]; then
 restartsb
 sbactive
-green "Sing-box服务已重启\n" && sleep 3 && sb
+green "Sing-box服务已重启\n" && sleep 3 && sing_box
 elif [ "$menu" = "2" ]; then
 if command -v apk >/dev/null 2>&1; then
 rc-service sing-box stop
@@ -4190,7 +4192,7 @@ else
 systemctl stop sing-box
 systemctl disable sing-box
 fi
-green "Sing-box服务已关闭\n" && sleep 3 && sb
+green "Sing-box服务已关闭\n" && sleep 3 && sing_box
 else
 stclre
 fi
@@ -4215,22 +4217,32 @@ rm /tmp/crontab.tmp
 
 lnsb(){
 local script_tmp
-script_tmp=$(mktemp /usr/bin/.sb.XXXXXX) || { red "无法创建脚本下载临时文件"; return 1; }
+script_tmp=$(mktemp /usr/bin/.sing_box.XXXXXX) || { red "无法创建脚本下载临时文件"; return 1; }
 if ! curl -fL -o "$script_tmp" -# --retry 2 "$SB_RAW_BASE/sb.sh" || [[ ! -s "$script_tmp" ]] || ! bash -n "$script_tmp"; then
 rm -f "$script_tmp"
-red "脚本下载或语法检查失败，已保留原有sb命令"
+red "脚本下载或语法检查失败，已保留原有快捷命令"
 return 1
 fi
-if ! chmod +x "$script_tmp" || ! mv -f "$script_tmp" /usr/bin/sb; then
+if ! chmod +x "$script_tmp" || ! mv -f "$script_tmp" /usr/bin/sing_box; then
 rm -f "$script_tmp"
-red "脚本替换失败，已保留原有sb命令"
+red "脚本替换失败，已保留原有快捷命令"
 return 1
 fi
+if [[ -f /usr/bin/sb ]]; then
+ln -sf /usr/bin/sing_box /usr/bin/sb || { red "sing_box 已安装，但旧命令兼容链接更新失败"; return 1; }
+fi
+return 0
 }
 
-upsbyg(){
-if [[ ! -f '/usr/bin/sb' ]]; then
-red "未正常安装Sing-box-yg" && exit
+migrate_shortcut(){
+[[ /usr/bin/sb -ef /usr/bin/sing_box ]] && return 0
+mv -f /usr/bin/sb /usr/bin/sing_box || { red "无法迁移旧脚本入口"; return 1; }
+ln -s /usr/bin/sing_box /usr/bin/sb || { red "sing_box 已安装，但旧命令兼容链接创建失败"; return 1; }
+}
+
+update_script(){
+if [[ ! -f /usr/bin/sing_box && ! -f /usr/bin/sb ]]; then
+red "未正常安装 sing-box"; return 1
 fi
 local script_version
 if ! script_version=$(curl -fsSL "$SB_RAW_BASE/version"); then
@@ -4244,7 +4256,7 @@ return 1
 fi
 lnsb || return 1
 printf '%s\n' "$script_version" > /etc/s-box/v
-green "Sing-box-yg安装脚本升级成功" && sleep 5 && sb
+green "sing-box安装脚本升级成功" && sleep 5 && sing_box
 }
 
 lapre(){
@@ -4280,7 +4292,7 @@ green "正式版版本号格式：数字.数字.数字 (例：1.10.7   注意，
 green "测试版版本号格式：数字.数字.数字-alpha或rc或beta.数字 (例：1.13.0-alpha或rc或beta.1)"
 readp "请输入Sing-box版本号：" upcore
 else
-sb
+sing_box
 fi
 if [[ -n $upcore ]]; then
 green "开始下载并更新Sing-box内核……请稍等"
@@ -4298,7 +4310,7 @@ sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/d
 rm -rf /etc/s-box/sb.json
 cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
 restartsb && sbshare > /dev/null 2>&1
-blue "成功升级/切换 Sing-box 内核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')" && sleep 3 && sb
+blue "成功升级/切换 Sing-box 内核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')" && sleep 3 && sing_box
 else
 red "下载 Sing-box 内核不完整，安装失败，请重试" && upsbcroe
 fi
@@ -4328,14 +4340,14 @@ fi
 ps -ef | grep "[l]ocalhost:$(sed 's://.*::g' /etc/s-box/sb.json 2>/dev/null | jq -r '.inbounds[1].listen_port')" | awk '{print $2}' | xargs kill 2>/dev/null
 ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
 kill -15 $(pgrep -f 'websbox' 2>/dev/null) >/dev/null 2>&1
-rm -rf /etc/s-box sbyg_update /usr/bin/sb /root/geoip.db /root/geosite.db /root/warpapi /root/warpip /root/websbox
+rm -rf /etc/s-box sing_box_update sbyg_update /usr/bin/sing_box /usr/bin/sb /root/geoip.db /root/geosite.db /root/warpapi /root/warpip /root/websbox
 rm -f /etc/local.d/alpineargo.start /etc/local.d/alpinesub.start /etc/local.d/alpinews5.start
 uncronsb
 iptables -t nat -F PREROUTING >/dev/null 2>&1
 netfilter-persistent save >/dev/null 2>&1
 service iptables save >/dev/null 2>&1
 green "Sing-box卸载完成！"
-blue "欢迎继续使用Sing-box-yg脚本：bash <(curl -fsSL $SB_RAW_BASE/sb.sh)"
+blue "欢迎继续使用sing-box脚本：bash <(curl -fsSL $SB_RAW_BASE/sb.sh)"
 echo
 }
 
@@ -4427,7 +4439,7 @@ white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 red "🚀SFA/SFI/SFW配置文件显示如下："
-red "安卓SFA、苹果SFI，win电脑官方文件包SFW请到甬哥Github项目自行下载，"
+red "请使用与当前配置版本兼容的 sing-box 客户端导入配置。"
 red "文件目录 /etc/s-box/sbox.json ，复制自建以json文件格式为准" && sleep 2
 echo
 cat /etc/s-box/sbox.json
@@ -4437,16 +4449,14 @@ echo
 elif [ "$menu" = "3" ]; then
 tgnotice
 else
-sb
+sing_box
 fi
 }
 
 acme(){
-#bash <(curl -Ls https://gitlab.com/rwkgyg/acme-script/raw/main/acme.sh)
 bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/acme-yg/main/acme.sh)
 }
 cfwarp(){
-#bash <(curl -Ls https://gitlab.com/rwkgyg/CFwarp/raw/main/CFwarp.sh)
 bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/warp-yg/main/CFwarp.sh)
 }
 bbr(){
@@ -4712,40 +4722,30 @@ fi
 elif [ "$menu" = "3" ]; then
 unins && green "已停止WARP-plus-Socks5代理功能"
 else
-sb
+sing_box
 fi
 }
 
 sbsm(){
 echo
-green "关注甬哥YouTube频道：https://youtube.com/@ygkkk?sub_confirmation=1 了解最新代理协议与翻墙动态"
-echo
-blue "sing-box-yg脚本视频教程：https://www.youtube.com/playlist?list=PLMgly2AulGG_Affv6skQXWnVqw7XWiPwJ"
-echo
-blue "sing-box-yg脚本博客说明：http://ygkkk.blogspot.com/2023/10/sing-box-yg.html"
-echo
-blue "sing-box-yg脚本项目地址：https://github.com/yonggekkk/sing-box-yg"
-echo
-blue "推荐甬哥新品：ArgoSBX一键无交互小钢炮脚本"
-blue "ArgoSBX项目地址：https://github.com/yonggekkk/argosbx"
+green "sing-box 多协议部署与订阅管理脚本"
+blue "项目地址：https://github.com/$SB_REPO"
+blue "使用说明：https://github.com/$SB_REPO/blob/$SB_BRANCH/README.md"
+blue "管理命令：sing_box；订阅管理：3 → 8；刷新节点：9"
 echo
 }
 
+# Older menu-7 updaters still save and launch the new script as /usr/bin/sb.
+if [[ "$0" == /usr/bin/sb ]]; then
+migrate_shortcut || exit 1
+fi
 clear
-white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" 
-echo -e "${bblue} ░██     ░██      ░██ ██ ██         ░█${plain}█   ░██     ░██   ░██     ░█${red}█   ░██${plain}  "
-echo -e "${bblue}  ░██   ░██      ░██    ░░██${plain}        ░██  ░██      ░██  ░██${red}      ░██  ░██${plain}   "
-echo -e "${bblue}   ░██ ░██      ░██ ${plain}                ░██ ██        ░██ █${red}█        ░██ ██  ${plain}   "
-echo -e "${bblue}     ░██        ░${plain}██    ░██ ██       ░██ ██        ░█${red}█ ██        ░██ ██  ${plain}  "
-echo -e "${bblue}     ░██ ${plain}        ░██    ░░██        ░██ ░██       ░${red}██ ░██       ░██ ░██ ${plain}  "
-echo -e "${bblue}     ░█${plain}█          ░██ ██ ██         ░██  ░░${red}██     ░██  ░░██     ░██  ░░██ ${plain}  "
-white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" 
-white "甬哥Github项目  ：github.com/yonggekkk"
-white "甬哥Blogger博客 ：ygkkk.blogspot.com"
-white "甬哥YouTube频道 ：www.youtube.com/@ygkkk"
-white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" 
+white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
+white "sing-box 多协议部署与订阅管理"
+white "项目地址：https://github.com/$SB_REPO"
+white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 white "Vless-reality-vision、Vmess-ws(tls)+Argo、Hy2、Tuic、Anytls 五协议共存脚本"
-white "脚本快捷方式：sb"
+white "脚本快捷方式：sing_box"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green " 1. 一键安装 Sing-box" 
 green " 2. 删除卸载 Sing-box"
@@ -4754,7 +4754,7 @@ green " 3. 变更配置 【双证书TLS/UUID路径/Argo/IP优先/TG通知/Warp/�
 green " 4. 更改主端口/添加多端口跳跃复用" 
 green " 5. 三通道域名分流"
 green " 6. 关闭/重启 Sing-box"   
-green " 7. 更新 Sing-box-yg 脚本"
+green " 7. 更新 sing-box 脚本"
 green " 8. 更新/切换/指定 Sing-box 内核版本"
 white "----------------------------------------------------------------------------------"
 green " 9. 刷新并查看节点 【Mihomo/SFA+SFI+SFW三合一配置/订阅链接/推送TG通知】"
@@ -4765,7 +4765,7 @@ green "13. 管理 Warp 查看Netflix/ChatGPT解锁情况"
 green "14. 添加 WARP-plus-Socks5 代理模式 【本地Warp/多地区Psiphon-VPN】"
 green "15. 更换IP刷新本地IP、调整IPV4/IPV6配置输出"
 white "----------------------------------------------------------------------------------"
-green "16. Sing-box-yg脚本使用说明书"
+green "16. sing-box脚本使用说明书"
 white "----------------------------------------------------------------------------------"
 green " 0. 退出脚本"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -4773,15 +4773,15 @@ insV=$(cat /etc/s-box/v 2>/dev/null)
 latestV=$(curl -fsSL "$SB_RAW_BASE/version" | awk -F "更新内容" '{print $1}' | head -n 1)
 if [ -f /etc/s-box/v ]; then
 if [ "$insV" = "$latestV" ]; then
-echo -e "当前 Sing-box-yg 脚本最新版：${bblue}${insV}${plain} (已安装)"
+echo -e "当前 sing-box 脚本最新版：${bblue}${insV}${plain} (已安装)"
 else
-echo -e "当前 Sing-box-yg 脚本版本号：${bblue}${insV}${plain}"
-echo -e "检测到最新 Sing-box-yg 脚本版本号：${yellow}${latestV}${plain} (可选择7进行更新)"
+echo -e "当前 sing-box 脚本版本号：${bblue}${insV}${plain}"
+echo -e "检测到最新 sing-box 脚本版本号：${yellow}${latestV}${plain} (可选择7进行更新)"
 echo -e "${yellow}$(curl -fsSL "$SB_RAW_BASE/version")${plain}"
 fi
 else
-echo -e "当前 Sing-box-yg 脚本版本号：${bblue}${latestV}${plain}"
-yellow "未安装 Sing-box-yg 脚本！请先选择 1 安装"
+echo -e "当前 sing-box 脚本版本号：${bblue}${latestV}${plain}"
+yellow "未安装 sing-box 脚本！请先选择 1 安装"
 fi
 
 lapre
@@ -4886,7 +4886,7 @@ case "$Input" in
  4 ) changeport;;
  5 ) changefl;;
  6 ) stclre;;
- 7 ) upsbyg;; 
+ 7 ) update_script;;
  8 ) upsbcroe;;
  9 ) clash_sb_share;;
 10 ) sblog;;

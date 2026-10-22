@@ -1,6 +1,6 @@
 # sing-box
 
-面向 VPS 的 sing-box 多协议部署与管理脚本，提供节点配置生成、订阅分享和自定义域名 HTTPS 订阅。主入口为 [`sb.sh`](sb.sh)，安装后通过 `sb` 命令管理。
+面向 VPS 的 sing-box 多协议部署与管理脚本，提供节点配置生成、订阅分享和自定义域名 HTTPS 订阅。主入口为 [`sb.sh`](sb.sh)，安装后通过 `sing_box` 命令管理。
 
 ## 主要功能
 
@@ -24,17 +24,22 @@ bash <(wget -qO- https://raw.githubusercontent.com/Linmiao010/sing-box/main/sb.s
 bash <(curl -fsSL https://raw.githubusercontent.com/Linmiao010/sing-box/main/sb.sh)
 ```
 
-进入菜单后选择 **1** 安装。安装完成后运行 `sb` 打开管理菜单。
+进入菜单后选择 **1** 安装。安装完成后运行 `sing_box` 打开管理菜单。已有安装升级后也使用该命令；旧 `sb` 入口作为兼容链接保留，供已有定时任务调用。
 
-首次安装、`sb` 快捷命令的菜单 **7** 升级、版本检查和重新安装均使用本仓库 `Linmiao010/sing-box` 的 `main` 分支。本地修改必须先推送到该分支，远程安装或升级命令才能取得新版本。
+首次安装、`sing_box` 快捷命令的菜单 **7** 升级、版本检查和重新安装均使用本仓库 `Linmiao010/sing-box` 的 `main` 分支。本地修改必须先推送到该分支，远程安装或升级命令才能取得新版本。
 
 要在已安装的 VPS 上先验证未推送的改动，可将当前仓库的同一份 `sb.sh` 上传到 VPS，在该文件所在目录以 root 执行：
 
 ```bash
-bash -n ./sb.sh && install -m 755 ./sb.sh /usr/bin/sb && sb
+bash -n ./sb.sh && install -m 755 ./sb.sh /usr/bin/sing_box && {
+  if [ -f /usr/bin/sb ]; then
+    ln -sf /usr/bin/sing_box /usr/bin/sb || exit 1
+  fi
+  sing_box
+}
 ```
 
-这会把当前文件安装为同一个 `sb` 快捷命令。之后菜单 **7** 仍从本仓库 `main` 下载；本地改动推送前执行升级，会被远程版本覆盖。
+这会把当前文件安装为同一个 `sing_box` 快捷命令。之后菜单 **7** 仍从本仓库 `main` 下载；本地改动推送前执行升级，会被远程版本覆盖。
 
 ## 常用快捷操作
 
@@ -43,36 +48,36 @@ bash -n ./sb.sh && install -m 755 ./sb.sh /usr/bin/sb && sb
 创建本地 IP HTTP 订阅，将示例令牌替换为自己的令牌：
 
 ```bash
-printf '3\n8\n1\nmy_subscription_token_123\n\n' | sb
+printf '3\n8\n1\nmy_subscription_token_123\n\n' | sing_box
 ```
 
 启用 Argo 临时隧道：
 
 ```bash
-printf '3\n3\n1\n1' | sb
+printf '3\n3\n1\n1' | sing_box
 ```
 
 启用 Argo 固定隧道，替换示例中的密钥与域名：
 
 ```bash
-printf '3\n3\n2\n1\n固定密钥\n固定域名' | sb
+printf '3\n3\n2\n1\n固定密钥\n固定域名' | sing_box
 ```
 
 设置域名分流，替换示例中的域名后缀：
 
 ```bash
-printf '5\n2\n1\n后缀域名1 后缀域名2' | sb
+printf '5\n2\n1\n后缀域名1 后缀域名2' | sing_box
 ```
 
 ## 自定义域名 HTTPS 订阅（VPS）
 
-运行 `sb`，进入 **3 → 8** 管理订阅入口。域名订阅通过 Caddy 提供 HTTPS，订阅后台仅监听 `127.0.0.1`；节点协议及其端口沿用原配置。
+运行 `sing_box`，进入 **3 → 8** 管理订阅入口。域名订阅通过 Caddy 提供 HTTPS，订阅后台仅监听 `127.0.0.1`；节点协议及其端口沿用原配置。
 
 ### 启用域名订阅
 
 1. 准备独立的订阅域名，例如 `sub.example.com`。将其 A/AAAA 记录指向当前 VPS；初次配置使用 DNS-only（仅 DNS 解析），并确保填写的 IPv4/IPv6 地址可达。
 2. 放行 VPS 防火墙与云平台安全组的 **TCP 80、443**。使用独立订阅后台端口，无需更改节点端口。
-3. 在 `sb` 的 **3 → 8 → 5** 中输入域名，仅填 `sub.example.com`，不带 `https://`、端口或路径。
+3. 在 `sing_box` 的 **3 → 8 → 5** 中输入域名，仅填 `sub.example.com`，不带 `https://`、端口或路径。
 4. 输入至少 **16 个字符**的订阅令牌，只能使用字母、数字、`_`、`-`。直接回车会通过 `openssl rand -hex 24` 生成令牌，即 24 个随机字节编码为 48 个十六进制字符。
 5. 输入一个未占用的本机后台端口，或回车随机选择。脚本配置入口并检查 HTTPS；成功后显示订阅链接。
 
