@@ -13,6 +13,12 @@ readp() { read -r "$2"; }
 red() { printf '%s\n' "$*"; }
 instsllsingbox() { printf 'INSTALL\n'; }
 acme() { printf 'CERTIFICATE\n'; }
+ipuuid() { printf 'OUTPUT_FAMILY:%s\n' "$1"; }
+wgcfgo() { printf 'UNEXPECTED_WARP_REFRESH\n'; }
+sbshare() { printf 'SHARE\n'; }
+ensure_dependencies() { printf 'CHECK_DEPENDENCIES\n'; }
+setup_tun() { printf 'SETUP_TUN\n'; }
+green() { printf '%s\n' "$*"; }
 main_menu() {
 ''' + menu + "\n}\n"
         script += "printf '%s' " + shlex.quote(inputs) + " | main_menu\n"
@@ -35,3 +41,13 @@ main_menu() {
         result = self.run_menu("0\n")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
+
+    def test_menu_fifteen_selects_output_without_warp_refresh(self):
+        result = self.run_menu("15\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "OUTPUT_FAMILY:select\nSHARE\n")
+
+    def test_menu_seventeen_repairs_without_manual_status_refresh(self):
+        result = self.run_menu("17\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("CHECK_DEPENDENCIES\nSETUP_TUN\n", result.stdout)

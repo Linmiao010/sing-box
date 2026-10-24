@@ -170,8 +170,10 @@ fi
 
 public_ip(){
 local family=$1 url address
-for url in https://icanhazip.com https://api64.ipify.org; do
-if address=$(curl -fsS "-$family" --noproxy '*' --connect-timeout 2 --max-time 5 "$url" 2>/dev/null); then
+local -a urls=(https://icanhazip.com https://api64.ipify.org)
+[[ -z ${3:-} ]] || urls=("$3")
+for url in "${urls[@]}"; do
+if address=$(curl -q -fsS "-$family" --noproxy '*' --retry 0 --connect-timeout "${2:-2}" --max-time "${2:-5}" "$url" 2>/dev/null); then
 address=${address%$'\r'}
 if ip_literal_valid "$family" "$address"; then
 printf '%s\n' "$address"
@@ -181,6 +183,33 @@ fi
 done
 return 1
 }
+
+menu_ip_status(){
+local family address url
+v4= v6=
+# Race both HTTPS sources for both families, with no sequential fallback wait.
+# Each request has 0.6s, leaving time for process/validation overhead within 1s.
+while read -r family address; do
+case "$family" in
+4) [[ -n $v4 ]] || v4=$address ;;
+6) [[ -n $v6 ]] || v6=$address ;;
+esac
+done < <(
+for family in 4 6; do
+for url in https://icanhazip.com https://api64.ipify.org; do
+(
+address=$(public_ip "$family" 0.6 "$url") || address=
+printf '%s %s\n' "$family" "$address"
+) &
+done
+done
+wait
+)
+vps_ipv4=${v4:-公网IPv4探测未成功}
+vps_ipv6=${v6:-公网IPv6探测未成功}
+showv4=$vps_ipv4 showv6=$vps_ipv6
+}
+
 warpcheck(){
 wgcfv6=$(curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
 wgcfv4=$(curl -s4m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
@@ -266,7 +295,7 @@ local release_page
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green "使用哪个内核版本？"
 yellow "1：使用目前最新正式版内核 (回车默认)"
-yellow "2：使用之前1.10.7正式版内核 (支持geosite分流、IP优选级切换，无Anytls协议)"
+yellow "2：使用之前1.10.7正式版内核 (支持geosite分流，无Anytls协议)"
 readp "请选择【1-2】：" menu || return 1
 if [ -z "$menu" ] || [ "$menu" = "1" ] ; then
 if ! release_page=$(curl -fLsS --connect-timeout 2 --max-time 6 https://github.com/SagerNet/sing-box/releases/latest); then
@@ -934,6 +963,7 @@ cat > /etc/s-box/sb11.json <<EOF
 ],
 "outbound":"warp-out"
 },
+{"action":"resolve","strategy":"$ipv"},
 {
 "outbound": "direct",
 "network": "udp,tcp"
@@ -1235,6 +1265,7 @@ fi
 }
 
 ipuuid(){
+local selected_ip
 if command -v apk >/dev/null 2>&1; then
 status_cmd="rc-service sing-box status"
 status_pattern="started"
@@ -1243,42 +1274,37 @@ status_cmd="systemctl is-active sing-box"
 status_pattern="active"
 fi
 if [[ -n $($status_cmd 2>/dev/null | grep -w "$status_pattern") && -f '/etc/s-box/sb.json' ]]; then
-v4v6
-if [[ -z $v4 && -z $v6 ]]; then
-red "公网IP探测未成功，已保留原节点地址；本机配置了地址不代表公网可达"
+if [[ ${1:-} == select ]] && {
+ip -o link show dev wgcf 2>/dev/null | grep -qE '<([^>]*,)?UP[,>]' || pgrep -x warp-go >/dev/null 2>&1
+}; then
+red "检测到活动的系统级WARP，公网探测可能为WARP出口，已保留原节点地址；请关闭全局WARP后重新进入主菜单再选择配置输出"
 return 1
 fi
-if [[ -n $v4 && -n $v6 ]]; then
-green "调整IPv4/IPV6配置输出"
-yellow "1：刷新本地IP，使用IPV4配置输出 (回车默认) "
-yellow "2：刷新本地IP，使用IPV6配置输出"
-readp "请选择【1-2】：" menu
-if [ -z "$menu" ] || [ "$menu" = "1" ]; then
-server_ip="$v4"
-echo "$server_ip" > /etc/s-box/server_ip.log
-server_ipcl="$v4"
-echo "$server_ipcl" > /etc/s-box/server_ipcl.log
-else
-server_ip="[$v6]"
-echo "$server_ip" > /etc/s-box/server_ip.log
-server_ipcl="$v6"
-echo "$server_ipcl" > /etc/s-box/server_ipcl.log
+[[ ${1:-} == select ]] || v4v6
+if [[ -z $v4 && -z $v6 ]]; then
+red "公网IP探测未成功，已保留原节点地址"
+return 1
 fi
+if [[ ${1:-} == select || ( -n $v4 && -n $v6 ) ]]; then
+green "调整IPv4/IPv6配置输出"
+yellow "1：使用IPv4配置输出 (回车默认)"
+yellow "2：使用IPv6配置输出"
+readp "请选择【1-2】：" menu || return 1
+case "$menu" in
+""|1) selected_ip=$v4 ;;
+2) selected_ip=$v6 ;;
+*) red "输入无效，请选择1或2；已保留原节点地址"; return 1 ;;
+esac
+[[ -n $selected_ip ]] || { red "所选地址族的公网IP探测未成功，已保留原节点地址"; return 1; }
 else
 yellow "仅确认一个地址族的公网IP，使用已探测到的地址生成配置"
-serip=${v4:-$v6}
-if [[ "$serip" =~ : ]]; then
-server_ip="[$serip]"
-echo "$server_ip" > /etc/s-box/server_ip.log
-server_ipcl="$serip"
-echo "$server_ipcl" > /etc/s-box/server_ipcl.log
-else
-server_ip="$serip"
-echo "$server_ip" > /etc/s-box/server_ip.log
-server_ipcl="$serip"
-echo "$server_ipcl" > /etc/s-box/server_ipcl.log
+selected_ip=${v4:-$v6}
 fi
-fi
+server_ip=$selected_ip
+[[ $selected_ip != *:* ]] || server_ip="[$selected_ip]"
+server_ipcl=$selected_ip
+printf '%s\n' "$server_ip" > /etc/s-box/server_ip.log
+printf '%s\n' "$server_ipcl" > /etc/s-box/server_ipcl.log
 else
 red "Sing-box服务未运行" && exit
 fi
@@ -3285,31 +3311,152 @@ changeserv
 fi
 }
 
-changeip(){
-if [[ "$sbnh" == "1.10" ]]; then
-v4v6
-chip(){
-rpip=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.outbounds[0].domain_strategy')
-sed -i "111s/$rpip/$rrpip/g" /etc/s-box/sb10.json
-cp /etc/s-box/sb10.json /etc/s-box/sb.json
-restartsb
+ip_priority_get(){
+jq -r '
+  ([.outbounds[]? | select(.type == "direct" and .tag == "direct") |
+    .domain_strategy // empty][0]) //
+  (if .route.rules[-1].outbound == "direct" and
+      .route.rules[-2].action == "resolve" and
+      ((.route.rules[-2] | keys) - ["action", "strategy"] | length) == 0
+   then .route.rules[-2].strategy else null end) // "default"
+' "${1:-/etc/s-box/sb.json}"
 }
-readp "1. IPV4优先\n2. IPV6优先\n3. 仅IPV4\n4. 仅IPV6\n请选择：" choose
-if [[ $choose == "1" && -n $v4 ]]; then
-rrpip="prefer_ipv4" && chip && v4_6="IPV4优先($v4)"
-elif [[ $choose == "2" && -n $v6 ]]; then
-rrpip="prefer_ipv6" && chip && v4_6="IPV6优先($v6)"
-elif [[ $choose == "3" && -n $v4 ]]; then
-rrpip="ipv4_only" && chip && v4_6="仅IPV4($v4)"
-elif [[ $choose == "4" && -n $v6 ]]; then
-rrpip="ipv6_only" && chip && v4_6="仅IPV6($v6)"
-else 
-red "所选地址族的公网探测未成功，或者输入错误" && changeip
-fi
-blue "当前已更换的IP优先级：${v4_6}" && sing_box
+
+ip_priority_label(){
+case "$1" in
+prefer_ipv4) printf 'IPv4优先' ;;
+prefer_ipv6) printf 'IPv6优先' ;;
+ipv4_only) printf '仅解析IPv4' ;;
+ipv6_only) printf '仅解析IPv6' ;;
+default) printf '默认（未显式设置）' ;;
+*) printf '无法读取' ;;
+esac
+}
+
+ip_priority_patch(){
+# Preserve the template layout: other menus still edit certificate/port/rule lines.
+# Compare parsed results so an unfamiliar layout fails without changing any files.
+jq -e -j -n --rawfile source "$1" --arg series "$3" --arg strategy "$4" '
+  def checked($expected):
+    . as $text | if (fromjson) == $expected then $text
+    else error("不支持此配置布局，未修改配置") end;
+  ($source | fromjson) as $config |
+  if $series == "1.10" then
+    if ([$config.outbounds[] | select(.type == "direct" and .tag == "direct")] | length) != 1
+    then error("缺少唯一的默认 direct 出站") else
+      ($config | (.outbounds[] | select(.type == "direct" and .tag == "direct") |
+        .domain_strategy) = $strategy) as $expected |
+      $source | sub("(?<prefix>\"tag\"\\s*:\\s*\"direct\"\\s*,\\s*\"domain_strategy\"\\s*:\\s*)\"[^\"]*\"";
+        "\(.prefix)\"\($strategy)\"") | checked($expected)
+    end
+  else
+    if $config.route.rules[-1] != {"outbound":"direct","network":"udp,tcp"}
+    then error("未找到模板末尾的默认 direct 路由") else
+      ($config.route.rules[-2] // {}) as $previous |
+      ($previous.action == "resolve" and (($previous | keys) - ["action", "strategy"] | length) == 0) as $existing |
+      ($config | if $existing then .route.rules[-2].strategy = $strategy
+        else .route.rules |= .[:-1] + [{"action":"resolve","strategy":$strategy}] + .[-1:] end) as $expected |
+      "\\{\\s*\"outbound\"\\s*:\\s*\"direct\"\\s*,\\s*\"network\"\\s*:\\s*\"udp,tcp\"\\s*\\}\\s*\\]\\s*\\}\\s*\\}\\s*$" as $tail |
+      (if $existing then "\\{\\s*\"action\"\\s*:\\s*\"resolve\"\\s*,\\s*\"strategy\"\\s*:\\s*\"[^\"]*\"\\s*\\},\\s*"
+       else "" end) as $prefix |
+      $source | sub($prefix + "(?<tail>" + $tail + ")";
+        "{\"action\":\"resolve\",\"strategy\":\"\($strategy)\"},\n\(.tail)") | checked($expected)
+    end
+  end
+' > "$2"
+}
+
+ip_priority_restart(){
+restartsb || return 1
+# Type=simple can acknowledge restart before the process fails during startup.
+sleep 1
+if command -v apk >/dev/null 2>&1; then
+rc-service sing-box status 2>/dev/null | grep -qw started
 else
-red "仅支持1.10.7内核可用" && exit
+systemctl is-active --quiet sing-box
 fi
+}
+
+ip_priority_apply(){
+(
+local strategy=$1 work file series restore=0 failed=0
+local check_args
+case "$strategy" in
+prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only) ;;
+*) red "无效的IP优先级"; exit 1 ;;
+esac
+work=$(mktemp -d /etc/s-box/.ip-priority.XXXXXX) || exit 1
+ip_priority_cleanup(){
+local status=$?
+trap - EXIT
+trap '' HUP INT TERM
+if (( restore )); then
+for file in sb10.json sb11.json sb.json; do
+mv -f -- "$work/old-$file" "/etc/s-box/$file" || failed=1
+done
+if (( failed )); then
+red "恢复配置失败，剩余备份保留在 $work"
+return 1
+fi
+ip_priority_restart >/dev/null 2>&1 || red "原配置已恢复，但服务启动失败，请查看运行日志"
+red "IP优先级切换失败，已恢复原配置"
+fi
+rm -rf -- "$work"
+return "$status"
+}
+trap ip_priority_cleanup EXIT
+trap 'exit 1' HUP INT TERM
+for file in sb10.json sb11.json sb.json; do
+cp -p "/etc/s-box/$file" "$work/old-$file" && cp -p "/etc/s-box/$file" "$work/$file" || exit 1
+case "$file" in
+sb10.json) series=1.10 ;;
+sb11.json) series=1.11 ;;
+sb.json) series=$sbnh ;;
+esac
+ip_priority_patch "/etc/s-box/$file" "$work/$file" "$series" "$strategy" || exit 1
+done
+check_args=(-c "$work/sb.json")
+[[ ! -f /etc/s-box/sb_extra.json ]] || check_args+=(-c /etc/s-box/sb_extra.json)
+if ! /etc/s-box/sing-box check "${check_args[@]}"; then
+red "候选配置校验失败，已保留原配置"
+exit 1
+fi
+restore=1
+for file in sb10.json sb11.json sb.json; do
+mv -f -- "$work/$file" "/etc/s-box/$file" || exit 1
+done
+ip_priority_restart || exit 1
+restore=0
+)
+}
+
+changeip(){
+local choose strategy family address
+yellow "设置VPS默认出站的域名解析优先级；已有WARP/SOCKS分流保持各自策略"
+yellow "仅解析模式只限制域名解析结果，IP地址请求仍可能使用另一地址族"
+while true; do
+readp "1. IPv4优先\n2. IPv6优先\n3. 仅解析IPv4\n4. 仅解析IPv6\n0. 返回上层\n请选择：" choose || return 1
+case "$choose" in
+1) strategy=prefer_ipv4; family=4 ;;
+2) strategy=prefer_ipv6; family=6 ;;
+3) strategy=ipv4_only; family=4 ;;
+4) strategy=ipv6_only; family=6 ;;
+0) changeserv; return ;;
+*) red "输入无效，请选择0-4"; continue ;;
+esac
+address=$(public_ip "$family") || address=
+if [[ -z $address ]]; then
+yellow "IPv${family}公网探测未成功，无法确认可用性"
+if [[ $strategy == *_only ]]; then
+red "仅解析模式未应用，已保留原配置"
+return 1
+fi
+fi
+ip_priority_apply "$strategy" || return 1
+blue "当前已更换的IP优先级：$(ip_priority_label "$strategy")"
+sing_box
+return
+done
 }
 
 tgsbshow(){
@@ -3468,7 +3615,7 @@ changeserv(){
 sbactive
 echo
 green "Sing-box配置变更选择如下:"
-readp "1：更换Reality域名伪装地址、切换自签证书与Acme域名证书、开关TLS\n2：更换原有协议UUID(密码)、Vmess-Path路径\n3：设置Argo临时隧道、固定隧道\n4：切换IPV4或IPV6的代理优先级 (仅 1.10.7 内核可用)\n5：设置Telegram推送节点通知\n6：更换Warp-wireguard出站账户\n7：设置Gitlab订阅分享链接\n8：管理订阅分享链接（本地IP/自定义域名HTTPS）\n9：设置所有Vmess节点的CDN优选地址\n10：设置自定义域名分发（HTTPS订阅）\n11：管理Trojan / Snell（启停、端口、密码、证书）\n0：返回上层\n请选择【0-11】：" menu
+readp "1：更换Reality域名伪装地址、切换自签证书与Acme域名证书、开关TLS\n2：更换原有协议UUID(密码)、Vmess-Path路径\n3：设置Argo临时隧道、固定隧道\n4：切换IPv4或IPv6的代理优先级\n5：设置Telegram推送节点通知\n6：更换Warp-wireguard出站账户\n7：设置Gitlab订阅分享链接\n8：管理订阅分享链接（本地IP/自定义域名HTTPS）\n9：设置所有Vmess节点的CDN优选地址\n10：设置自定义域名分发（HTTPS订阅）\n11：管理Trojan / Snell（启停、端口、密码、证书）\n0：返回上层\n请选择【0-11】：" menu
 if [ "$menu" = "1" ];then
 changeym
 elif [ "$menu" = "2" ];then
@@ -4200,22 +4347,6 @@ fi
 }
 
 sbymfl(){
-if [[ $1 == probe ]]; then
-sbport=$(cat /etc/s-box/sbwpph.log 2>/dev/null | awk '{print $3}' | awk -F":" '{print $NF}') 
-sbport=${sbport:-'40000'}
-resv1=$(curl -fsS --connect-timeout 2 --max-time 3 --noproxy '' --socks5 "localhost:$sbport" https://icanhazip.com 2>/dev/null) || resv1=
-resv2=$(curl -fsS --connect-timeout 2 --max-time 3 --noproxy '' -x "socks5h://localhost:$sbport" https://icanhazip.com 2>/dev/null) || resv2=
-if ip_literal_valid 4 "$resv1" || ip_literal_valid 6 "$resv1" || ip_literal_valid 4 "$resv2" || ip_literal_valid 6 "$resv2"; then
-warp_s4_ip='Socks5查询成功（不代表双栈均可用）'
-warp_s6_ip=$warp_s4_ip
-else
-warp_s4_ip='Socks5公网查询未成功（不代表服务未启动）'
-warp_s6_ip=$warp_s4_ip
-fi
-v4v6
-vps_ipv4="当前IP：${v4:-公网IPv4探测未成功}"
-vps_ipv6="当前IP：$v6_display"
-fi
 warp_s4_ip=${warp_s4_ip:-Socks5-IPV4未探测}
 warp_s6_ip=${warp_s6_ip:-Socks5-IPV6未探测}
 vps_ipv4=${vps_ipv4:-公网IPv4未探测}
@@ -4277,6 +4408,10 @@ fi
 sfl6="${yellow}【$warp_s6_ip】已分流：$ssd6$ssg6${plain} "
 fi
 
+if [[ "$sbnh" != "1.10" ]]; then
+adfl4='暂不支持' adfl6='暂不支持'
+return
+fi
 ad4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[5].domain_suffix | join(" ")' 2>/dev/null)
 ag4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[5].geosite | join(" ")' 2>/dev/null)
 if [[ ("$ad4" == "yg_kkk" || -z "$ad4") && ("$ag4" == "yg_kkk" || -z "$ag4") ]]; then
@@ -5171,55 +5306,6 @@ blue "管理命令：sing_box；Trojan/Snell：3 → 11；域名分发：3 → 1
 echo
 }
 
-local_ip_status(){
-local interface_v6
-interface_v6=$(ip -o -6 addr show scope global up 2>/dev/null | awk '
-$3 == "inet6" && / scope global / && !/ (tentative|dadfailed|deprecated)( |$)/ {
-    split($4, address, "/"); print address[1]; exit
-}')
-vps_ipv4="公网IPv4未探测"
-vps_ipv6="${interface_v6:-未检测到全局IPv6地址}（本机配置；公网未探测）"
-showv4=$vps_ipv4 showv6=$vps_ipv6
-}
-
-refresh_status(){
-local version_response
-yellow "主动刷新：脚本版本≤6秒，内核版本≤6秒，公网IP/地区≤30秒，SOCKS≤6秒；网络预算合计≤48秒"
-if version_response=$(curl -fsSL --connect-timeout 2 --max-time 6 "$SB_RAW_BASE/version") && [[ -n $version_response ]]; then
-printf '%s\n' "$version_response"
-else
-yellow "脚本版本查询失败"
-fi
-lapre
-echo "远端内核正式版：${latcore:-查询失败}；测试版：${precore:-查询失败}"
-if [[ -f /etc/s-box/sb.json ]]; then
-sbymfl probe
-echo "$warp_s4_ip"
-else
-v4v6
-fi
-echo "公网IPv4：${v4:-探测未成功}"
-echo "IPv6：$v6_display"
-echo "地区：${v4dq:-${v6dq:-查询未成功}}"
-yellow "本次探测不修改节点地址；需要更新地址请选择主菜单15"
-}
-
-diagnostics_menu(){
-local choice
-while true; do
-green "1. 主动刷新版本 / 公网IP / SOCKS状态（网络预算≤48秒）"
-green "2. 修复脚本依赖 / OpenVZ TUN（执行包安装，耗时取决于软件源）"
-green "0. 返回主菜单"
-readp "请选择【0-2】：" choice || return 1
-case "$choice" in
-1) refresh_status ;;
-2) if ensure_dependencies && setup_tun; then green "依赖检查/修复完成"; else red "依赖修复失败，请检查软件源和缺失命令"; fi ;;
-0) sing_box; return $? ;;
-*) red "输入无效" ;;
-esac
-done
-}
-
 # Older menu-7 updaters still save and launch the new script as /usr/bin/sb.
 if [[ "$0" == /usr/bin/sb ]]; then
 migrate_shortcut || exit 1
@@ -5248,34 +5334,25 @@ green "11. 一键原版BBR+FQ加速"
 green "12. 管理 Acme 申请域名IP证书"
 green "13. 管理 Warp 查看Netflix/ChatGPT解锁情况"
 green "14. 添加 WARP-plus-Socks5 代理模式 【本地Warp/多地区Psiphon-VPN】"
-green "15. 更换IP刷新本地IP、调整IPV4/IPV6配置输出"
+green "15. 选择IPv4/IPv6配置输出"
 white "----------------------------------------------------------------------------------"
 green "16. sing-box脚本使用说明书"
-green "17. 诊断与修复（联网状态 / 脚本依赖）"
+green "17. 修复脚本依赖 / OpenVZ TUN"
 white "----------------------------------------------------------------------------------"
 green " 0. 退出脚本"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 insV=$(cat /etc/s-box/v 2>/dev/null)
-echo -e "当前 sing-box 脚本版本：${bblue}${insV:-未记录}${plain}；远端版本未查询（7更新 / 17诊断）"
+echo -e "当前 sing-box 脚本版本：${bblue}${insV:-未记录}${plain}；远端版本未查询（7更新）"
 inscore=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}')
-echo -e "当前 Sing-box 内核版本：${bblue}${inscore:-未安装}${plain}；远端版本未查询（8更新 / 17诊断）"
+echo -e "当前 Sing-box 内核版本：${bblue}${inscore:-未安装}${plain}；远端版本未查询（8更新）"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo -e "VPS状态如下："
 echo -e "系统:$blue$op$plain  \c";echo -e "内核:$blue$version$plain  \c";echo -e "处理器:$blue$cpu$plain  \c";echo -e "虚拟化:$blue$vi$plain  \c";echo -e "BBR算法:$blue$bbr$plain"
-local_ip_status
+menu_ip_status
 echo -e "IPv4：$blue$vps_ipv4$plain   IPv6：$blue$vps_ipv6$plain"
-echo -e "服务器地区：未探测（选择17主动刷新）"
-if [[ "$sbnh" == "1.10" ]]; then
-rpip=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.outbounds[0].domain_strategy') 2>/dev/null
-if [[ $rpip = 'prefer_ipv6' ]]; then
-v4_6="IPV6优先出站($showv6)"
-elif [[ $rpip = 'prefer_ipv4' ]]; then
-v4_6="IPV4优先出站($showv4)"
-elif [[ $rpip = 'ipv4_only' ]]; then
-v4_6="仅IPV4出站($showv4)"
-elif [[ $rpip = 'ipv6_only' ]]; then
-v4_6="仅IPV6出站($showv6)"
-fi
+if [[ -f /etc/s-box/sb.json ]]; then
+rpip=$(ip_priority_get 2>/dev/null) || rpip=unknown
+v4_6=$(ip_priority_label "$rpip")
 echo -e "代理IP优先级：$blue$v4_6$plain"
 fi
 if command -v apk >/dev/null 2>&1; then
@@ -5297,7 +5374,7 @@ if [ -f '/etc/s-box/sb.json' ]; then
 if command -v jq >/dev/null 2>&1; then
 showprotocol
 else
-yellow "缺少jq，详细配置暂无法读取；选择17 → 2修复依赖"
+yellow "缺少jq，详细配置暂无法读取；选择17修复依赖"
 fi
 fi
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -5324,8 +5401,8 @@ case "$Input" in
 12 ) acme;;
 13 ) cfwarp;;
 14 ) inssbwpph;;
-15 ) wgcfgo && sbshare;;
+15 ) ipuuid select && sbshare;;
 16 ) sbsm;;
-17 ) diagnostics_menu;;
+17 ) if ensure_dependencies && setup_tun; then green "依赖检查/修复完成"; else red "依赖修复失败，请检查软件源和缺失命令"; fi ;;
  * ) exit 
 esac
