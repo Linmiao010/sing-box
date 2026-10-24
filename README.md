@@ -149,10 +149,52 @@ https://sub.example.com/<token>/jhsub.txt
 | 首屏等待远端服务 | 版本、IP、SOCKS 串行请求及重复探测主要继承上游；fork 的双源 IP 回退增加部分路径的等待 | 改成按需探测，普通首屏请求数为 0；隔离测试覆盖正常、超时、DNS 失败和无 IPv6 |
 | 换目录启动触发依赖初始化 | 相对标记、全系统更新与顶层 TUN/ping 逻辑继承上游 | 移至安装/显式修复；已测标记丢失、旧标记、不同目录及安装失败 |
 | 静默订阅刷新等待 | 上游已有展示 sleep，fork 新动作也调用这条链路 | 输出重定向时跳过展示等待；保留发布失败回滚测试 |
-| 网页慢 / 吞吐慢 | 8 组原有节点 TLS/Argo 生成对照中，Mihomo YAML 与上游结构完全一致；JSON 唯一结构差异为 fork 显式 `stack: gvisor` | 保留原 DNS、规则、栈和策略默认值，真实客户端 A/B 实验待执行 |
+| 网页慢 / 吞吐慢 | 首轮菜单修复前的 8 组原有节点 TLS/Argo 对照中，Mihomo YAML 与上游结构完全一致；JSON 唯一结构差异为 fork 显式 `stack: gvisor` | 后续确认国内域名冷解析依赖默认海外 DNS，补丁与实验见下节；真实客户端性能仍需复测 |
 | 自动组可能选择新协议 | fork 将 Trojan/Snell 加入共享候选 | 未取得实际选组/出口记录，不能确认性能因果；保留协议可用性 |
 
 本次真实内核校验使用 **sing-box 1.14.3** 与 **Mihomo v1.19.33**：分别检查客户端 5 个有效模板分支，sing-box 服务端检查 TLS 开/关和额外协议的 8 种组合；另有 32 组 JSON/YAML 结构与节点引用检查。校验不启动代理服务，不证明规则集下载、真实 TUN、Linux 服务、网络连通性或吞吐；legacy 1.10.7 未做真实内核校验。
+
+### FlClash 国内网页首访 DNS 修复
+
+后续复现目标为 Android FlClash 导入 `clmi.yaml`，首次访问 `zhihu.com` 慢；对照使用同一协议、两台不同 VPS。复核最新上游仍为 `b13f9435…`，其 DNS 模板也存在下面的路径，不能将此认定为 fork 独有回归。
+
+原规则第一条 `GEOIP,LAN,DIRECT` 在判断地址是否属于私网之前会触发域名解析，而默认 `nameserver` 只有 `1.1.1.1` / `8.8.8.8` 的 DoH。配合 `respect-rules: true`，这些海外 DNS 的请求按规则经代理出口。即使知乎业务随后判定为直连，首次请求也已经等待这段解析；缓存命中时则可能看不出问题。VPS 的常规测速接近，并不能排除这条 DNS 链路的延迟或重试不同。[Mihomo GEOIP 实现](https://github.com/MetaCubeX/mihomo/blob/v1.19.33/rules/common/geoip.go)、[DNS 配置说明](https://wiki.metacubex.one/en/config/dns/)
+
+修复只在 `clall()` 增加以下 DNS 策略，使已有 CN 域名集合使用脚本原本已使用的阿里/腾讯 DoH。普通 VMess、TLS 和所有 Argo 生成分支共用这处模板。
+
+```yaml
+dns:
+  nameserver-policy:
+    "geosite:cn":
+      - "https://223.5.5.5/dns-query"
+      - "https://doh.pub/dns-query"
+```
+
+默认海外 DNS、节点域名解析、IPv6、fake-IP、原分流规则及节点选择均保留。没有给 LAN 加 `no-resolve`，避免改变非 CN 域名解析到私网地址时的处理；也不需要同时增加 `direct-nameserver`。
+
+用真实 **Mihomo v1.19.33 Windows 核心**做了回环单变量实验：默认 DNS 人工延迟 600 ms，国内策略 DNS 无延迟，均返回回环地址，HTTP 内容固定 34 字节；每次冷请求用独立核心进程，随后再发一次热请求。
+
+| 配置 / 域名 | 冷请求完成时间 | 实际收到查询的 DNS |
+| --- | --- | --- |
+| 原配置，`zhihu.com`，n=3 | p50 605.373 ms，范围 605.225–615.984 | 默认慢 DNS |
+| 仅增加策略，`zhihu.com`，n=3 | p50 4.053 ms，范围 3.867–4.607 | 国内策略 DNS |
+| 仅增加 `direct-nameserver`，n=1 | 606.904 ms | 先默认慢 DNS，再直连 DNS |
+| 仅前移 CN 规则，n=1 | 604.426 ms | 默认慢 DNS |
+| 仅 LAN 加 `no-resolve`，n=1 | 605.472 ms | 默认慢 DNS |
+| `www.zhihu.com`，各 n=1 | 604.669 → 3.932 ms | 默认 → 国内 |
+| `picx.zhimg.com`，各 n=1 | 605.153 → 4.832 ms | 默认 → 国内 |
+
+共 17 个独立核心进程、34 次目标 HTTP 请求，全部 200、34 字节、0 失败；热请求均没有新增 DNS 查询。`example.org` 仍使用默认 DNS，`lab.internal` 解析后仍按 LAN 直连。由于这些目标都返回 `127.0.0.1`，它们的最终连接均为 LAN/DIRECT，**该实验不证明公网目标的实际出口或 Android TUN 行为**。600 ms 是测试注入值，不能将表格当成知乎真实提速或两台 VPS 差异的定案。
+
+原始证据保存在本地 `.test-tools/protocol-validation/dns-policy-experiment/results.json` 及对应核心日志。另有生成回归覆盖 TLS 开/关 × Argo 固定/临时状态，检查 DNS 策略、原规则、IPv6 和其他 DNS 设置。
+
+要让手机实际使用修复，必须完成这条链路：
+
+1. 将修复后的 `sb.sh` 安装到 VPS；本地代码未推送前，菜单 **7** 取不到此补丁，使用下文的手动部署方式。
+2. 在 VPS 选择 **9 → 2** 重新生成 `clmi.yaml`，确认文件中存在上述 `nameserver-policy`。
+3. 在 FlClash 更新这个订阅并重新应用配置。若使用文件导入，需要重新导入；仅更新 VPS 脚本不会更新手机已有配置。
+4. 核对 FlClash 最终生效配置仍有这项策略。若设置了 DNS 覆写，让此字段跟随订阅，或在覆写中加入同一策略；应用会合并覆写，订阅原文不等于最终配置。[FlClash 配置合并实现](https://github.com/chen08209/FlClash/blob/main/lib/common/task.dart)
+5. 固定原有同一节点，在相同网络下重新测试知乎及其图片资源的冷/热加载。这里尚未访问用户 Android 或两台 VPS，真实改善幅度待这一步确认。
 
 ### 菜单离线计时
 
@@ -240,7 +282,7 @@ sing_box
 
 确认两份 SHA-256 相同，普通首屏可接受输入，选择 **0** 正常退出；断网复验应使用可恢复的测试环境，勿断开生产 SSH。菜单 **17 → 1** 只查看主动探测结果，菜单 **15** 才会刷新节点地址。
 
-本次不改客户端模板或服务端配置，部署脚本不需要重启代理服务。验证订阅链路时可选择 **9 → 2** 重新生成订阅，再让客户端刷新并核对下载文件、覆写及实际选组；随后按上述矩阵复测。对生效配置使用对应客户端版本的 `sing-box check -c …` / `mihomo -t -f …`，服务端单独校验 `sb.json` 和存在时的 `sb_extra.json`，不能只检查 JSON/YAML 语法。
+后续 DNS 修复修改了 Mihomo 客户端模板，未修改服务端配置，部署脚本不需要重启 VPS 代理服务。部署后必须选择 **9 → 2** 重新生成订阅，再让客户端刷新并核对下载文件、覆写及实际选组；随后按上述矩阵复测。对生效配置使用对应客户端版本的 `sing-box check -c …` / `mihomo -t -f …`，服务端单独校验 `sb.json` 和存在时的 `sb_extra.json`，不能只检查 JSON/YAML 语法。
 
 回滚脚本：`install -m 755 "$backup/manager.sh" /usr/bin/sing_box`。若本次还刷新过订阅，需要恢复时只从备份取回 `sbox.json`、`clmi.yaml`、`jhsub.txt` 等实际改动文件，再刷新客户端；保留令牌、凭据、节点地址与自定义规则，不卸载重装。菜单 **7** 始终下载远端 `main`，未推送的本地修复可能被覆盖。
 
@@ -258,7 +300,7 @@ git diff --check
 
 `tests/test_config_matrix.py` 的真实内核检查需指定 `SING_BOX_BIN`、`MIHOMO_BIN`、`MIHOMO_DATA_DIR`（已下载 GeoSite/GeoIP 数据）、`SB_TEST_CERT` 和 `SB_TEST_KEY`（测试证书/私钥）。未提供时明确跳过相关检查，不能把跳过计为通过。新采集工具的集成测试仅向本机 HTTP 服务发送请求。
 
-本次启用上述 native 检查后，全套 **135 项通过，0 失败、0 跳过**（210.041 秒）；`bash -n sb.sh` 与 `git diff --check` 通过。测试日志在本地 `.test-tools/final-tests.log`。软件包安装、TUN 初始化和 Linux 服务管理使用测试替身，尚未在真实 Debian/Alpine/CentOS VPS 执行安装或重启验证。
+后续 DNS 修复启用上述 native 检查后，全套 **136 项通过，0 失败、0 跳过**（215.515 秒）；`bash -n sb.sh` 与 `git diff --check` 通过。测试日志在本地 `.test-tools/dns-policy-final-tests.log`。软件包安装、TUN 初始化和 Linux 服务管理使用测试替身，尚未在真实 Debian/Alpine/CentOS VPS 执行安装或重启验证。
 
 ## 附带脚本
 

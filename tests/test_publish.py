@@ -7,6 +7,11 @@ import shutil
 
 from shell_testlib import REPO, ShellTestCase, section
 
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
 
 class PublishTests(ShellTestCase):
     def setUp(self):
@@ -102,6 +107,30 @@ if sbshare; then exit 0; else exit 1; fi
                     for name in ("sbox.json", "clmi.yaml"):
                         self.assertEqual((self.root / (name + ".previous")).read_text(encoding="utf-8"), self.previous[name])
                     self.assert_clean()
+
+    def test_domestic_dns_policy_is_generated_without_changing_routing(self):
+        if yaml is None:
+            self.skipTest("PyYAML is required to inspect the generated DNS policy")
+        for tls in (False, True):
+            for fixed, temporary in ((False, False), (True, False), (False, True), (True, True)):
+                with self.subTest(tls=tls, fixed=fixed, temporary=temporary):
+                    (self.output / "sb.json").write_text(json.dumps({"inbounds": [
+                        {}, {"tls": {"enabled": tls}, "listen_port": 8443}]}), encoding="utf-8")
+                    processes = ("cloudflared tunnel run\n" if fixed else "") + (
+                        "cloudflared --url localhost:8443\n" if temporary else "")
+                    self.run_shell(self.client_script(processes))
+                    config = yaml.safe_load((self.output / "clmi.yaml").read_text(encoding="utf-8"))
+                    dns = config["dns"]
+                    self.assertEqual(dns.get("nameserver-policy"), {
+                        "geosite:cn": ["https://223.5.5.5/dns-query", "https://doh.pub/dns-query"]})
+                    self.assertEqual(dns["nameserver"], ["https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"])
+                    self.assertEqual(dns["proxy-server-nameserver"], [
+                        "https://223.5.5.5/dns-query", "https://doh.pub/dns-query"])
+                    self.assertEqual(dns["enhanced-mode"], "fake-ip")
+                    self.assertTrue(dns["respect-rules"])
+                    self.assertTrue(dns["ipv6"])
+                    self.assertEqual(config["rules"], ["GEOIP,LAN,DIRECT", "GEOSITE,CN,DIRECT",
+                                                     "GEOIP,CN,DIRECT", "MATCH,🌍选择代理节点"])
 
     def test_invalid_json_retains_both_previous_client_files(self):
         result = self.run_shell(self.client_script(extra="vl_port=invalid-number"), check=False)
