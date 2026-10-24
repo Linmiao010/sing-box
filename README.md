@@ -11,6 +11,7 @@
 - 提供本地 IP HTTP 订阅、GitLab 订阅和自定义域名 HTTPS 订阅；域名模式支持令牌轮换和后台端口管理。
 - 管理协议端口、证书、Argo 隧道、域名分流、Telegram 通知以及 sing-box 内核版本。
 - 适配 IPv4、IPv6 和双栈 VPS，包含 Debian、Ubuntu、CentOS、Alpine 安装分支，以及 amd64、arm64、armv7 架构识别。
+- 支持逐地址探测与 IPv4 / IPv6 出站源地址选择，入口为 **3 → 4**；绑定作用于脚本探测和 sing-box 原生直连，与地址族优先级、节点公布地址分别设置。
 
 ## 安装与更新
 

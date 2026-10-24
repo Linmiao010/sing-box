@@ -1,4 +1,3 @@
 .test-tools/
 __pycache__/
 tests/*
-!tests/test_ip_priority.py

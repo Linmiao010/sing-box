@@ -88,7 +88,9 @@ printf '%s' "$v6_display" > v6_display
         resolver = self.root / "resolv.conf"
         original = "nameserver 192.0.2.53\n"
         resolver.write_text(original, encoding="utf-8")
-        script = section("v6", "close").replace("/etc/resolv.conf", resolver.as_posix())
+        script = (section("ip_literal_valid", "warpcheck") + "\n" + section("v6", "close"))
+        script = script.replace("/etc/resolv.conf", resolver.as_posix())
+        script = script.replace("/etc/s-box", (self.root / "s-box").as_posix())
         script += r'''
 public_ip() { return 1; }
 warpcheck() { wgcfv4=on; wgcfv6=on; }

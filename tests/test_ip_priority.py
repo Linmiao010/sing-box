@@ -28,7 +28,10 @@ class IpPriorityTests(ShellTestCase):
         self.box.mkdir()
 
     def source(self, start, end):
-        return section(start, end).replace("/etc/s-box", "s-box")
+        source = section(start, end)
+        if start == "ip_priority_get":
+            source = section("ip_literal_valid", "warpcheck") + "\n" + source
+        return source.replace("/etc/s-box", "s-box")
 
     def generate(self, version="1.14", initial="prefer_ipv4"):
         values = {

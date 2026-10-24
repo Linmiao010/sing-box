@@ -169,11 +169,16 @@ fi
 }
 
 public_ip(){
-local family=$1 url address
+local family=$1 url address source=${4:-}
 local -a urls=(https://icanhazip.com https://api64.ipify.org)
+local -a binding=()
+if [[ -n $source ]]; then
+ip_literal_valid "$family" "$source" || return 1
+binding=(--interface "$source")
+fi
 [[ -z ${3:-} ]] || urls=("$3")
 for url in "${urls[@]}"; do
-if address=$(curl -q -fsS "-$family" --noproxy '*' --retry 0 --connect-timeout "${2:-2}" --max-time "${2:-5}" "$url" 2>/dev/null); then
+if address=$(curl -q -fsS "-$family" --noproxy '*' --retry 0 --connect-timeout "${2:-2}" --max-time "${2:-5}" "${binding[@]}" "$url" 2>/dev/null); then
 address=${address%$'\r'}
 if ip_literal_valid "$family" "$address"; then
 printf '%s\n' "$address"
@@ -184,29 +189,212 @@ done
 return 1
 }
 
+egress_read(){
+local values
+egress_ipv4= egress_ipv6=
+[[ -e /etc/s-box/egress.json ]] || return 0
+values=$(jq -er '
+  if type == "object" and (.ipv4_source | type) == "string" and (.ipv6_source | type) == "string"
+    and (.ipv4_source | test("^[0-9.]*$")) and (.ipv6_source | test("^[0-9a-fA-F:]*$"))
+  then [.ipv4_source, .ipv6_source] | map(if . == "" then "-" else . end) | join(" ")
+  else error("invalid egress settings") end
+' /etc/s-box/egress.json 2>/dev/null) || return 1
+values=${values%$'\r'}
+read -r egress_ipv4 egress_ipv6 <<< "$values"
+[[ $egress_ipv4 != - ]] || egress_ipv4=
+[[ $egress_ipv6 != - ]] || egress_ipv6=
+[[ -z $egress_ipv4 ]] || ip_literal_valid 4 "$egress_ipv4" || return 1
+[[ -z $egress_ipv6 ]] || ip_literal_valid 6 "$egress_ipv6" || return 1
+}
+
+egress_public_ip(){
+local egress_ipv4 egress_ipv6 source
+egress_read || return 1
+case "$1" in
+4) source=$egress_ipv4 ;;
+6) source=$egress_ipv6 ;;
+*) return 1 ;;
+esac
+public_ip "$1" "${2:-}" "${3:-}" "$source"
+}
+
+egress_ip_key(){
+# Compare equivalent compressed/expanded IPv6 literals without another dependency.
+local family=$1 address=$2 part missing
+local -a left=() right=()
+ip_literal_valid "$family" "$address" || return 1
+if [[ $family == 4 ]]; then
+IFS=. read -r -a left <<< "$address"
+for part in "${left[@]}"; do printf '%d.' "$((10#$part))"; done
+else
+if [[ $address == *::* ]]; then
+IFS=: read -r -a left <<< "${address%%::*}"
+IFS=: read -r -a right <<< "${address#*::}"
+missing=$((8 - ${#left[@]} - ${#right[@]}))
+while (( missing-- > 0 )); do left+=(0); done
+left+=("${right[@]}")
+else
+IFS=: read -r -a left <<< "$address"
+fi
+for part in "${left[@]}"; do printf '%04x' "$((16#${part:-0}))"; done
+fi
+}
+
+egress_addresses(){
+local family=$1 addresses links
+[[ $family == 4 || $family == 6 ]] || return 1
+links=$(ip -o link show up 2>/dev/null) || return 1
+addresses=$(ip -o "-$family" addr show 2>/dev/null) || return 1
+printf '%s\n' "$addresses" | awk -v links="$links" -v family="$family" '
+BEGIN {
+  OFS="\t"; split(links, rows, "\n")
+  for (i in rows) { split(rows[i], fields, " "); name=fields[2]; sub(/:$/, "", name); sub(/@.*/, "", name); up[name]=1 }
+}
+$3 == (family == 6 ? "inet6" : "inet") {
+  iface=$2; sub(/@.*/, "", iface); split($4, cidr, "/")
+  scope="-"; valid="-"; preferred="-"
+  for (i=5; i<=NF; i++) {
+    if ($i == "scope") scope=$(i+1)
+    if ($i == "valid_lft") valid=$(i+1)
+    if ($i == "preferred_lft") preferred=$(i+1)
+  }
+  row=" " $0 " "; state="ready"
+  if (scope != "global") state="not_global"
+  else if (!up[iface]) state="down"
+  else if (row ~ / tentative /) state="tentative"
+  else if (row ~ / dadfailed /) state="dadfailed"
+  else if (row ~ / deprecated / || preferred == "0sec") state="deprecated"
+  print cidr[1],iface,scope,state,(row ~ / temporary / ? "true" : "false"),valid,preferred,(row ~ / dynamic / ? "true" : "false")
+}' | jq -Rn '[inputs | select(length > 0) | split("\t") |
+  {address:.[0],interface:.[1],scope:.[2],state:.[3],temporary:(.[4] == "true"),
+   valid_lft:.[5],preferred_lft:.[6],dynamic:(.[7] == "true")} ]'
+}
+
+egress_candidate_usable(){
+local family=$1 source=$2 addresses address key
+key=$(egress_ip_key "$family" "$source") || return 1
+addresses=$(egress_addresses "$family") || return 1
+while IFS= read -r address; do
+address=${address%$'\r'}
+[[ $(egress_ip_key "$family" "$address") != "$key" ]] || return 0
+done < <(jq -r '.[] | select(.state == "ready") | .address' <<< "$addresses")
+return 1
+}
+
+egress_probe(){
+local family=$1 source=$2 url=$3 limit=${4:-5} result code=0 meta address= local_ip= remote= elapsed= status
+local connect=2
+local -a binding=()
+[[ $family == 4 || $family == 6 ]] || return 1
+if [[ -n $source ]]; then
+ip_literal_valid "$family" "$source" || return 1
+binding=(--interface "$source")
+fi
+(( limit >= 2 )) || connect=$limit
+result=$(curl -q -fsS "-$family" --noproxy '*' --retry 0 --connect-timeout "$connect" --max-time "$limit" \
+  "${binding[@]}" --write-out $'\n%{local_ip}\t%{remote_ip}\t%{time_total}\n' "$url" 2>/dev/null) || code=$?
+if [[ $result == *$'\n'* ]]; then
+meta=${result##*$'\n'}; address=${result%$'\n'*}
+# IP echo services may terminate the body with LF or CRLF before curl metadata.
+while [[ $address == *$'\n' || $address == *$'\r' ]]; do address=${address%?}; done
+local_ip=${meta%%$'\t'*}; meta=${meta#*$'\t'}
+remote=${meta%%$'\t'*}; elapsed=${meta#*$'\t'}; elapsed=${elapsed%$'\r'}
+fi
+case "$code" in
+0) status=ok ;;
+6) status=dns ;;
+45) status=bind ;;
+28) status=timeout ;;
+7) status=connect ;;
+22) status=http ;;
+35|51|58|60|77|83|90|91) status=tls ;;
+*) status=error ;;
+esac
+if [[ $status == ok ]]; then
+if ! ip_literal_valid "$family" "$address" || ! ip_literal_valid "$family" "$local_ip"; then
+status=invalid_response
+elif [[ -n $source && $(egress_ip_key "$family" "$source") != "$(egress_ip_key "$family" "$local_ip")" ]]; then
+status=source_mismatch
+fi
+fi
+[[ $status == ok ]] || address=
+jq -cn --arg status "$status" --arg local "$local_ip" --arg public "$address" --arg remote "$remote" \
+  --arg seconds "$elapsed" '{status:$status,local:$local,public:$public,remote:$remote,seconds:$seconds}' || return 1
+[[ $status == ok ]]
+}
+
+egress_scan(){
+(
+local family=$1 budget=${2:-30} work addresses index source state url remaining limit started=$SECONDS serial=0 pid
+local -a pids=()
+[[ $family == 4 || $family == 6 ]] && [[ $budget =~ ^[1-9][0-9]*$ ]] || exit 1
+work=$(mktemp -d) || exit 1
+trap 'for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || :; done; rm -rf -- "$work"' EXIT
+trap 'exit 1' HUP INT TERM
+addresses=$(egress_addresses "$family") || exit 1
+jq '[{address:"",interface:"系统自动",state:"ready",temporary:false}] + .' <<< "$addresses" > "$work/rows.json" || exit 1
+: > "$work/result-empty.json"
+while IFS=$'\t' read -r index source state; do
+state=${state%$'\r'}
+[[ $state == ready ]] || continue
+[[ $source != - ]] || source=
+for url in https://icanhazip.com https://api64.ipify.org; do
+if (( ${#pids[@]} >= 4 )); then
+for pid in "${pids[@]}"; do wait "$pid" || :; done
+pids=()
+fi
+remaining=$((budget - SECONDS + started))
+(( remaining > 0 )) || break 2
+limit=5; (( remaining >= limit )) || limit=$remaining
+serial=$((serial + 1))
+(
+result=$(egress_probe "$family" "$source" "$url" "$limit") || :
+[[ -n $result ]] || result='{"status":"error"}'
+jq --argjson row "$index" --arg endpoint "$url" '. + {row:$row,endpoint:$endpoint}' <<< "$result"
+) > "$work/result-$serial.json" &
+pids+=("$!")
+done
+done < <(jq -r 'to_entries[] | [.key, (if .value.address == "" then "-" else .value.address end), .value.state] | @tsv' "$work/rows.json")
+for pid in "${pids[@]}"; do wait "$pid" || :; done
+pids=()
+jq -s --slurpfile rows "$work/rows.json" '. as $results | $rows[0] | to_entries |
+  map(.key as $id | .value + {results:[$results[] | select(.row == $id) | del(.row)]})' "$work"/result-*.json
+)
+}
+
 menu_ip_status(){
-local family address url
+local family address url source detected_v4= detected_v6=
+local egress_ipv4 egress_ipv6
 v4= v6=
+if ! egress_read; then
+vps_ipv4="出站源地址设置无效"; vps_ipv6=$vps_ipv4
+showv4=$vps_ipv4 showv6=$vps_ipv6
+return 1
+fi
 # Race both HTTPS sources for both families, with no sequential fallback wait.
 # Each request has 2.6s, leaving time for process/validation overhead within 3s.
 while read -r family address; do
 case "$family" in
-4) [[ -n $v4 ]] || v4=$address ;;
-6) [[ -n $v6 ]] || v6=$address ;;
+4) [[ -n $detected_v4 ]] || detected_v4=$address ;;
+6) [[ -n $detected_v6 ]] || detected_v6=$address ;;
 esac
 done < <(
 for family in 4 6; do
+if [[ $family == 4 ]]; then source=$egress_ipv4; else source=$egress_ipv6; fi
 for url in https://icanhazip.com https://api64.ipify.org; do
 (
-address=$(public_ip "$family" 2.6 "$url") || address=
+address=$(public_ip "$family" 2.6 "$url" "$source") || address=
 printf '%s %s\n' "$family" "$address"
 ) &
 done
 done
 wait
 )
-vps_ipv4=${v4:-公网IPv4探测未成功}
-vps_ipv6=${v6:-公网IPv6探测未成功}
+vps_ipv4=${detected_v4:-公网IPv4探测未成功}
+vps_ipv6=${detected_v6:-公网IPv6探测未成功}
+# Only unbound observations may be reused by the separate node-address menu.
+[[ -n $egress_ipv4 ]] || v4=$detected_v4
+[[ -n $egress_ipv6 ]] || v6=$detected_v6
 showv4=$vps_ipv4 showv6=$vps_ipv6
 }
 
@@ -219,8 +407,8 @@ v6(){
 local result
 v4orv6(){
 local detected_v4 detected_v6
-detected_v4=$(public_ip 4)
-detected_v6=$(public_ip 6)
+detected_v4=$(egress_public_ip 4)
+detected_v6=$(egress_public_ip 6)
 if [[ -z $detected_v4 && -z $detected_v6 ]]; then
 red "公网IP探测均未成功，请检查网络或DNS；未修改DNS配置"
 return 1
@@ -519,6 +707,12 @@ blue "已确认Vmess的path路径：${uuid}-vm"
 }
 
 inssbjsonser(){
+local egress_ipv4= egress_ipv6= egress_bind_fields=
+if [[ -e /etc/s-box/egress.json ]]; then
+egress_read || { red "出站源地址设置无效，未重新生成配置"; return 1; }
+[[ -z $egress_ipv4 ]] || egress_bind_fields+=",\"inet4_bind_address\":\"$egress_ipv4\""
+[[ -z $egress_ipv6 ]] || egress_bind_fields+=",\"inet6_bind_address\":\"$egress_ipv6\""
+fi
 cat > /etc/s-box/sb10.json <<EOF
 {
 "log": {
@@ -630,17 +824,17 @@ cat > /etc/s-box/sb10.json <<EOF
 {
 "type":"direct",
 "tag":"direct",
-"domain_strategy": "$ipv"
+"domain_strategy": "$ipv"$egress_bind_fields
 },
 {
 "type":"direct",
 "tag": "vps-outbound-v4", 
-"domain_strategy":"prefer_ipv4"
+"domain_strategy":"prefer_ipv4"$egress_bind_fields
 },
 {
 "type":"direct",
 "tag": "vps-outbound-v6",
-"domain_strategy":"prefer_ipv6"
+"domain_strategy":"prefer_ipv6"$egress_bind_fields
 },
 {
 "type": "socks",
@@ -922,7 +1116,7 @@ cat > /etc/s-box/sb11.json <<EOF
 "outbounds": [
 {
 "type":"direct",
-"tag":"direct"
+"tag":"direct"$egress_bind_fields
 },
 {
 "type": "socks",
@@ -1280,7 +1474,8 @@ ip -o link show dev wgcf 2>/dev/null | grep -qE '<([^>]*,)?UP[,>]' || pgrep -x w
 red "检测到活动的系统级WARP，公网探测可能为WARP出口，已保留原节点地址；请关闭全局WARP后重新进入主菜单再选择配置输出"
 return 1
 fi
-[[ ${1:-} == select ]] || v4v6
+# Selected egress observations are not evidence for the server advertised to clients.
+if [[ ${1:-} != select || -e /etc/s-box/egress.json ]]; then v4v6; fi
 if [[ -z $v4 && -z $v6 ]]; then
 red "公网IP探测未成功，已保留原节点地址"
 return 1
@@ -2930,7 +3125,7 @@ wget -q -O /root/geosite.db https://github.com/MetaCubeX/meta-rules-dat/releases
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green "五、自动生成warp-wireguard出站账户" && sleep 2
 warpwg
-inssbjsonser
+inssbjsonser || return 1
 extra_install || return 1
 sbservice || return 1
 sbactive
@@ -3430,6 +3625,109 @@ restore=0
 )
 }
 
+egress_config_patch(){
+local ipv4=$3 ipv6=$4
+[[ -z $ipv4 ]] || ip_literal_valid 4 "$ipv4" || return 1
+[[ -z $ipv6 ]] || ip_literal_valid 6 "$ipv6" || return 1
+# Edit flat native dialers in place: port/certificate menus depend on line numbers.
+# Parsing the result against the structural edit makes unsupported layouts fail closed.
+jq -e -j -n --rawfile source "$1" --arg ipv4 "$ipv4" --arg ipv6 "$ipv6" '
+  def native:
+    .type == "direct" and (.tag == "direct" or .tag == "vps-outbound-v4" or .tag == "vps-outbound-v6")
+    and (has("detour") | not);
+  ($source | fromjson) as $config |
+  if ([$config.outbounds[]? | select(native and .tag == "direct")] | length) != 1
+  then error("缺少唯一的原生 direct 出站，未修改配置") else
+    ($config | .outbounds |= map(if native then
+      del(.inet4_bind_address, .inet6_bind_address) |
+      (if $ipv4 != "" then .inet4_bind_address=$ipv4 else . end) |
+      (if $ipv6 != "" then .inet6_bind_address=$ipv6 else . end)
+      else . end)) as $expected |
+    ([if $ipv4 != "" then "\"inet4_bind_address\":\"\($ipv4)\"" else empty end,
+      if $ipv6 != "" then "\"inet6_bind_address\":\"\($ipv6)\"" else empty end] | join(",")) as $fields |
+    (if $fields == "" then "" else "," + $fields end) as $addition |
+    $source | gsub("(?<obj>\\{[^{}]*\\})";
+      .obj as $text | ($text | try fromjson catch null) as $object |
+      if $object != null and ($object | native) then
+        $text |
+        gsub(",(?<ws>\\s*)\"inet[46]_bind_address\"[ \\t]*:[ \\t]*\"[^\"\\r\\n]*\""; "\(.ws)") |
+        gsub("\"inet[46]_bind_address\"[ \\t]*:[ \\t]*\"[^\"\\r\\n]*\"(?<ws>\\s*),"; "\(.ws)") |
+        sub("(?<tail>\\s*)\\}$"; $addition + "\(.tail)}")
+      else $text end) |
+    if (fromjson) == $expected then . else error("不支持此配置布局，未修改配置") end
+  end
+' > "$2"
+}
+
+egress_apply(){
+(
+local family=$1 source=$2 egress_ipv4 egress_ipv6 work file result url verified=0 restore=0 had_state=0 failed=0
+local -a check_args
+[[ $family == 4 || $family == 6 ]] || { red "无效的地址族"; exit 1; }
+egress_read || { red "出站源地址设置无效，已保留原配置"; exit 1; }
+if [[ -n $source ]]; then
+ip_literal_valid "$family" "$source" && egress_candidate_usable "$family" "$source" || {
+red "所选地址已不存在或尚不可用，已保留原配置"; exit 1;
+}
+for url in https://icanhazip.com https://api64.ipify.org; do
+if result=$(egress_probe "$family" "$source" "$url") && jq -e '.status == "ok"' <<< "$result" >/dev/null; then
+verified=1; break
+fi
+done
+(( verified )) || { red "所选源地址复测未成功，已保留原配置"; exit 1; }
+fi
+if [[ $family == 4 ]]; then egress_ipv4=$source; else egress_ipv6=$source; fi
+work=$(mktemp -d /etc/s-box/.egress.XXXXXX) || exit 1
+egress_cleanup(){
+local status=$?
+trap - EXIT
+trap '' HUP INT TERM
+if (( restore )); then
+for file in sb10.json sb11.json sb.json; do
+mv -f -- "$work/old-$file" "/etc/s-box/$file" || failed=1
+done
+if (( had_state )); then
+mv -f -- "$work/old-egress.json" /etc/s-box/egress.json || failed=1
+else
+rm -f -- /etc/s-box/egress.json || failed=1
+fi
+if (( failed )); then
+red "恢复配置失败，剩余备份保留在 $work"
+return 1
+fi
+ip_priority_restart >/dev/null 2>&1 || red "原配置已恢复，但服务启动失败，请查看运行日志"
+red "出站源地址切换失败，已恢复原配置和地址设置"
+fi
+rm -rf -- "$work"
+return "$status"
+}
+trap egress_cleanup EXIT
+trap 'exit 1' HUP INT TERM
+if [[ -e /etc/s-box/egress.json ]]; then
+had_state=1
+cp -p /etc/s-box/egress.json "$work/old-egress.json" || exit 1
+fi
+for file in sb10.json sb11.json sb.json; do
+cp -p "/etc/s-box/$file" "$work/old-$file" && cp -p "/etc/s-box/$file" "$work/$file" || exit 1
+egress_config_patch "/etc/s-box/$file" "$work/$file" "$egress_ipv4" "$egress_ipv6" || exit 1
+done
+jq -n --arg ipv4 "$egress_ipv4" --arg ipv6 "$egress_ipv6" \
+  '{ipv4_source:$ipv4,ipv6_source:$ipv6}' > "$work/egress.json" || exit 1
+check_args=(-c "$work/sb.json")
+[[ ! -f /etc/s-box/sb_extra.json ]] || check_args+=(-c /etc/s-box/sb_extra.json)
+if ! /etc/s-box/sing-box check "${check_args[@]}"; then
+red "候选配置校验失败，已保留原配置和地址设置"
+exit 1
+fi
+restore=1
+for file in sb10.json sb11.json sb.json egress.json; do
+mv -f -- "$work/$file" "/etc/s-box/$file" || exit 1
+done
+ip_priority_restart || exit 1
+restore=0
+)
+}
+
 changeip(){
 local choose strategy family address
 yellow "设置VPS默认出站的域名解析优先级；已有WARP/SOCKS分流保持各自策略"
@@ -3441,10 +3739,10 @@ case "$choose" in
 2) strategy=prefer_ipv6; family=6 ;;
 3) strategy=ipv4_only; family=4 ;;
 4) strategy=ipv6_only; family=6 ;;
-0) changeserv; return ;;
+0) [[ ${1:-} == egress ]] || changeserv; return ;;
 *) red "输入无效，请选择0-4"; continue ;;
 esac
-address=$(public_ip "$family") || address=
+address=$(egress_public_ip "$family") || address=
 if [[ -z $address ]]; then
 yellow "IPv${family}公网探测未成功，无法确认可用性"
 if [[ $strategy == *_only ]]; then
@@ -3454,8 +3752,94 @@ fi
 fi
 ip_priority_apply "$strategy" || return 1
 blue "当前已更换的IP优先级：$(ip_priority_label "$strategy")"
-sing_box
+[[ ${1:-} == egress ]] || sing_box
 return
+done
+}
+
+egress_status(){
+local egress_ipv4 egress_ipv6 family addresses count
+if ! egress_read; then
+yellow "出站源地址设置无效，请检查 /etc/s-box/egress.json；未回退系统自动选择"
+return 1
+fi
+for family in 4 6; do
+if addresses=$(ip -o "-$family" addr show scope global 2>/dev/null); then
+count=$(printf '%s\n' "$addresses" | awk -v kind="$( [[ $family == 4 ]] && printf inet || printf inet6 )" '$3 == kind {n++} END {print n+0}')
+else
+count=未知
+fi
+if [[ $family == 4 ]]; then
+printf '本机IPv4：%s 个；出站源：%s\n' "$count" "${egress_ipv4:-系统自动}"
+else
+printf '本机IPv6：%s 个；出站源：%s\n' "$count" "${egress_ipv6:-系统自动}"
+fi
+done
+}
+
+egress_select(){
+local family=$1 data choice row source state refresh=1
+[[ $family == 4 || $family == 6 ]] || return 1
+while true; do
+if (( refresh )); then
+yellow "检测 IPv${family} 出站：最多4个并发请求，完整扫描限时30秒；超时未开始的项目显示未检测"
+if ip -o link show dev wgcf 2>/dev/null | grep -qE '<([^>]*,)?UP[,>]' || pgrep -x warp-go >/dev/null 2>&1; then
+yellow "检测到系统级WARP：绑定源地址不会绕过系统路由，本次结果不能证明原生出口"
+fi
+data=$(egress_scan "$family") || { red "无法读取本机地址或完成扫描，未修改设置"; return 1; }
+refresh=0
+jq -r '
+  def reason:
+    {ready:"可选",down:"网卡未启用",not_global:"非全局地址",tentative:"地址尚未就绪",dadfailed:"地址重复检测失败",
+     deprecated:"地址已弃用",ok:"通过",dns:"DNS失败",bind:"绑定失败",timeout:"超时",connect:"连接失败",
+     http:"HTTP失败",tls:"TLS失败",invalid_response:"返回无效",source_mismatch:"源地址不符",error:"请求失败"}[.] // .;
+  to_entries[] | .key as $n | .value |
+  "\($n)：\(if .address == "" then "系统自动（恢复内核选择）" else .address end)  [\(.interface)]  \(.state | reason)\(if .temporary then "；临时地址，不建议长期固定" else "" end)",
+  (if .address != "" then "   有效期：\(.valid_lft // "未知")；首选有效期：\(.preferred_lft // "未知")" else empty end),
+  "   本轮：\([.results[] | select(.status == "ok")] | length)/2 通过\(if (.results|length) < 2 then "；其余未检测" else "" end)\(if .address != "" and .state == "ready" and (.temporary|not) and ([.results[] | select(.status == "ok")]|length) == 2 then "；本轮推荐" else "" end)",
+  (.results[] | "   \(.endpoint // "探测")：\(.status | reason)；本地源=\(.local // "-")；公网出口=\(.public // "-")；目标=\(.remote // "-")；耗时=\(.seconds // "-")s")
+' <<< "$data"
+yellow "只影响脚本探测和sing-box原生直连；不修改节点公布地址。DNS和系统路由仍由现有配置处理。"
+fi
+readp "输入地址序号，0恢复系统自动，r重新检测，b返回：" choice || return 1
+case "$choice" in
+b|B) return 0 ;;
+r|R) refresh=1; continue ;;
+esac
+if [[ ! $choice =~ ^[0-9]{1,6}$ ]]; then
+red "请输入列表中的地址序号"; continue
+fi
+row=$(jq -ce --arg index "$choice" '.[$index | tonumber] // empty' <<< "$data") || {
+red "地址序号不存在"; continue;
+}
+source=$(jq -r '.address' <<< "$row")
+state=$(jq -r '.state' <<< "$row")
+if [[ -n $source && $state != ready ]]; then
+red "该地址当前不可用于固定出站，请重新检测后选择"; continue
+fi
+if egress_apply "$family" "$source"; then
+blue "IPv${family} 出站源已设为：${source:-系统自动}"
+return 0
+fi
+return 1
+done
+}
+
+egress_menu(){
+local choice
+while true; do
+egress_status
+yellow "地址族优先级决定连接目标IPv4还是IPv6；源地址决定使用本机哪个IP建立连接"
+readp "1：设置IPv4/IPv6优先级\n2：选择IPv4源地址\n3：选择IPv6源地址\n4：刷新当前出站连通性\n0：返回上层\n请选择：" choice || return 1
+case "$choice" in
+1) changeip egress ;;
+2) egress_select 4 ;;
+3) egress_select 6 ;;
+4) menu_ip_status; printf '公网探测 IPv4：%s  IPv6：%s\n' "$vps_ipv4" "$vps_ipv6"
+   yellow "完整的逐地址扫描请进入2或3；选择页支持r重新检测" ;;
+0) changeserv; return ;;
+*) red "输入无效，请选择0-4" ;;
+esac
 done
 }
 
@@ -3615,7 +3999,7 @@ changeserv(){
 sbactive
 echo
 green "Sing-box配置变更选择如下:"
-readp "1：更换Reality域名伪装地址、切换自签证书与Acme域名证书、开关TLS\n2：更换原有协议UUID(密码)、Vmess-Path路径\n3：设置Argo临时隧道、固定隧道\n4：切换IPv4或IPv6的代理优先级\n5：设置Telegram推送节点通知\n6：更换Warp-wireguard出站账户\n7：设置Gitlab订阅分享链接\n8：管理订阅分享链接（本地IP/自定义域名HTTPS）\n9：设置所有Vmess节点的CDN优选地址\n10：设置自定义域名分发（HTTPS订阅）\n11：管理Trojan / Snell（启停、端口、密码、证书）\n0：返回上层\n请选择【0-11】：" menu
+readp "1：更换Reality域名伪装地址、切换自签证书与Acme域名证书、开关TLS\n2：更换原有协议UUID(密码)、Vmess-Path路径\n3：设置Argo临时隧道、固定隧道\n4：IP出站设置（地址族优先级/源地址）\n5：设置Telegram推送节点通知\n6：更换Warp-wireguard出站账户\n7：设置Gitlab订阅分享链接\n8：管理订阅分享链接（本地IP/自定义域名HTTPS）\n9：设置所有Vmess节点的CDN优选地址\n10：设置自定义域名分发（HTTPS订阅）\n11：管理Trojan / Snell（启停、端口、密码、证书）\n0：返回上层\n请选择【0-11】：" menu
 if [ "$menu" = "1" ];then
 changeym
 elif [ "$menu" = "2" ];then
@@ -3623,7 +4007,7 @@ changeuuid
 elif [ "$menu" = "3" ];then
 cfargo_ym
 elif [ "$menu" = "4" ];then
-changeip
+egress_menu
 elif [ "$menu" = "5" ];then
 tgsbshow
 elif [ "$menu" = "6" ];then
@@ -5321,7 +5705,7 @@ red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 green " 1. 一键安装 Sing-box" 
 green " 2. 删除卸载 Sing-box"
 white "----------------------------------------------------------------------------------"
-green " 3. 变更配置 【TLS/UUID/Argo/IP优先/TG/Warp/订阅/域名分发/CDN/Trojan/Snell】"
+green " 3. 变更配置 【TLS/UUID/Argo/IP出站/TG/Warp/订阅/域名分发/CDN/Trojan/Snell】"
 green " 4. 更改主端口/添加多端口跳跃复用" 
 green " 5. 三通道域名分流"
 green " 6. 关闭/重启 Sing-box"   
@@ -5349,7 +5733,8 @@ red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 echo -e "VPS状态如下："
 echo -e "系统:$blue$op$plain  \c";echo -e "内核:$blue$version$plain  \c";echo -e "处理器:$blue$cpu$plain  \c";echo -e "虚拟化:$blue$vi$plain  \c";echo -e "BBR算法:$blue$bbr$plain"
 menu_ip_status
-echo -e "IPv4：$blue$vps_ipv4$plain   IPv6：$blue$vps_ipv6$plain"
+echo -e "公网探测 IPv4：$blue$vps_ipv4$plain   IPv6：$blue$vps_ipv6$plain"
+egress_status
 if [[ -f /etc/s-box/sb.json ]]; then
 rpip=$(ip_priority_get 2>/dev/null) || rpip=unknown
 v4_6=$(ip_priority_label "$rpip")
