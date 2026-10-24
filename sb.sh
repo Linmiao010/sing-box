@@ -188,7 +188,7 @@ menu_ip_status(){
 local family address url
 v4= v6=
 # Race both HTTPS sources for both families, with no sequential fallback wait.
-# Each request has 0.6s, leaving time for process/validation overhead within 1s.
+# Each request has 2.6s, leaving time for process/validation overhead within 3s.
 while read -r family address; do
 case "$family" in
 4) [[ -n $v4 ]] || v4=$address ;;
@@ -198,7 +198,7 @@ done < <(
 for family in 4 6; do
 for url in https://icanhazip.com https://api64.ipify.org; do
 (
-address=$(public_ip "$family" 0.6 "$url") || address=
+address=$(public_ip "$family" 2.6 "$url") || address=
 printf '%s %s\n' "$family" "$address"
 ) &
 done

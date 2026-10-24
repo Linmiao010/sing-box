@@ -228,6 +228,8 @@ class MenuIpStatusTests(ShellTestCase):
                 family = self.headers["X-Probe-Family"]
                 requests.append((family, self.path))
                 if mode == "timeout" or (mode == "fallback" and self.path == "/primary"):
+                    time.sleep(4)
+                elif mode == "delayed":
                     time.sleep(1.2)
                 body = ("203.0.113.25" if family == "4" else "2001:db8::25").encode()
                 try:
@@ -286,17 +288,23 @@ done
         self.assertEqual(output.splitlines(), ["203.0.113.25", "2001:db8::25"])
         self.assertCountEqual(requests, [(family, path) for family in ("4", "6")
                                         for path in ("/primary", "/fallback")])
-        self.assertLess(max(durations), 1.0, durations)
+        self.assertLess(max(durations), 3.0, durations)
 
-    def test_menu_status_falls_back_within_one_second(self):
+    def test_menu_status_accepts_slow_response_within_three_seconds(self):
+        output, requests, durations = self.status("delayed")
+        self.assertEqual(output.splitlines(), ["203.0.113.25", "2001:db8::25"])
+        self.assertEqual(len(requests), 4)
+        self.assertLess(max(durations), 3.0, durations)
+
+    def test_menu_status_falls_back_within_three_seconds(self):
         output, requests, durations = self.status("fallback")
         self.assertEqual(output.splitlines(), ["203.0.113.25", "2001:db8::25"])
         self.assertCountEqual(requests, [(family, path) for family in ("4", "6")
                                         for path in ("/primary", "/fallback")])
-        self.assertLess(max(durations), 1.0, durations)
+        self.assertLess(max(durations), 3.0, durations)
 
-    def test_dual_stack_timeout_finishes_within_one_second_without_stale_results(self):
+    def test_dual_stack_timeout_finishes_within_three_seconds_without_stale_results(self):
         output, requests, durations = self.status("timeout", samples=3)
         self.assertEqual(output.splitlines(), ["公网IPv4探测未成功", "公网IPv6探测未成功"] * 3)
         self.assertEqual(len(requests), 12)
-        self.assertLess(max(durations), 1.0, durations)
+        self.assertLess(max(durations), 3.0, durations)
