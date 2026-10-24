@@ -59,89 +59,64 @@ x86_64) cpu=amd64;;
 esac
 if [[ -n $(sysctl net.ipv4.tcp_congestion_control 2>/dev/null | awk -F ' ' '{print $3}') ]]; then
 bbr=`sysctl net.ipv4.tcp_congestion_control | awk -F ' ' '{print $3}'`
-elif [[ -n $(ping 10.0.0.2 -c 2 | grep ttl) ]]; then
-bbr="Openvz版bbr-plus"
 else
-bbr="Openvz/Lxc"
+bbr="未知（本机未提供）"
 fi
 hostname=$(hostname)
 
-# Preserve the dependency marker when upgrading an existing installation.
-if [[ -f sbyg_update && ! -f sing_box_update ]]; then
-mv sbyg_update sing_box_update || exit 1
-fi
-if [ ! -f sing_box_update ]; then
-green "首次安装sing-box脚本必要的依赖……"
-if command -v apk >/dev/null 2>&1; then
-apk update
-apk add bash libc6-compat jq openssl procps busybox-extras iproute2 iputils coreutils expect git socat iptables grep tar tzdata util-linux
-apk add virt-what
-else
-if [[ $release = Centos && ${vsid} =~ 8 ]]; then
-cd /etc/yum.repos.d/ && mkdir backup && mv *repo backup/ 
-curl -o /etc/yum.repos.d/CentOS-Base.repo http://mirrors.aliyun.com/repo/Centos-8.repo
-sed -i -e "s|mirrors.cloud.aliyuncs.com|mirrors.aliyun.com|g " /etc/yum.repos.d/CentOS-*
-sed -i -e "s|releasever|releasever-stream|g" /etc/yum.repos.d/CentOS-*
-yum clean all && yum makecache
-cd
-fi
-if [ -x "$(command -v apt-get)" ]; then
-apt update -y
-apt install jq cron socat busybox iptables-persistent coreutils util-linux -y
-elif [ -x "$(command -v yum)" ]; then
-yum update -y && yum install epel-release -y
-yum install jq socat busybox coreutils util-linux -y
-elif [ -x "$(command -v dnf)" ]; then
-dnf update -y
-dnf install jq socat busybox coreutils util-linux -y
-fi
-if [ -x "$(command -v yum)" ] || [ -x "$(command -v dnf)" ]; then
-if [ -x "$(command -v yum)" ]; then
-yum install -y cronie iptables-services
-elif [ -x "$(command -v dnf)" ]; then
-dnf install -y cronie iptables-services
-fi
-systemctl enable iptables >/dev/null 2>&1
-systemctl start iptables >/dev/null 2>&1
-fi
-if [[ -z $vi ]]; then
-apt install iputils-ping iproute2 systemctl -y
-fi
-
-packages=("curl" "openssl" "iptables" "tar" "expect" "wget" "xxd" "python3" "qrencode" "git")
-inspackages=("curl" "openssl" "iptables" "tar" "expect" "wget" "xxd" "python3" "qrencode" "git")
-for i in "${!packages[@]}"; do
-package="${packages[$i]}"
-inspackage="${inspackages[$i]}"
-if ! command -v "$package" &> /dev/null; then
-if [ -x "$(command -v apt-get)" ]; then
-apt-get install -y "$inspackage"
-elif [ -x "$(command -v yum)" ]; then
-yum install -y "$inspackage"
-elif [ -x "$(command -v dnf)" ]; then
-dnf install -y "$inspackage"
-fi
-fi
+# Called only by installation or an explicit repair, never menu display.
+ensure_dependencies(){
+local dependency missing=0 manager
+local marker=/etc/s-box/dependencies.ready
+local -a required=(curl jq openssl ip ss crontab socat busybox iptables tar expect wget xxd python3 qrencode git sysctl)
+for dependency in "${required[@]}"; do
+command -v "$dependency" >/dev/null 2>&1 || missing=1
 done
+# Old cwd/root markers (sbyg_update / sing_box_update) are only hints.
+# Existing installations migrate after checking commands, even if the old marker was lost.
+if (( ! missing )); then
+mkdir -p /etc/s-box && touch "$marker"
+return $?
 fi
-touch sing_box_update
-fi
-
-if [[ $vi = openvz ]]; then
-TUN=$(cat /dev/net/tun 2>&1)
-if [[ ! $TUN =~ 'in bad state' ]] && [[ ! $TUN =~ '处于错误状态' ]] && [[ ! $TUN =~ 'Die Dateizugriffsnummer ist in schlechter Verfassung' ]]; then 
-red "检测到未开启TUN，现尝试添加TUN支持" && sleep 4
-cd /dev && mkdir net && mknod net/tun c 10 200 && chmod 0666 net/tun
-TUN=$(cat /dev/net/tun 2>&1)
-if [[ ! $TUN =~ 'in bad state' ]] && [[ ! $TUN =~ '处于错误状态' ]] && [[ ! $TUN =~ 'Die Dateizugriffsnummer ist in schlechter Verfassung' ]]; then 
-green "添加TUN支持失败，建议与VPS厂商沟通或后台设置开启" && exit
+rm -f "$marker"
+green "安装/修复sing-box脚本必要的依赖……"
+if command -v apk >/dev/null 2>&1; then
+apk add bash libc6-compat curl jq openssl procps busybox busybox-extras iproute2 iputils coreutils expect git socat iptables grep tar tzdata util-linux wget xxd python3 libqrencode-tools virt-what || return 1
+elif command -v apt-get >/dev/null 2>&1; then
+apt-get update && apt-get install -y curl jq cron socat busybox iptables-persistent coreutils util-linux openssl iptables tar expect wget xxd python3 qrencode git iproute2 iputils-ping procps || return 1
+elif command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
+command -v dnf >/dev/null 2>&1 && manager=dnf || manager=yum
+"$manager" install -y epel-release && "$manager" install -y curl jq cronie socat busybox coreutils util-linux openssl iptables-services tar expect wget vim-common python3 qrencode git iproute iputils procps-ng || return 1
+# Restore saved port-forwarding rules on reboot; do not reload a live firewall.
+systemctl enable iptables >/dev/null 2>&1 || return 1
 else
-echo '#!/bin/bash' > /root/tun.sh && echo 'cd /dev && mkdir net && mknod net/tun c 10 200 && chmod 0666 net/tun' >> /root/tun.sh && chmod +x /root/tun.sh
-grep -qE "^ *@reboot root bash /root/tun.sh >/dev/null 2>&1" /etc/crontab || echo "@reboot root bash /root/tun.sh >/dev/null 2>&1" >> /etc/crontab
+red "未找到受支持的包管理器，请手动安装缺失依赖"
+return 1
+fi
+for dependency in "${required[@]}"; do
+command -v "$dependency" >/dev/null 2>&1 || { red "依赖仍缺失：$dependency"; return 1; }
+done
+mkdir -p /etc/s-box && touch "$marker"
+}
+
+setup_tun(){
+[[ $vi == openvz ]] || return 0
+local tun_result
+tun_result=$(LC_ALL=C cat /dev/net/tun 2>&1)
+[[ $tun_result == *"File descriptor in bad state"* ]] && return 0
+red "检测到未开启TUN，现尝试添加TUN支持"
+if [[ ! -e /dev/net/tun ]]; then
+mkdir -p /dev/net && mknod /dev/net/tun c 10 200 && chmod 0666 /dev/net/tun || return 1
+fi
+tun_result=$(LC_ALL=C cat /dev/net/tun 2>&1)
+if [[ $tun_result != *"File descriptor in bad state"* ]]; then
+red "添加TUN支持失败，请联系VPS厂商开启"; return 1
+fi
+printf '%s\n' '#!/bin/bash' 'mkdir -p /dev/net; [ -c /dev/net/tun ] || { mknod /dev/net/tun c 10 200 && chmod 0666 /dev/net/tun; }' > /root/tun.sh && chmod +x /root/tun.sh || return 1
+grep -qE "^ *@reboot root bash /root/tun.sh >/dev/null 2>&1" /etc/crontab || echo "@reboot root bash /root/tun.sh >/dev/null 2>&1" >> /etc/crontab || return 1
 green "TUN守护功能已启动"
-fi
-fi
-fi
+return 0
+}
 v4v6(){
 v4=$(public_ip 4)
 v6=$(public_ip 6)
@@ -158,8 +133,8 @@ else
 v6_display="未检测到全局IPv6地址；公网探测未成功"
 fi
 v4dq= v6dq=
-[[ -z $v4 ]] || v4dq=$(curl -fsS -4 --noproxy '*' --max-time 5 https://ip.fm 2>/dev/null | sed -n 's/.*Location: //p')
-[[ -z $v6 ]] || v6dq=$(curl -fsS -6 --noproxy '*' --max-time 5 https://ip.fm 2>/dev/null | sed -n 's/.*Location: //p')
+[[ -z $v4 ]] || v4dq=$(curl -fsS -4 --noproxy '*' --connect-timeout 2 --max-time 5 https://ip.fm 2>/dev/null | sed -n 's/.*Location: //p')
+[[ -z $v6 ]] || v6dq=$(curl -fsS -6 --noproxy '*' --connect-timeout 2 --max-time 5 https://ip.fm 2>/dev/null | sed -n 's/.*Location: //p')
 return 0
 }
 
@@ -196,7 +171,7 @@ fi
 public_ip(){
 local family=$1 url address
 for url in https://icanhazip.com https://api64.ipify.org; do
-if address=$(curl -fsS "-$family" --noproxy '*' --max-time 5 "$url" 2>/dev/null); then
+if address=$(curl -fsS "-$family" --noproxy '*' --connect-timeout 2 --max-time 5 "$url" 2>/dev/null); then
 address=${address%$'\r'}
 if ip_literal_valid "$family" "$address"; then
 printf '%s\n' "$address"
@@ -287,13 +262,18 @@ fi
 }
 
 inssb(){
+local release_page
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 green "使用哪个内核版本？"
 yellow "1：使用目前最新正式版内核 (回车默认)"
 yellow "2：使用之前1.10.7正式版内核 (支持geosite分流、IP优选级切换，无Anytls协议)"
-readp "请选择【1-2】：" menu
+readp "请选择【1-2】：" menu || return 1
 if [ -z "$menu" ] || [ "$menu" = "1" ] ; then
-sbcore=$(curl -Ls https://github.com/SagerNet/sing-box/releases/latest | grep -oP 'tag/v\K[0-9.]+' | head -n 1)
+if ! release_page=$(curl -fLsS --connect-timeout 2 --max-time 6 https://github.com/SagerNet/sing-box/releases/latest); then
+red "正式版版本查询失败，未下载内核"; return 1
+fi
+sbcore=$(printf '%s\n' "$release_page" | grep -oE 'tag/v[0-9]+\.[0-9]+\.[0-9]+(["/<>[:space:]]|$)' | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+[[ -n $sbcore ]] || { red "正式版版本信息无效，未下载内核"; return 1; }
 else
 sbcore='1.10.7'
 fi
@@ -1440,7 +1420,7 @@ echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 vl_link="vless://$uuid@$server_ip:$vl_port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$vl_name&fp=chrome&pbk=$public_key&sid=$short_id&type=tcp&headerType=none#vl-reality-$hostname"
 echo "$vl_link" > /etc/s-box/vl_reality.txt || return 1
-red "🚀【 vless-reality-vision 】节点信息如下：" && sleep 2
+red "🚀【 vless-reality-vision 】节点信息如下：" && { [[ ! -t 1 ]] || sleep 2; }
 echo
 echo "分享链接【v2ran(切换singbox内核)、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}$vl_link${plain}"
@@ -1457,7 +1437,7 @@ if [[ "$tls" = "false" ]]; then
 if ps -ef 2>/dev/null | grep "[l]ocalhost:$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port')" >/dev/null 2>&1; then
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-red "🚀【 vmess-ws(tls)+Argo 】临时节点信息如下(可选择3-8-3，自定义CDN优选地址)：" && sleep 2
+red "🚀【 vmess-ws(tls)+Argo 】临时节点信息如下(可选择3-8-3，自定义CDN优选地址)：" && { [[ ! -t 1 ]] || sleep 2; }
 echo
 echo "分享链接【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}vmess://$(echo '{"add":"'$vmadd_argo'","aid":"0","host":"'$argo'","id":"'$uuid'","net":"ws","path":"'$ws_path'","port":"443","ps":"'vm-argo-$hostname'","tls":"tls","sni":"'$argo'","fp":"chrome","type":"none","v":"2"}' | base64 -w 0)${plain}"
@@ -1471,7 +1451,7 @@ if ps -ef 2>/dev/null | grep -q '[c]loudflared.*run'; then
 argogd=$(cat /etc/s-box/sbargoym.log 2>/dev/null)
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-red "🚀【 vmess-ws(tls)+Argo 】固定节点信息如下 (可选择3-8-3，自定义CDN优选地址)：" && sleep 2
+red "🚀【 vmess-ws(tls)+Argo 】固定节点信息如下 (可选择3-8-3，自定义CDN优选地址)：" && { [[ ! -t 1 ]] || sleep 2; }
 echo
 echo "分享链接【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}vmess://$(echo '{"add":"'$vmadd_argo'","aid":"0","host":"'$argogd'","id":"'$uuid'","net":"ws","path":"'$ws_path'","port":"443","ps":"'vm-argo-$hostname'","tls":"tls","sni":"'$argogd'","fp":"chrome","type":"none","v":"2"}' | base64 -w 0)${plain}"
@@ -1483,7 +1463,7 @@ qrencode -o - -t ANSIUTF8 "$(cat /etc/s-box/vm_ws_argogd.txt)"
 fi
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-red "🚀【 vmess-ws 】节点信息如下 (建议选择3-8-1，设置为CDN优选节点)：" && sleep 2
+red "🚀【 vmess-ws 】节点信息如下 (建议选择3-8-1，设置为CDN优选节点)：" && { [[ ! -t 1 ]] || sleep 2; }
 echo
 echo "分享链接【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}vmess://$(echo '{"add":"'$vmadd_are_local'","aid":"0","host":"'$vm_name'","id":"'$uuid'","net":"ws","path":"'$ws_path'","port":"'$vm_port'","ps":"'vm-ws-$hostname'","tls":"","type":"none","v":"2"}' | base64 -w 0)${plain}"
@@ -1495,7 +1475,7 @@ qrencode -o - -t ANSIUTF8 "$(cat /etc/s-box/vm_ws.txt)"
 else
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-red "🚀【 vmess-ws-tls 】节点信息如下 (建议选择3-8-1，设置为CDN优选节点)：" && sleep 2
+red "🚀【 vmess-ws-tls 】节点信息如下 (建议选择3-8-1，设置为CDN优选节点)：" && { [[ ! -t 1 ]] || sleep 2; }
 echo
 echo "分享链接【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}vmess://$(echo '{"add":"'$vmadd_are_local'","aid":"0","host":"'$vm_name'","id":"'$uuid'","net":"ws","path":"'$ws_path'","port":"'$vm_port'","ps":"'vm-ws-tls-$hostname'","tls":"tls","sni":"'$vm_name'","fp":"chrome","type":"none","v":"2"}' | base64 -w 0)${plain}"
@@ -1515,7 +1495,7 @@ white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 hy2_link="hysteria2://$uuid@$sb_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=0&allowInsecure=0$hyps&sni=$hy2_name&pinSHA256=$SHA256#hy2-$hostname"
 #hy2_link="hysteria2://$uuid@$sb_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=$ins_hy2&allowInsecure=$ins_hy2$hyps&sni=$hy2_name#hy2-$hostname"
 echo "$hy2_link" > /etc/s-box/hy2.txt || return 1
-red "🚀【 Hysteria-2 】节点信息如下：" && sleep 2
+red "🚀【 Hysteria-2 】节点信息如下：" && { [[ ! -t 1 ]] || sleep 2; }
 echo
 echo "分享链接【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}$hy2_link${plain}"
@@ -1531,7 +1511,7 @@ echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 tuic5_link="tuic://$uuid:$uuid@$sb_tu5_ip:$tu5_port?congestion_control=bbr&udp_relay_mode=native&alpn=h3&sni=$tu5_name&insecure=$ins&allowInsecure=$ins&allow_insecure=$ins#tu5-$hostname"
 echo "$tuic5_link" > /etc/s-box/tuic5.txt || return 1
-red "🚀【 Tuic-v5 】节点信息如下：" && sleep 2
+red "🚀【 Tuic-v5 】节点信息如下：" && { [[ ! -t 1 ]] || sleep 2; }
 echo
 echo "分享链接【v2rayn、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}$tuic5_link${plain}"
@@ -1547,7 +1527,7 @@ echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 an_link="anytls://$uuid@$sb_an_ip:$an_port?&sni=$an_name&allowInsecure=$ins_an&insecure=$ins_an#anytls-$hostname"
 echo "$an_link" > /etc/s-box/an.txt || return 1
-red "🚀【 Anytls】节点信息如下：" && sleep 2
+red "🚀【 Anytls】节点信息如下：" && { [[ ! -t 1 ]] || sleep 2; }
 echo
 echo "分享链接【v2rayn、小火箭shadowrocket】"
 echo -e "${yellow}$an_link${plain}"
@@ -2900,10 +2880,11 @@ instsllsingbox(){
 if [[ -f '/etc/systemd/system/sing-box.service' ]]; then
 red "已安装Sing-box服务，无法再次安装" && exit
 fi
+ensure_dependencies && setup_tun || return 1
 mkdir -p /etc/s-box
 v6 || return 1
 openyn
-inssb
+inssb || return 1
 inscertificate
 insport
 sleep 2
@@ -2926,7 +2907,7 @@ sbactive
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 lnsb || return 1
 local installed_version
-if installed_version=$(curl -fsSL "$SB_RAW_BASE/version"); then
+if installed_version=$(curl -fsSL --connect-timeout 2 --max-time 6 "$SB_RAW_BASE/version"); then
 printf '%s\n' "$installed_version" | awk -F "更新内容" '{print $1}' | head -n 1 > /etc/s-box/v
 else
 yellow "脚本版本信息获取失败，请稍后通过菜单7更新"
@@ -4215,25 +4196,31 @@ fi
 }
 
 sbymfl(){
+if [[ $1 == probe ]]; then
 sbport=$(cat /etc/s-box/sbwpph.log 2>/dev/null | awk '{print $3}' | awk -F":" '{print $NF}') 
 sbport=${sbport:-'40000'}
-resv1=$(curl -sm3 --socks5 localhost:$sbport icanhazip.com)
-resv2=$(curl -sm3 -x socks5h://localhost:$sbport icanhazip.com)
-if [[ -z $resv1 && -z $resv2 ]]; then
-warp_s4_ip='Socks5-IPV4未启动，黑名单模式'
-warp_s6_ip='Socks5-IPV6未启动，黑名单模式'
+resv1=$(curl -fsS --connect-timeout 2 --max-time 3 --noproxy '' --socks5 "localhost:$sbport" https://icanhazip.com 2>/dev/null) || resv1=
+resv2=$(curl -fsS --connect-timeout 2 --max-time 3 --noproxy '' -x "socks5h://localhost:$sbport" https://icanhazip.com 2>/dev/null) || resv2=
+if ip_literal_valid 4 "$resv1" || ip_literal_valid 6 "$resv1" || ip_literal_valid 4 "$resv2" || ip_literal_valid 6 "$resv2"; then
+warp_s4_ip='Socks5查询成功（不代表双栈均可用）'
+warp_s6_ip=$warp_s4_ip
 else
-warp_s4_ip='Socks5-IPV4可用'
-warp_s6_ip='Socks5-IPV6自测'
+warp_s4_ip='Socks5公网查询未成功（不代表服务未启动）'
+warp_s6_ip=$warp_s4_ip
 fi
 v4v6
 vps_ipv4="当前IP：${v4:-公网IPv4探测未成功}"
 vps_ipv6="当前IP：$v6_display"
+fi
+warp_s4_ip=${warp_s4_ip:-Socks5-IPV4未探测}
+warp_s6_ip=${warp_s6_ip:-Socks5-IPV6未探测}
+vps_ipv4=${vps_ipv4:-公网IPv4未探测}
+vps_ipv6=${vps_ipv6:-公网IPv6未探测}
 unset swg4 swd4 swd6 swg6 ssd4 ssg4 ssd6 ssg6 sad4 sag4 sad6 sag6
 wd4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[1].domain_suffix | join(" ")')
 wg4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[1].geosite | join(" ")' 2>/dev/null)
 if [[ "$wd4" == "yg_kkk" && ("$wg4" == "yg_kkk" || -z "$wg4") ]]; then
-wfl4="${yellow}【warp出站IPV4可用】未分流${plain}"
+wfl4="${yellow}【warp出站IPV4未探测】未分流${plain}"
 else
 if [[ "$wd4" != "yg_kkk" ]]; then
 swd4="$wd4 "
@@ -4241,13 +4228,13 @@ fi
 if [[ "$wg4" != "yg_kkk" ]]; then
 swg4=$wg4
 fi
-wfl4="${yellow}【warp出站IPV4可用】已分流：$swd4$swg4${plain} "
+wfl4="${yellow}【warp出站IPV4未探测】已分流：$swd4$swg4${plain} "
 fi
 
 wd6=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[2].domain_suffix | join(" ")')
 wg6=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[2].geosite | join(" ")' 2>/dev/null)
 if [[ "$wd6" == "yg_kkk" && ("$wg6" == "yg_kkk"|| -z "$wg6") ]]; then
-wfl6="${yellow}【warp出站IPV6自测】未分流${plain}"
+wfl6="${yellow}【warp出站IPV6未探测】未分流${plain}"
 else
 if [[ "$wd6" != "yg_kkk" ]]; then
 swd6="$wd6 "
@@ -4255,7 +4242,7 @@ fi
 if [[ "$wg6" != "yg_kkk" ]]; then
 swg6=$wg6
 fi
-wfl6="${yellow}【warp出站IPV6自测】已分流：$swd6$swg6${plain} "
+wfl6="${yellow}【warp出站IPV6未探测】已分流：$swd6$swg6${plain} "
 fi
 
 sd4=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.route.rules[3].domain_suffix | join(" ")')
@@ -4640,7 +4627,7 @@ if [[ ! -f /usr/bin/sing_box && ! -f /usr/bin/sb ]]; then
 red "未正常安装 sing-box"; return 1
 fi
 local script_version
-if ! script_version=$(curl -fsSL "$SB_RAW_BASE/version"); then
+if ! script_version=$(curl -fsSL --connect-timeout 2 --max-time 6 "$SB_RAW_BASE/version"); then
 red "脚本版本信息下载失败，未执行升级"
 return 1
 fi
@@ -4655,13 +4642,14 @@ green "sing-box安装脚本升级成功" && sleep 5 && sing_box
 }
 
 lapre(){
-json=$(curl -Ls --max-time 3 https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box)
+latcore= precore=
+json=$(curl -fLsS --connect-timeout 2 --max-time 3 https://data.jsdelivr.com/v1/package/gh/SagerNet/sing-box 2>/dev/null) || json=
 if echo "$json"|grep -q '"versions"'; then
 latcore=$(echo "$json"|grep -Eo '"[0-9.]+",'|head -n1|tr -d '",')
 precore=$(echo "$json"|grep -Eo '"[0-9.]*-[^"]*"'|head -n1|tr -d '",')
 else
-page=$(curl -Ls --max-time 3 https://github.com/SagerNet/sing-box/releases)
-latcore=$(echo "$page"|grep -oE 'tag/v[0-9.]+'|head -n1|cut -d'v' -f2)
+page=$(curl -fLsS --connect-timeout 2 --max-time 3 https://github.com/SagerNet/sing-box/releases 2>/dev/null) || page=
+latcore=$(echo "$page"|grep -oE 'tag/v[0-9]+\.[0-9]+\.[0-9]+(["/<>[:space:]]|$)'|head -n1|grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 precore=$(echo "$page"|grep -oE '/tag/v[0-9.]+-[^"]+'|head -n1|cut -d'v' -f2)
 fi
 inscore=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}')
@@ -4727,31 +4715,34 @@ exit 1
 upsbcroe(){
 sbactive
 lapre
+lat= pre= upcore=
 [[ $inscore =~ ^[0-9.]+$ ]] && lat="【已安装v$inscore】" || pre="【已安装v$inscore】"
-green "1：升级/切换Sing-box最新正式版 v$latcore  ${bblue}${lat}${plain}"
-green "2：升级/切换Sing-box最新测试版 v$precore  ${bblue}${pre}${plain}"
+green "1：升级/切换Sing-box最新正式版 ${latcore:-查询失败}  ${bblue}${lat}${plain}"
+green "2：升级/切换Sing-box最新测试版 ${precore:-查询失败}  ${bblue}${pre}${plain}"
 green "3：切换Sing-box某个正式版或测试版，需指定版本号 (建议1.10.0以上版本)"
 green "0：返回上层"
-readp "请选择【0-3】：" menu
+readp "请选择【0-3】：" menu || return 1
 if [ "$menu" = "1" ]; then
-upcore=$(curl -Ls https://github.com/SagerNet/sing-box/releases/latest | grep -oP 'tag/v\K[0-9.]+' | head -n 1)
+upcore=$latcore
 elif [ "$menu" = "2" ]; then
-upcore=$(curl -Ls https://github.com/SagerNet/sing-box/releases | grep -oP '/tag/v\K[0-9.]+-[^"]+' | head -n 1)
+upcore=$precore
 elif [ "$menu" = "3" ]; then
 echo
 red "版本号可在 https://github.com/SagerNet/sing-box/tags 查询；启用 Snell 时需要 1.14.0 或更新正式版"
 green "正式版版本号格式：数字.数字.数字 (例：1.10.7   注意，1.10系列内核支持geosite分流，1.10以上内核不支持geosite分流"
 green "测试版版本号格式：数字.数字.数字-alpha或rc或beta.数字 (例：1.13.0-alpha或rc或beta.1)"
-readp "请输入Sing-box版本号：" upcore
+readp "请输入Sing-box版本号：" upcore || return 1
 else
 sing_box
+return $?
 fi
 if [[ -n $upcore ]]; then
 green "开始下载并更新Sing-box内核……请稍等"
 core_update "$upcore" || return 1
 blue "成功升级/切换 Sing-box 内核版本：$(/etc/s-box/sing-box version | awk '/version/{print $NF}')" && sleep 3 && sing_box
 else
-red "版本号检测出错，请重试" && upsbcroe
+red "版本号查询失败，可重新进入菜单8或指定版本号"
+return 1
 fi
 }
 
@@ -4830,7 +4821,7 @@ sb_client || exit 1
 mv -f -- "$publish_dir/jhsub.txt" /etc/s-box/jhsub.txt || exit 1
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-red "🚀【 聚合节点 】节点信息如下：" && sleep 2
+red "🚀【 聚合节点 】节点信息如下：" && { [[ ! -t 1 ]] || sleep 2; }
 echo
 echo "分享链接"
 echo -e "${yellow}$v2sub${plain}"
@@ -5018,11 +5009,11 @@ l4="VPS本地ipv4优先分流域名：$adfl4"
 l6="VPS本地ipv6优先分流域名：$adfl6"
 [[ "$sbnh" == "1.10" ]] && ymflzu=("ww4" "ww6" "ws4" "ws6" "l4" "l6") || ymflzu=("ww6" "ws4" "l4" "l6")
 for ymfl in "${ymflzu[@]}"; do
-if [[ ${!ymfl} != *"未"* ]]; then
+if [[ ${!ymfl} != *"】未分流"* ]]; then
 echo -e "${!ymfl}"
 fi
 done
-if [[ $ww4 = *"未"* && $ww6 = *"未"* && $ws4 = *"未"* && $ws6 = *"未"* && $l4 = *"未"* && $l6 = *"未"* ]] ; then
+if [[ $ww4 = *"】未分流"* && $ww6 = *"】未分流"* && $ws4 = *"】未分流"* && $ws6 = *"】未分流"* && $l4 = *"】未分流"* && $l6 = *"】未分流"* ]] ; then
 echo -e "未设置域名分流"
 fi
 }
@@ -5176,6 +5167,55 @@ blue "管理命令：sing_box；Trojan/Snell：3 → 11；域名分发：3 → 1
 echo
 }
 
+local_ip_status(){
+local interface_v6
+interface_v6=$(ip -o -6 addr show scope global up 2>/dev/null | awk '
+$3 == "inet6" && / scope global / && !/ (tentative|dadfailed|deprecated)( |$)/ {
+    split($4, address, "/"); print address[1]; exit
+}')
+vps_ipv4="公网IPv4未探测"
+vps_ipv6="${interface_v6:-未检测到全局IPv6地址}（本机配置；公网未探测）"
+showv4=$vps_ipv4 showv6=$vps_ipv6
+}
+
+refresh_status(){
+local version_response
+yellow "主动刷新：脚本版本≤6秒，内核版本≤6秒，公网IP/地区≤30秒，SOCKS≤6秒；网络预算合计≤48秒"
+if version_response=$(curl -fsSL --connect-timeout 2 --max-time 6 "$SB_RAW_BASE/version") && [[ -n $version_response ]]; then
+printf '%s\n' "$version_response"
+else
+yellow "脚本版本查询失败"
+fi
+lapre
+echo "远端内核正式版：${latcore:-查询失败}；测试版：${precore:-查询失败}"
+if [[ -f /etc/s-box/sb.json ]]; then
+sbymfl probe
+echo "$warp_s4_ip"
+else
+v4v6
+fi
+echo "公网IPv4：${v4:-探测未成功}"
+echo "IPv6：$v6_display"
+echo "地区：${v4dq:-${v6dq:-查询未成功}}"
+yellow "本次探测不修改节点地址；需要更新地址请选择主菜单15"
+}
+
+diagnostics_menu(){
+local choice
+while true; do
+green "1. 主动刷新版本 / 公网IP / SOCKS状态（网络预算≤48秒）"
+green "2. 修复脚本依赖 / OpenVZ TUN（执行包安装，耗时取决于软件源）"
+green "0. 返回主菜单"
+readp "请选择【0-2】：" choice || return 1
+case "$choice" in
+1) refresh_status ;;
+2) if ensure_dependencies && setup_tun; then green "依赖检查/修复完成"; else red "依赖修复失败，请检查软件源和缺失命令"; fi ;;
+0) sing_box; return $? ;;
+*) red "输入无效" ;;
+esac
+done
+}
+
 # Older menu-7 updaters still save and launch the new script as /usr/bin/sb.
 if [[ "$0" == /usr/bin/sb ]]; then
 migrate_shortcut || exit 1
@@ -5207,75 +5247,20 @@ green "14. 添加 WARP-plus-Socks5 代理模式 【本地Warp/多地区Psiphon-V
 green "15. 更换IP刷新本地IP、调整IPV4/IPV6配置输出"
 white "----------------------------------------------------------------------------------"
 green "16. sing-box脚本使用说明书"
+green "17. 诊断与修复（联网状态 / 脚本依赖）"
 white "----------------------------------------------------------------------------------"
 green " 0. 退出脚本"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 insV=$(cat /etc/s-box/v 2>/dev/null)
-latestV=$(curl -fsSL "$SB_RAW_BASE/version" | awk -F "更新内容" '{print $1}' | head -n 1)
-if [ -f /etc/s-box/v ]; then
-if [ "$insV" = "$latestV" ]; then
-echo -e "当前 sing-box 脚本最新版：${bblue}${insV}${plain} (已安装)"
-else
-echo -e "当前 sing-box 脚本版本号：${bblue}${insV}${plain}"
-echo -e "检测到最新 sing-box 脚本版本号：${yellow}${latestV}${plain} (可选择7进行更新)"
-echo -e "${yellow}$(curl -fsSL "$SB_RAW_BASE/version")${plain}"
-fi
-else
-echo -e "当前 sing-box 脚本版本号：${bblue}${latestV}${plain}"
-yellow "未安装 sing-box 脚本！请先选择 1 安装"
-fi
-
-lapre
-if [ -f '/etc/s-box/sb.json' ]; then
-if [[ $inscore =~ ^[0-9.]+$ ]]; then
-if [ "${inscore}" = "${latcore}" ]; then
-echo
-echo -e "当前 Sing-box 最新正式版内核：${bblue}${inscore}${plain} (已安装)"
-echo
-echo -e "当前 Sing-box 最新测试版内核：${bblue}${precore}${plain} (可切换)"
-else
-echo
-echo -e "当前 Sing-box 已安装正式版内核：${bblue}${inscore}${plain}"
-echo -e "检测到最新 Sing-box 正式版内核：${yellow}${latcore}${plain} (可选择8进行更新)"
-echo
-echo -e "当前 Sing-box 最新测试版内核：${bblue}${precore}${plain} (可切换)"
-fi
-else
-if [ "${inscore}" = "${precore}" ]; then
-echo
-echo -e "当前 Sing-box 最新测试版内核：${bblue}${inscore}${plain} (已安装)"
-echo
-echo -e "当前 Sing-box 最新正式版内核：${bblue}${latcore}${plain} (可切换)"
-else
-echo
-echo -e "当前 Sing-box 已安装测试版内核：${bblue}${inscore}${plain}"
-echo -e "检测到最新 Sing-box 测试版内核：${yellow}${precore}${plain} (可选择8进行更新)"
-echo
-echo -e "当前 Sing-box 最新正式版内核：${bblue}${latcore}${plain} (可切换)"
-fi
-fi
-else
-echo
-echo -e "当前 Sing-box 最新正式版内核：${bblue}${latcore}${plain}"
-echo -e "当前 Sing-box 最新测试版内核：${bblue}${precore}${plain}"
-fi
+echo -e "当前 sing-box 脚本版本：${bblue}${insV:-未记录}${plain}；远端版本未查询（7更新 / 17诊断）"
+inscore=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}')
+echo -e "当前 Sing-box 内核版本：${bblue}${inscore:-未安装}${plain}；远端版本未查询（8更新 / 17诊断）"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo -e "VPS状态如下："
 echo -e "系统:$blue$op$plain  \c";echo -e "内核:$blue$version$plain  \c";echo -e "处理器:$blue$cpu$plain  \c";echo -e "虚拟化:$blue$vi$plain  \c";echo -e "BBR算法:$blue$bbr$plain"
-v4v6
-if [[ "$v6" == "2a09"* ]]; then
-w6="【WARP】"
-fi
-if [[ "$v4" == "104.28"* ]]; then
-w4="【WARP】"
-fi
-showv4="${v4:-公网IPv4探测未成功}$w4"
-showv6="$v6_display$w6"
-vps_ipv4="${v4:-公网IPv4探测未成功}"
-vps_ipv6="$v6_display"
-location="${v4dq:-${v6dq:-地区查询未成功}}"
-echo -e "本地IPV4地址：$blue$vps_ipv4$w4$plain   本地IPV6地址：$blue$vps_ipv6$w6$plain"
-echo -e "服务器地区：$blue$location$plain"
+local_ip_status
+echo -e "IPv4：$blue$vps_ipv4$plain   IPv6：$blue$vps_ipv6$plain"
+echo -e "服务器地区：未探测（选择17主动刷新）"
 if [[ "$sbnh" == "1.10" ]]; then
 rpip=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.outbounds[0].domain_strategy') 2>/dev/null
 if [[ $rpip = 'prefer_ipv6' ]]; then
@@ -5305,15 +5290,19 @@ echo -e "Sing-box状态：$red未安装$plain"
 fi
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 if [ -f '/etc/s-box/sb.json' ]; then
+if command -v jq >/dev/null 2>&1; then
 showprotocol
+else
+yellow "缺少jq，详细配置暂无法读取；选择17 → 2修复依赖"
+fi
 fi
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
 while true; do
-readp "请输入数字【0-16】:" Input || exit 1
+readp "请输入数字【0-17】:" Input || exit 1
 case "$Input" in
-0|[1-9]|1[0-6]) break ;;
-*) red "输入无效，请输入 0 到 16 之间的数字。" ;;
+0|[1-9]|1[0-7]) break ;;
+*) red "输入无效，请输入 0 到 17 之间的数字。" ;;
 esac
 done
 case "$Input" in  
@@ -5333,5 +5322,6 @@ case "$Input" in
 14 ) inssbwpph;;
 15 ) wgcfgo && sbshare;;
 16 ) sbsm;;
+17 ) diagnostics_menu;;
  * ) exit 
 esac

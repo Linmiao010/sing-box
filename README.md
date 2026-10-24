@@ -10,7 +10,7 @@
 - 管理协议端口、证书、Argo 隧道、域名分流、Telegram 通知以及 sing-box 内核版本。
 - 适配 IPv4、IPv6 和双栈 VPS，包含 Debian、Ubuntu、CentOS、Alpine 安装分支，以及 amd64、arm64、armv7 架构识别。
 
-IP 检测通过 HTTPS 查询公网地址，主查询站失败时尝试备用站。若本机网卡已配置 IPv6，但公网查询未成功，界面会显示本机地址及“公网探测未成功”，不再直接显示“无 IPv6”。本机地址仅用于状态提示，不会自动替代节点中的公网地址；刷新时两种地址族均探测失败会保留原节点地址。公网查询成功也不代表节点入站端口已经可达。
+普通菜单只读取本地信息，公网 IP、地区和出站连通性显示“未探测”。选择 **17 → 1** 后通过 HTTPS 查询公网地址，主查询站失败时尝试备用站。若本机网卡已配置 IPv6，但公网查询未成功，会区分显示本机配置与公网探测结果。本机地址仅用于状态提示，不会自动替代节点中的公网地址；使用菜单 **15** 刷新地址时，两种地址族均探测失败会保留原节点地址。公网查询成功也不代表节点入站端口已经可达。
 
 ## 安装与更新
 
@@ -130,15 +130,135 @@ https://sub.example.com/<token>/jhsub.txt
 
 若 TCP 80/443 被 Nginx、非标准安装的 Caddy 或其他入口占用，且脚本无法接入标准 Caddy 配置，脚本会报告冲突。需要在现有站点服务中自行接入订阅路由，或先调整入口配置；脚本不会停止这些服务来抢占端口。
 
+## 性能排查与本次修复（2026-10-24）
+
+普通打开菜单不查询远端版本、公网 IP 或 SOCKS，也不安装软件包、创建 TUN 设备或修改 crontab。主菜单 **7/8** 更新时查询版本，**17 → 1** 主动刷新版本和联网状态，**17 → 2** 显式修复依赖及 OpenVZ TUN。原有操作编号与规则代理功能保留。
+
+依赖检查只在安装/修复动作中进行；状态记录使用 `/etc/s-box/dependencies.ready`。旧的 `sbyg_update` / `sing_box_update` 相对目录标记不再控制启动：已有安装无论标记是否丢失，必要命令齐全就不运行包管理器，安装缺失依赖且复查成功后才写新标记。不再运行全系统 `yum/dnf update`，也不自动重写 CentOS 8 软件源；软件源失效时需先修复源，再执行 **17 → 2**。RPM 系统保留 iptables 的开机启用，修复动作不重载正在工作的防火墙。
+
+主动状态刷新各网络请求预算为：脚本版本 6 秒、内核版本两个来源合计 6 秒、公网地址及地区最多 30 秒、SOCKS 两种解析方式合计 6 秒，总网络预算不超过 48 秒，另加本地进程执行时间。失败会明确显示查询失败；状态探测不写节点地址。脚本更新与首次内核安装的版本元数据也有连接/总超时，内核更新复用本次已取得的版本。二进制下载不套用这些短预算。
+
+重定向输出的节点/订阅生成跳过展示用 `sleep 2`；交互展示保留停顿，Argo 等真实异步等待保留。
+
+### 证据与边界
+
+已重新核对 fork `a1507538d12b3b95299fff8377f0ac35f7d0c1d4`、上游 `b13f9435c4792fccf04d4fbc73e24a1948abff1b`，共同祖先 `5923edcc5d38654d6153f5f8795c4169f8014ed6`，fork ahead 11 / behind 2。用户曾经测速更快的部署版本尚未取得，不能用本次上游快照代替它。
+
+| 问题 | 证据与归属 | 本次处理 / 验证状态 |
+| --- | --- | --- |
+| 首屏等待远端服务 | 版本、IP、SOCKS 串行请求及重复探测主要继承上游；fork 的双源 IP 回退增加部分路径的等待 | 改成按需探测，普通首屏请求数为 0；隔离测试覆盖正常、超时、DNS 失败和无 IPv6 |
+| 换目录启动触发依赖初始化 | 相对标记、全系统更新与顶层 TUN/ping 逻辑继承上游 | 移至安装/显式修复；已测标记丢失、旧标记、不同目录及安装失败 |
+| 静默订阅刷新等待 | 上游已有展示 sleep，fork 新动作也调用这条链路 | 输出重定向时跳过展示等待；保留发布失败回滚测试 |
+| 网页慢 / 吞吐慢 | 8 组原有节点 TLS/Argo 生成对照中，Mihomo YAML 与上游结构完全一致；JSON 唯一结构差异为 fork 显式 `stack: gvisor` | 保留原 DNS、规则、栈和策略默认值，真实客户端 A/B 实验待执行 |
+| 自动组可能选择新协议 | fork 将 Trojan/Snell 加入共享候选 | 未取得实际选组/出口记录，不能确认性能因果；保留协议可用性 |
+
+本次真实内核校验使用 **sing-box 1.14.3** 与 **Mihomo v1.19.33**：分别检查客户端 5 个有效模板分支，sing-box 服务端检查 TLS 开/关和额外协议的 8 种组合；另有 32 组 JSON/YAML 结构与节点引用检查。校验不启动代理服务，不证明规则集下载、真实 TUN、Linux 服务、网络连通性或吞吐；legacy 1.10.7 未做真实内核校验。
+
+### 菜单离线计时
+
+在同一 Windows 开发机的 Git Bash 下，抽取真实菜单与显示函数，重定向系统路径；JSON/进程状态使用 fixture，每次模拟网络请求只等待 10 ms。计时从启动隔离进程到实际 `readp` 输入点，随后发送 `0` 并确认退出。顶层 OS/OpenVZ 初始化另做隔离行为检查，未执行完整安装器。
+
+| 模拟场景 | 样本数（前 / 后） | 修改前首输入 p50 / p95 | 修改后首输入 p50 / p95 | 每次公网请求（前 → 后） | 失败数 |
+| --- | --- | --- | --- | --- | --- |
+| 正常网络 | 30 / 30 | 3.872 / 5.566 秒 | 2.301 / 2.470 秒 | 12 → 0 | 0 / 0 |
+| 请求超时 | 30 / 30 | 4.068 / 4.846 秒 | 2.271 / 2.659 秒 | 14 → 0 | 0 / 0 |
+
+修改后各场景包管理器、ping、mknod、crontab 调用也为 0；DNS 失败和无 IPv6 的行为测试通过。旧版正常场景中各阶段耗时中位数为：`lapre` 0.411 秒、两次 `v4v6` 合计 0.873 秒、`sbymfl` 1.318 秒、`showprotocol` 2.349 秒；后三项有嵌套，不能相加。
+
+连续 20 次 `3 → 0` 往返可正常退出：子菜单进入 p50 为 0.018 秒（范围 0.015–0.030），返回 p50 为 1.886 秒（范围 1.774–3.440），无公网或包管理器调用。返回测试以同进程 `main_menu` 模拟 `sing_box` 重入，不包含真实新解释器启动，n=20 不报告 p95。
+
+上述计时不是 Linux/VPS 验收：Windows/Git Bash 的本地管道开销较大，基线采样期间穿插了少量其他测试，修改后串行测量；不据此计算严格性能增益。该模型首屏 p95 仍高于 2 秒，**VPS 首屏 ≤2 秒、往返 ≤1 秒的目标尚未实测确认**。已证实的是普通展示消除了隐式联网、包安装和 TUN/crontab 修改。
+
+原始分段日志保存于本地 ignored 的 `.test-tools/menu-before.json` / `menu-after.json`。可重新采集；比较前后时固定机器负载，旧源码使用明确的提交，不要在提交补丁后将 `HEAD` 误作旧版：
+
+```bash
+python tests/test_menu_performance.py --benchmark --samples 30 --scenarios online timeout --source-ref a1507538d12b3b95299fff8377f0ac35f7d0c1d4 --output .test-tools/menu-before.json
+python tests/test_menu_performance.py --benchmark --samples 30 --scenarios online timeout --switch-cycles 20 --output .test-tools/menu-after.json
+```
+
+### 可重复的配置与网络采集
+
+先备份客户端当前配置和持久化策略选择。分别准备上游生成配置、fork 生成配置及客户端合并/覆写后实际配置，使用脱敏标签对照：
+
+```bash
+python tools/compare_client_configs.py upstream.json fork.json
+python tools/compare_client_configs.py downloaded.yaml effective.yaml
+```
+
+工具仅输出变化路径与类型，保留规则/节点列表顺序，不打印配置值；YAML 解析需要测试环境已有的 PyYAML。凭据不同也会报告其路径，勿把凭据差异误认为性能因素。订阅链接和配置原件仍须私下保管。
+
+固定同一个原有节点、VPS、客户端/服务端内核及测试目标。按 **A/B/A/B** 手动切换配置，每段独立调用采集工具，结束后恢复原策略：
+
+- A：上游规则配置，固定原有节点；B：fork 规则配置，同一节点。
+- C：fork 全局模式只作诊断对照；D：fork 自动组/负载均衡，逐次记录实际最终节点。
+- E：仅实际使用 sing-box TUN 时，在 B 基础上单独改变该客户端版本支持的 stack，记录 CPU、TCP/UDP 与吞吐。Mihomo 不做这个 JSON 栈实验；单节点链接应检查客户端自带规则与覆写。
+
+```bash
+# TARGET 为实际慢网页或关键资源；每段至少10次，冷/热缓存分别记录。
+python tools/network_probe.py --label A1-fixed-warm --url "$TARGET" --output web.csv --count 10 --system-path
+# 手动切换为 B 后执行；随后恢复 A2，再切换 B2，沿用同一输出文件。
+python tools/network_probe.py --label B1-fixed-warm --url "$TARGET" --output web.csv --count 10 --system-path
+
+# 固定大小的同一下载对象；BYTES 填实际大小，不用204或错误页测吞吐。
+python tools/network_probe.py --label B-single --url "$DOWNLOAD_TARGET" --output throughput.csv --count 5 --concurrency 1 --expected-bytes "$BYTES" --system-path
+python tools/network_probe.py --label B-multi --url "$DOWNLOAD_TARGET" --output throughput.csv --count 5 --concurrency 4 --expected-bytes "$BYTES" --system-path
+
+# 隔离显式代理链路时，先核实监听类型和端口。
+python tools/network_probe.py --label B-http-proxy --url "$TARGET" --output proxy.csv --count 10 --proxy http://127.0.0.1:7890
+```
+
+当前 YAML 的 `7890` 是 HTTP 端口；JSON 的 TUN 配置不因此具备 SOCKS 入口。`--system-path` 禁用 curl 的环境代理，仍服从系统路由/TUN；显式代理实验不能替代原 TUN 场景复验。`--family 4` / `6` 只用于单变量对照，不修改系统 IPv6。
+
+CSV 记录 `time_namelookup/connect/appconnect/starttransfer/total`、`speed_download`、`size_download`、HTTP 状态、curl 退出码、重定向、并发及 walltime。时间多为累计值，不能直接相加；代理下连接时间可能只到本地代理，`socks5h` 的 DNS 时间不表示完整目标解析耗时。[curl 官方计时说明](https://curl.se/docs/manpage.html)
+
+速度单位为 B/s，除以 `1e6` 得 MB/s，乘以 `8/1e6` 得 Mbps。并发吞吐按每批总字节 / 实际 walltime 计算，CSV 中重复的 `batch_*` 列按 `(run_id, batch)` 去重。汇总报告失败次数、成功样本 p50/范围，仅样本数至少 30 时报告 p95；失败批次不进入成功吞吐统计。结果不记录 URL、query、代理凭据或响应体，人工 label 也不要包含敏感信息。每次 curl 为新进程，不等于系统 DNS 冷缓存。
+
+curl 只能测请求，网页整体加载还需浏览器 HAR；删除 cookie、认证头、令牌和敏感 URL 后再分享。另记录如下表格，至少覆盖预期直连、代理、私网和自定义例外；缺失项填“未测”，不能用 URL 延迟代替吞吐：
+
+| 标签 / 时间 / 冷热缓存 | 目标代号 | 预期出口 | 实际最终节点与协议 | 命中规则 / DNS 出口 | HTTP/退出码、失败数 | TTFB / 页面完成 | 单/多连接吞吐、总字节 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A1 / 待填 | 慢页、直连或代理目标 | 待填 | 待填 | 待填 | 见 CSV | CSV / HAR | 见 CSV |
+
+真实网页 TTFB、加载完成时间、单/多连接吞吐当前均为**未测**，尚不能判定达到上游 90% 吞吐或无超过 10% 的网页回退。继续验证最少需要：客户端应用/内核/OS与TUN或系统代理模式、导入格式及脱敏生效配置、实际选中节点与是否经CDN/Argo/WARP、VPS与管理脚本版本/哈希、原始慢网页和测速目标、用户曾认为更快的部署版本。
+
+### 部署与回滚
+
+本补丁未推送或部署。先将工作树 `sb.sh` 上传到 VPS；在服务器执行以下步骤（不是在开发机运行安装器）：
+
+```bash
+backup="/root/sing-box-backup-$(date +%Y%m%d-%H%M%S)"
+install -d -m 700 "$backup" || exit 1
+manager=$(command -v sing_box || command -v sb) || exit 1
+cp -L "$manager" "$backup/manager.sh" || exit 1
+cp -a /etc/s-box "$backup/s-box" || exit 1
+bash -n ./sb.sh && install -m 755 ./sb.sh /usr/bin/sing_box || exit 1
+if [ -e /usr/bin/sb ]; then ln -sfn /usr/bin/sing_box /usr/bin/sb; fi
+sha256sum ./sb.sh /usr/bin/sing_box
+readlink -f /usr/bin/sb
+sing_box
+```
+
+确认两份 SHA-256 相同，普通首屏可接受输入，选择 **0** 正常退出；断网复验应使用可恢复的测试环境，勿断开生产 SSH。菜单 **17 → 1** 只查看主动探测结果，菜单 **15** 才会刷新节点地址。
+
+本次不改客户端模板或服务端配置，部署脚本不需要重启代理服务。验证订阅链路时可选择 **9 → 2** 重新生成订阅，再让客户端刷新并核对下载文件、覆写及实际选组；随后按上述矩阵复测。对生效配置使用对应客户端版本的 `sing-box check -c …` / `mihomo -t -f …`，服务端单独校验 `sb.json` 和存在时的 `sb_extra.json`，不能只检查 JSON/YAML 语法。
+
+回滚脚本：`install -m 755 "$backup/manager.sh" /usr/bin/sing_box`。若本次还刷新过订阅，需要恢复时只从备份取回 `sbox.json`、`clmi.yaml`、`jhsub.txt` 等实际改动文件，再刷新客户端；保留令牌、凭据、节点地址与自定义规则，不卸载重装。菜单 **7** 始终下载远端 `main`，未推送的本地修复可能被覆盖。
+
 ## 本地验证范围
 
 在仓库目录运行离线行为测试：
 
 ```bash
+bash -n sb.sh
 python -m unittest discover -s tests -v
+git diff --check
 ```
 
 测试需要 Python 3、Bash、jq 和 Caddy；Windows 可使用 Git Bash。额外的 YAML 解析检查可使用 PyYAML，它仅用于测试。测试抽取相关 Bash 函数，在临时目录中检查安装、订阅生成、失败处理和通知内容，TG 请求由测试替身拦截。真实 Caddy 的 localhost 路由检查也只验证本机访问行为；这些结果不代表真实 VPS 的 systemd/OpenRC 服务、域名 DNS、公网 HTTPS 证书签发或客户端联网更新已经验证通过。
+
+`tests/test_config_matrix.py` 的真实内核检查需指定 `SING_BOX_BIN`、`MIHOMO_BIN`、`MIHOMO_DATA_DIR`（已下载 GeoSite/GeoIP 数据）、`SB_TEST_CERT` 和 `SB_TEST_KEY`（测试证书/私钥）。未提供时明确跳过相关检查，不能把跳过计为通过。新采集工具的集成测试仅向本机 HTTP 服务发送请求。
+
+本次启用上述 native 检查后，全套 **135 项通过，0 失败、0 跳过**（210.041 秒）；`bash -n sb.sh` 与 `git diff --check` 通过。测试日志在本地 `.test-tools/final-tests.log`。软件包安装、TUN 初始化和 Linux 服务管理使用测试替身，尚未在真实 Debian/Alpine/CentOS VPS 执行安装或重启验证。
 
 ## 附带脚本
 
