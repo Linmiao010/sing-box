@@ -67,18 +67,11 @@ hostname=$(hostname)
 # Called only by installation or an explicit repair, never menu display.
 ensure_dependencies(){
 local dependency missing=0 manager
-local marker=/etc/s-box/dependencies.ready
 local -a required=(curl jq openssl ip ss crontab socat busybox iptables tar expect wget xxd python3 qrencode git sysctl)
 for dependency in "${required[@]}"; do
 command -v "$dependency" >/dev/null 2>&1 || missing=1
 done
-# Old cwd/root markers (sbyg_update / sing_box_update) are only hints.
-# Existing installations migrate after checking commands, even if the old marker was lost.
-if (( ! missing )); then
-mkdir -p /etc/s-box && touch "$marker"
-return $?
-fi
-rm -f "$marker"
+(( missing )) || return 0
 green "安装/修复sing-box脚本必要的依赖……"
 if command -v apk >/dev/null 2>&1; then
 apk add bash libc6-compat curl jq openssl procps busybox busybox-extras iproute2 iputils coreutils expect git socat iptables grep tar tzdata util-linux wget xxd python3 libqrencode-tools virt-what || return 1
@@ -96,7 +89,7 @@ fi
 for dependency in "${required[@]}"; do
 command -v "$dependency" >/dev/null 2>&1 || { red "依赖仍缺失：$dependency"; return 1; }
 done
-mkdir -p /etc/s-box && touch "$marker"
+return 0
 }
 
 setup_tun(){
@@ -1205,29 +1198,41 @@ esac
 }
 
 extra_port_available(){
-local protocol=$1 port=$2 current
+local protocol=$1 port=$2 current sockets
+# 0: available; 1: invalid/occupied; 2: configuration or socket inspection failed.
 [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || return 1
-sed 's://.*::g' /etc/s-box/sb.json | jq -e --argjson port "$port" \
-    '[.inbounds[]? | select(.listen_port == $port)] | length == 0' >/dev/null || return 1
-if [[ -s /etc/s-box/sb_extra.json ]]; then
-jq -e --arg protocol "$protocol" --argjson port "$port" \
-    '[.inbounds[]? | select(.type != $protocol and .listen_port == $port)] | length == 0' \
-    /etc/s-box/sb_extra.json >/dev/null || return 1
-current=$(jq -r --arg protocol "$protocol" '.inbounds[]? | select(.type == $protocol) | .listen_port' /etc/s-box/sb_extra.json) || return 1
+current=$(set -o pipefail; sed 's://.*::g' /etc/s-box/sb.json | jq -er --argjson port "$port" \
+    '[.inbounds[]? | select(.listen_port == $port)] | length') || return 2
+(( current == 0 )) || return 1
+if [[ -e /etc/s-box/sb_extra.json ]]; then
+current=$(jq -er --arg protocol "$protocol" --argjson port "$port" \
+    '[.inbounds[]? | select(.type != $protocol and .listen_port == $port)] | length' \
+    /etc/s-box/sb_extra.json) || return 2
+(( current == 0 )) || return 1
+current=$(jq -r --arg protocol "$protocol" '.inbounds[]? | select(.type == $protocol) | .listen_port' /etc/s-box/sb_extra.json) || return 2
 [[ "$current" != "$port" ]] || return 0
 fi
-! ss -ltnH | awk '{print $4}' | grep -Eq ":${port}$"
+sockets=$(ss -ltnH) || return 2
+! awk '{print $4}' <<< "$sockets" | grep -Eq ":${port}$"
 }
 
 extra_random_port(){
-local candidate
-while true; do
+local candidate attempt status
+for attempt in {1..10}; do
 candidate=$(shuf -i 10000-65535 -n 1) || return 1
 if extra_port_available "$1" "$candidate"; then
 printf '%s\n' "$candidate"
 return 0
+else
+status=$?
+if (( status != 1 )); then
+red "读取配置或检查监听端口失败，已停止随机端口选择" >&2
+return 1
+fi
 fi
 done
+red "尝试10次仍未找到可用端口，请手动指定" >&2
+return 1
 }
 
 extra_apply(){
@@ -1264,7 +1269,7 @@ chmod 600 "$candidate" || exit 1
 restore=1
 mv -f -- "$candidate" /etc/s-box/sb_extra.json || exit 1
 # Rewrite our service once here so an existing installation also loads the extra file.
-sbservice || exit 1
+sbservice checked || exit 1
 restore=0
 )
 }
@@ -1423,7 +1428,9 @@ green "Trojan / Snell 配置已应用，请在 Clash Verge 中刷新 clmi.yaml �
 
 sbservice(){
 extra_config_init || return 1
+if [[ ${1:-} != checked ]]; then
 /etc/s-box/sing-box check -c /etc/s-box/sb.json -c /etc/s-box/sb_extra.json || return 1
+fi
 if command -v apk >/dev/null 2>&1; then
 echo '#!/sbin/openrc-run
 description="sing-box service"
@@ -1453,7 +1460,6 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload || return 1
 systemctl enable sing-box >/dev/null 2>&1
-systemctl start sing-box
 systemctl restart sing-box
 fi
 }
@@ -1524,11 +1530,11 @@ fi
 }
 
 result_vl_vm_hy_tu(){
-if [[ -f /root/ygkkkca/cert.crt && -f /root/ygkkkca/private.key && -s /root/ygkkkca/cert.crt && -s /root/ygkkkca/private.key ]]; then
+if [[ ${1:-} != client-only && -f /root/ygkkkca/cert.crt && -f /root/ygkkkca/private.key && -s /root/ygkkkca/cert.crt && -s /root/ygkkkca/private.key ]]; then
 ym=`bash ~/.acme.sh/acme.sh --list | tail -1 | awk '{print $1}'`
 echo $ym > /root/ygkkkca/ca.log
 fi
-rm -rf /etc/s-box/vm_ws_argo.txt /etc/s-box/vm_ws.txt /etc/s-box/vm_ws_tls.txt
+[[ ${1:-} == client-only ]] || rm -rf /etc/s-box/vm_ws_argo.txt /etc/s-box/vm_ws.txt /etc/s-box/vm_ws_tls.txt
 server_ip=$(cat /etc/s-box/server_ip.log)
 server_ipcl=$(cat /etc/s-box/server_ipcl.log)
 uuid=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].users[0].uuid')
@@ -1537,6 +1543,7 @@ vl_name=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].tls.server_na
 public_key=$(cat /etc/s-box/public.key)
 short_id=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[0].tls.reality.short_id[0]')
 argo=$(cat /etc/s-box/argo.log 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
+argogd=$(cat /etc/s-box/sbargoym.log 2>/dev/null)
 ws_path=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].transport.path')
 vm_port=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].listen_port')
 tls=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[1].tls.enabled')
@@ -1588,8 +1595,7 @@ ym=$(cat /root/ygkkkca/ca.log 2>/dev/null)
 hy2_sniname=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '.inbounds[2].tls.key_path')
 if [[ "$hy2_sniname" = '/etc/s-box/private.key' ]]; then
 SHA256=$(openssl x509 -in /etc/s-box/cert.pem -outform DER | sha256sum | awk '{print $1}')
-echo "$SHA256" > /etc/s-box/SHA256.txt
-SHA256=$(cat /etc/s-box/SHA256.txt)
+[[ ${1:-} == client-only ]] || printf '%s\n' "$SHA256" > /etc/s-box/SHA256.txt
 hy2_name=www.bing.com
 sb_hy2_ip=$server_ip
 cl_hy2_ip=$server_ipcl
@@ -1759,9 +1765,274 @@ white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
 }
 
+client_warp_validate(){
+python3 - "$1" <<'PY'
+import base64, ipaddress, json, re, sys
+try:
+    with open(sys.argv[1], encoding="utf-8-sig") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or type(data.get("enabled")) is not bool:
+        raise ValueError("enabled 必须为 true 或 false")
+    fields = ("enabled", "server", "port", "ip", "ipv6", "private_key", "public_key", "reserved", "mtu")
+    data = {key: data[key] for key in fields if key in data}
+    if data["enabled"]:
+        server = data.get("server", "")
+        if not isinstance(server, str) or not server or len(server) > 253:
+            raise ValueError("WARP 入口地址无效")
+        try:
+            ipaddress.ip_address(server)
+        except ValueError:
+            if ":" in server or re.fullmatch(r"[0-9.]+", server) or not all(
+                re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", x)
+                for x in server.split(".")
+            ):
+                raise ValueError("WARP 入口必须为 IP 或域名，不含端口")
+        if type(data.get("port")) is not int or not 1 <= data["port"] <= 65535:
+            raise ValueError("WARP 端口无效")
+        if not isinstance(data.get("ip"), str):
+            raise ValueError("缺少隧道 IPv4")
+        ipaddress.IPv4Address(data["ip"])
+        if "ipv6" in data and not isinstance(data["ipv6"], str):
+            raise ValueError("隧道 IPv6 必须为字符串")
+        if data.get("ipv6"):
+            ipaddress.IPv6Address(data["ipv6"])
+        else:
+            data.pop("ipv6", None)
+        for key in ("private_key", "public_key"):
+            if not isinstance(data.get(key), str) or len(base64.b64decode(data[key], validate=True)) != 32:
+                raise ValueError("WireGuard 密钥必须为 base64 编码的 32 字节")
+        reserved = data.setdefault("reserved", [0, 0, 0])
+        if not isinstance(reserved, list) or len(reserved) != 3 or any(type(x) is not int or not 0 <= x <= 255 for x in reserved):
+            raise ValueError("reserved 必须为三个 0 到 255 的整数")
+        mtu = data.setdefault("mtu", 1280)
+        if type(mtu) is not int or not 1280 <= mtu <= 1420:
+            raise ValueError("MTU 必须在 1280 到 1420 之间")
+    print(json.dumps(data, separators=(",", ":")))
+except (OSError, ValueError, TypeError) as e:
+    print("客户端 WARP 参数无效：" + str(e), file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
+client_warp_read(){
+local config=${client_warp_config_file:-/etc/s-box/client_warp.json}
+client_warp_json='{"enabled":false}'
+client_warp_dialer= client_warp_node=
+if [[ -e $config ]]; then
+    client_warp_json=$(client_warp_validate "$config") || return 1
+elif grep -Fq '# client-warp: enabled' /etc/s-box/clmi.yaml 2>/dev/null; then
+    printf '%s\n' '客户端 WARP 状态文件缺失，保留原订阅；请通过3→12导入参数或明确关闭。' >&2
+    return 1
+fi
+if [[ $(jq -r '.enabled' <<< "$client_warp_json") == true ]]; then
+    client_warp_dialer='  dialer-proxy: WARP-前置'
+    client_warp_node=$(jq -cr '
+        {name:"WARP-前置",type:"wireguard",server:.server,port:.port,ip:.ip,
+         "private-key":.private_key,"public-key":.public_key,reserved:.reserved,
+         mtu:.mtu,udp:true,"allowed-ips":["0.0.0.0/0","::/0"]}
+         + (if .ipv6 then {ipv6:.ipv6} else {} end) | "- " + tojson
+    ' <<< "$client_warp_json") || return 1
+    client_warp_node=$'# client-warp: enabled\n'"$client_warp_node"
+fi
+}
+
+client_warp_register(){
+(
+local destination=$1 register_dir private_key public_key
+umask 077
+register_dir=$(mktemp -d /etc/s-box/.client-warp-register.XXXXXX) || exit 1
+trap 'rm -rf -- "$register_dir"' EXIT
+trap 'exit 1' HUP INT TERM
+openssl genpkey -algorithm X25519 -out "$register_dir/key.pem" 2>/dev/null || exit 1
+private_key=$(set -o pipefail; openssl pkey -in "$register_dir/key.pem" -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\r\n') || exit 1
+public_key=$(set -o pipefail; openssl pkey -in "$register_dir/key.pem" -pubout -outform DER 2>/dev/null | tail -c 32 | base64 | tr -d '\r\n') || exit 1
+jq -n --arg key "$public_key" --arg tos "$(date -u +'%Y-%m-%dT%H:%M:%S.000Z')" \
+    '{key:$key,tos:$tos,key_type:"curve25519",tunnel_type:"wireguard",locale:"en_US",
+      fcm_token:"",install_id:"",serial_number:"",os_version:"16.0.0",model:"PC"}' > "$register_dir/request.json" || exit 1
+curl --noproxy '*' -fsS --connect-timeout 3 --max-time 15 \
+    -H 'CF-Client-Version: a-6.38.9-5641' \
+    -H 'User-Agent: 1.1.1.1/6.38.9-5641 (Android 16.0.0)' \
+    -H 'Content-Type: application/json' --data-binary "@$register_dir/request.json" \
+    'https://api.cloudflareclient.com/v0a5641/reg' -o "$register_dir/response.json" || exit 1
+python3 - "$register_dir/response.json" "$private_key" > "$register_dir/candidate.json" <<'PY'
+import base64, json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        response = json.load(f)
+    response = response.get("result", response)
+    if response.get("tunnel_type", "wireguard") != "wireguard":
+        raise ValueError("注册响应不是 WireGuard 配置")
+    config = response["config"]
+    addresses = config["interface"]["addresses"]
+    peer = config["peers"][0]
+    endpoint = peer["endpoint"]
+    server = endpoint.get("v4") or endpoint.get("host") or endpoint.get("v6")
+    port = (endpoint.get("ports") or [2408])[0]
+    if not isinstance(server, str) or not server:
+        raise ValueError("注册响应缺少入口")
+    if server.startswith("["):
+        server, suffix = server[1:].split("]", 1)
+        if suffix:
+            port = int(suffix[1:] if suffix.startswith(":") else suffix)
+    elif server.count(":") == 1:
+        server, port = server.rsplit(":", 1)
+        port = int(port)
+    reserved = list(base64.b64decode(config["client_id"], validate=True))
+    print(json.dumps({"enabled":True,"server":server,"port":port,
+        "ip":addresses["v4"],"ipv6":addresses.get("v6", ""),
+        "private_key":sys.argv[2],"public_key":peer["public_key"],"reserved":reserved,"mtu":1280}))
+except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError):
+    print("WARP 注册响应不完整；未使用共享凭据，请重试或导入有效参数。", file=sys.stderr)
+    sys.exit(1)
+PY
+[[ $? == 0 ]] || exit 1
+client_warp_validate "$register_dir/candidate.json" > "$register_dir/validated.json" || exit 1
+chmod 600 "$register_dir/validated.json" && mv -f -- "$register_dir/validated.json" "$destination"
+)
+}
+
+client_warp_apply(){
+(
+local candidate=$1 apply_dir committing=0 had_state=0 had_client=0
+local client_warp_config_file
+umask 077
+apply_dir=$(mktemp -d /etc/s-box/.client-warp.XXXXXX) || exit 1
+client_warp_cleanup(){
+    local status=$? restore_failed=0
+    trap - EXIT HUP INT TERM
+    if (( committing )); then
+        if (( had_state )); then command mv -f -- "$apply_dir/state.old" /etc/s-box/client_warp.json || restore_failed=1; else rm -f /etc/s-box/client_warp.json || restore_failed=1; fi
+        if (( had_client )); then command mv -f -- "$apply_dir/client.old" /etc/s-box/clmi.yaml || restore_failed=1; else rm -f /etc/s-box/clmi.yaml || restore_failed=1; fi
+        if (( restore_failed )); then
+            printf '客户端WARP回退失败，备份保留在 %s，请勿删除。\n' "$apply_dir" >&2
+            exit 1
+        fi
+    fi
+    rm -rf -- "$apply_dir"
+    exit "$status"
+}
+trap client_warp_cleanup EXIT
+trap 'exit 1' HUP INT TERM
+client_warp_validate "$candidate" > "$apply_dir/state.json" || exit 1
+client_warp_config_file=$apply_dir/state.json
+result_vl_vm_hy_tu client-only || exit 1
+sb_client "$apply_dir" || exit 1
+if [[ -e /etc/s-box/client_warp.json ]]; then
+    cp -p /etc/s-box/client_warp.json "$apply_dir/state.old" || exit 1
+    had_state=1
+fi
+if [[ -e /etc/s-box/clmi.yaml ]]; then
+    cp -p /etc/s-box/clmi.yaml "$apply_dir/client.old" || exit 1
+    had_client=1
+fi
+chmod 600 "$apply_dir/state.json" || exit 1
+committing=1
+mv -f -- "$apply_dir/state.json" /etc/s-box/client_warp.json || exit 1
+mv -f -- "$apply_dir/clmi.yaml" /etc/s-box/clmi.yaml || exit 1
+committing=0
+)
+}
+
+client_warp_egress_status(){
+local family source trace detected local_ip rules
+rules=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r '
+    [.route.rules[]? | select((.outbound // "") | test("warp|wireguard|socks")) |
+      ((.domain_suffix // []) + (.geosite // []))[] | select(. != "yg_kkk")] | length' 2>/dev/null)
+if [[ $rules =~ ^[0-9]+$ && $rules != 0 ]]; then
+    yellow "服务端仍有WARP/SOCKS域名分流：前置不会改变它，原生出口需在菜单5清理对应规则。"
+elif [[ ! $rules =~ ^[0-9]+$ ]]; then
+    yellow "无法读取服务端分流规则，原生出口状态未知。"
+fi
+for family in 4 6; do
+    source=$(sed 's://.*::g' /etc/s-box/sb.json | jq -r --arg key "inet${family}_bind_address" \
+        '.outbounds[]? | select(.tag == "direct" and .type == "direct" and (.detour // "") == "") | .[$key] // ""' 2>/dev/null)
+    local -a bind=()
+    [[ -z $source ]] || bind=(--interface "$source")
+    trace=$(curl -q -"$family" --noproxy '*' -fsS --connect-timeout 2 --max-time 4 \
+        "${bind[@]}" -w '\nlocal_ip=%{local_ip}\n' https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null) || trace=
+    detected=$(printf '%s\n' "$trace" | sed -n 's/^warp=//p' | tr -d '\r')
+    local_ip=$(printf '%s\n' "$trace" | sed -n 's/^local_ip=//p' | tr -d '\r')
+    if [[ -n $source && $local_ip != "$source" ]]; then detected=; fi
+    case "$detected" in
+    on|plus) yellow "IPv${family}：检测到WARP出口；如需原生出口，请通过菜单13取消系统全局接管。" ;;
+    off) green "IPv${family}：本次直连探测未经过WARP（仍需验证实际代理出口）。" ;;
+    *) yellow "IPv${family}：出口探测未成功，状态未知。" ;;
+    esac
+done
+}
+
+client_warp_menu(){
+(
+local choice action import_file endpoint port candidate current
+local client_warp_json client_warp_node client_warp_dialer
+candidate=$(mktemp /etc/s-box/.client-warp-menu.XXXXXX) || exit 1
+chmod 600 "$candidate" || exit 1
+trap 'rm -f -- "$candidate"' EXIT
+trap 'exit 1' HUP INT TERM
+while true; do
+    if client_warp_read; then
+        current=$(jq -r 'if .enabled then "开启" else "关闭" end' <<< "$client_warp_json")
+    else
+        current=参数损坏或缺失
+    fi
+    green "客户端 WARP 前置（单客户端 / Clash-Mihomo）：$current"
+    yellow "只作用于clmi.yaml完整订阅；二维码、jhsub.txt、sbox.json不含前置。"
+    readp "1：启用WARP前置\n2：关闭WARP前置\n3：重新申请 / 导入WARP参数\n4：修改WARP入口IP或域名及端口\n0：返回\n请选择【0-4】：" choice || exit 1
+    case "$choice" in
+    0) exit 0 ;;
+    1)
+        if [[ -s /etc/s-box/client_warp.json ]] && ! jq -e '.enabled == false and .private_key == null' /etc/s-box/client_warp.json >/dev/null 2>&1; then
+            jq '.enabled=true' /etc/s-box/client_warp.json > "$candidate" || continue
+        else
+            yellow "申请客户端专用WARP参数，单次请求限时15秒……"
+            client_warp_register "$candidate" || { red "注册失败，未启用；可选择3导入有效参数。"; continue; }
+        fi ;;
+    2)
+        if ! jq '.enabled=false' /etc/s-box/client_warp.json > "$candidate" 2>/dev/null; then
+            printf '%s\n' '{"enabled":false}' > "$candidate"
+        fi ;;
+    3)
+        readp "1：重新申请独立参数\n2：导入client_warp.json文件\n请选择【1-2】：" action || exit 1
+        case "$action" in
+        1) client_warp_register "$candidate" || { red "注册失败，已保留旧配置。"; continue; } ;;
+        2)
+            readp "请输入参数JSON文件的绝对路径：" import_file || exit 1
+            [[ $import_file == /* && -f $import_file ]] || { red "文件不存在或不是绝对路径。"; continue; }
+            jq '.enabled=true' "$import_file" > "$candidate" || continue ;;
+        *) continue ;;
+        esac ;;
+    4)
+        [[ -s /etc/s-box/client_warp.json ]] || { red "请先申请或导入参数。"; continue; }
+        readp "WARP入口IP或域名（不含端口）：" endpoint || exit 1
+        readp "WARP入口端口：" port || exit 1
+        [[ $port =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || { red "端口无效。"; continue; }
+        jq --arg server "$endpoint" --argjson port "$port" '.server=$server | .port=$port | .enabled=true' \
+            /etc/s-box/client_warp.json > "$candidate" || continue ;;
+    *) red "输入无效，请选择0到4。"; continue ;;
+    esac
+    if client_warp_apply "$candidate"; then
+        green "本地Mihomo配置已更新。请刷新并重载clmi.yaml订阅，关闭旧连接后验证。"
+        yellow "已配置的本地HTTP/HTTPS订阅随文件更新生效；二维码和聚合链接不含前置。"
+        if [[ -d /etc/s-box/.git ]]; then
+            yellow "GitLab远端尚未同步；现有9→2仅在未启用HTTPS域名订阅时执行GitLab推送。"
+        fi
+        if [[ $(jq -r '.enabled' "$candidate") == true ]]; then
+            yellow "客户端WARP连通性尚未验证；检查服务端出口（最多8秒）……"
+            client_warp_egress_status
+        fi
+    else
+        red "配置生成或保存失败，已保留旧状态及订阅。"
+    fi
+done
+)
+}
+
 sb_client(){
 (
 local publish_dir sb_all sb_any1 sb_any2 cl_all cl_any1 cl_any2 sb_hy2ports vm_listen_port extra_data extra_piece
+local client_destination=${1:-/etc/s-box}
+local client_warp_json client_warp_dialer client_warp_node
+client_warp_read || exit 1
 publish_dir=$(mktemp -d /etc/s-box/.client.XXXXXX) || exit 1
 trap 'rm -rf -- "$publish_dir"' EXIT
 trap 'exit 1' HUP INT TERM
@@ -1809,6 +2080,7 @@ clany2(){
   if [[ "$sbnh" != "1.10" ]]; then
     cat <<EOF
 - name: anytls-$hostname
+$client_warp_dialer
   type: anytls
   server: $cl_an_ip
   port: $an_port
@@ -2108,7 +2380,9 @@ dns:
     - "https://doh.pub/dns-query"
 
 proxies:
+$client_warp_node
 - name: vless-reality-vision-$hostname               
+$client_warp_dialer
   type: vless
   server: $server_ipcl                           
   port: $vl_port                                
@@ -2124,6 +2398,7 @@ proxies:
   client-fingerprint: chrome                  
 
 - name: vmess-ws-$hostname                         
+$client_warp_dialer
   type: vmess
   server: $vmadd_local                        
   port: $vm_port                                     
@@ -2140,6 +2415,7 @@ proxies:
       Host: $vm_name                     
 
 - name: hysteria2-$hostname                            
+$client_warp_dialer
   type: hysteria2                                      
   server: $cl_hy2_ip                               
   port: $hy2_port
@@ -2152,6 +2428,7 @@ proxies:
   fast-open: true
 
 - name: tuic5-$hostname                            
+$client_warp_dialer
   server: $cl_tu5_ip                      
   port: $tu5_port                                    
   type: tuic
@@ -2184,7 +2461,8 @@ extra_piece=$(printf '%s' "$extra_data" | jq -cr '.singbox[] | tojson + ","') ||
 sb_any2+=$'\n'"$extra_piece"
 extra_piece=$(printf '%s' "$extra_data" | jq -r '.mihomo[] | "    - " + (.name|tojson)') || exit 1
 cl_any1+=$'\n'"$extra_piece"
-extra_piece=$(printf '%s' "$extra_data" | jq -cr '.mihomo[] | "- " + tojson') || exit 1
+extra_piece=$(printf '%s' "$extra_data" | jq -cr --arg dialer "$client_warp_dialer" \
+    '.mihomo[] | if $dialer != "" then . + {"dialer-proxy":"WARP-前置"} else . end | "- " + tojson') || exit 1
 cl_any2+=$'\n'"$extra_piece"
 fi
 if ps -ef 2>/dev/null | grep -q '[c]loudflared.*run' && ps -ef 2>/dev/null | grep "[l]ocalhost:$vm_listen_port" >/dev/null 2>&1 && [ "$tls" = "false" ]; then
@@ -2345,6 +2623,7 @@ $cl_all
 $cl_any2
 
 - name: vmess-tls-argo固定-$hostname                         
+$client_warp_dialer
   type: vmess
   server: $vmadd_argo                        
   port: 443                                     
@@ -2362,6 +2641,7 @@ $cl_any2
 
 
 - name: vmess-argo固定-$hostname                         
+$client_warp_dialer
   type: vmess
   server: $vmadd_argo                        
   port: 8880                                     
@@ -2378,6 +2658,7 @@ $cl_any2
       Host: $argogd
 
 - name: vmess-tls-argo临时-$hostname                         
+$client_warp_dialer
   type: vmess
   server: $vmadd_argo                        
   port: 443                                     
@@ -2394,6 +2675,7 @@ $cl_any2
       Host: $argo
 
 - name: vmess-argo临时-$hostname                         
+$client_warp_dialer
   type: vmess
   server: $vmadd_argo                        
   port: 8880                                     
@@ -2573,6 +2855,7 @@ $cl_all
 $cl_any2
 
 - name: vmess-tls-argo临时-$hostname                         
+$client_warp_dialer
   type: vmess
   server: $vmadd_argo                        
   port: 443                                     
@@ -2589,6 +2872,7 @@ $cl_any2
       Host: $argo
 
 - name: vmess-argo临时-$hostname                         
+$client_warp_dialer
   type: vmess
   server: $vmadd_argo                        
   port: 8880                                     
@@ -2760,6 +3044,7 @@ $cl_all
 $cl_any2
 
 - name: vmess-tls-argo固定-$hostname                         
+$client_warp_dialer
   type: vmess
   server: $vmadd_argo                        
   port: 443                                     
@@ -2776,6 +3061,7 @@ $cl_any2
       Host: $argogd
 
 - name: vmess-argo固定-$hostname                         
+$client_warp_dialer
   type: vmess
   server: $vmadd_argo                        
   port: 8880                                     
@@ -2931,8 +3217,8 @@ fi
 [ -s "$publish_dir/sbox.json" ] && [ -s "$publish_dir/clmi.yaml" ] || exit 1
 jq -e . "$publish_dir/sbox.json" >/dev/null || exit 1
 chmod 644 "$publish_dir/sbox.json" "$publish_dir/clmi.yaml" || exit 1
-mv -f -- "$publish_dir/sbox.json" /etc/s-box/sbox.json || exit 1
-mv -f -- "$publish_dir/clmi.yaml" /etc/s-box/clmi.yaml || exit 1
+mv -f -- "$publish_dir/sbox.json" "$client_destination/sbox.json" || exit 1
+mv -f -- "$publish_dir/clmi.yaml" "$client_destination/clmi.yaml" || exit 1
 )
 }
 
@@ -3127,7 +3413,7 @@ green "五、自动生成warp-wireguard出站账户" && sleep 2
 warpwg
 inssbjsonser || return 1
 extra_install || return 1
-sbservice || return 1
+sbservice checked || return 1
 sbactive
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 lnsb || return 1
@@ -3562,7 +3848,7 @@ jq -e -j -n --rawfile source "$1" --arg series "$3" --arg strategy "$4" '
 }
 
 ip_priority_restart(){
-restartsb || return 1
+restartsb "$@" || return 1
 # Type=simple can acknowledge restart before the process fails during startup.
 sleep 1
 if command -v apk >/dev/null 2>&1; then
@@ -3620,15 +3906,14 @@ restore=1
 for file in sb10.json sb11.json sb.json; do
 mv -f -- "$work/$file" "/etc/s-box/$file" || exit 1
 done
-ip_priority_restart || exit 1
+ip_priority_restart checked || exit 1
 restore=0
 )
 }
 
 egress_config_patch(){
 local ipv4=$3 ipv6=$4
-[[ -z $ipv4 ]] || ip_literal_valid 4 "$ipv4" || return 1
-[[ -z $ipv6 ]] || ip_literal_valid 6 "$ipv6" || return 1
+# egress_apply has validated both addresses before editing the three configs.
 # Edit flat native dialers in place: port/certificate menus depend on line numbers.
 # Parsing the result against the structural edit makes unsupported layouts fail closed.
 jq -e -j -n --rawfile source "$1" --arg ipv4 "$ipv4" --arg ipv6 "$ipv6" '
@@ -3661,16 +3946,16 @@ jq -e -j -n --rawfile source "$1" --arg ipv4 "$ipv4" --arg ipv6 "$ipv6" '
 
 egress_apply(){
 (
-local family=$1 source=$2 egress_ipv4 egress_ipv6 work file result url verified=0 restore=0 had_state=0 failed=0
+local family=$1 source=$2 egress_ipv4 egress_ipv6 work file url verified=0 restore=0 had_state=0 failed=0
 local -a check_args
 [[ $family == 4 || $family == 6 ]] || { red "无效的地址族"; exit 1; }
 egress_read || { red "出站源地址设置无效，已保留原配置"; exit 1; }
 if [[ -n $source ]]; then
-ip_literal_valid "$family" "$source" && egress_candidate_usable "$family" "$source" || {
+egress_candidate_usable "$family" "$source" || {
 red "所选地址已不存在或尚不可用，已保留原配置"; exit 1;
 }
 for url in https://icanhazip.com https://api64.ipify.org; do
-if result=$(egress_probe "$family" "$source" "$url") && jq -e '.status == "ok"' <<< "$result" >/dev/null; then
+if egress_probe "$family" "$source" "$url" >/dev/null; then
 verified=1; break
 fi
 done
@@ -3723,7 +4008,7 @@ restore=1
 for file in sb10.json sb11.json sb.json egress.json; do
 mv -f -- "$work/$file" "/etc/s-box/$file" || exit 1
 done
-ip_priority_restart || exit 1
+ip_priority_restart checked || exit 1
 restore=0
 )
 }
@@ -3961,6 +4246,10 @@ fi
 
 sub_migrate_tg(){
 [[ -f /etc/s-box/sbtg.sh ]] || return 0
+if ! grep -Eq '^m(9|10)=\$\(cat |^if \[\[ -f /etc/s-box/(sing_box|clash_meta)_gitlab\.txt \]\]; then$' /etc/s-box/sbtg.sh; then
+bash -n /etc/s-box/sbtg.sh || { red "TG通知脚本语法检查失败，未执行"; return 1; }
+return 0
+fi
 local tg_tmp
 tg_tmp=$(mktemp /etc/s-box/.sbtg.XXXXXX) || return 1
 if ! sed \
@@ -3999,7 +4288,7 @@ changeserv(){
 sbactive
 echo
 green "Sing-box配置变更选择如下:"
-readp "1：更换Reality域名伪装地址、切换自签证书与Acme域名证书、开关TLS\n2：更换原有协议UUID(密码)、Vmess-Path路径\n3：设置Argo临时隧道、固定隧道\n4：IP出站设置（地址族优先级/源地址）\n5：设置Telegram推送节点通知\n6：更换Warp-wireguard出站账户\n7：设置Gitlab订阅分享链接\n8：管理订阅分享链接（本地IP/自定义域名HTTPS）\n9：设置所有Vmess节点的CDN优选地址\n10：设置自定义域名分发（HTTPS订阅）\n11：管理Trojan / Snell（启停、端口、密码、证书）\n0：返回上层\n请选择【0-11】：" menu
+readp "1：更换Reality域名伪装地址、切换自签证书与Acme域名证书、开关TLS\n2：更换原有协议UUID(密码)、Vmess-Path路径\n3：设置Argo临时隧道、固定隧道\n4：IP出站设置（地址族优先级/源地址）\n5：设置Telegram推送节点通知\n6：更换Warp-wireguard出站账户\n7：设置Gitlab订阅分享链接\n8：管理订阅分享链接（本地IP/自定义域名HTTPS）\n9：设置所有Vmess节点的CDN优选地址\n10：设置自定义域名分发（HTTPS订阅）\n11：管理Trojan / Snell（启停、端口、密码、证书）\n12：客户端WARP前置（Clash/Mihomo）\n0：返回上层\n请选择【0-12】：" menu
 if [ "$menu" = "1" ];then
 changeym
 elif [ "$menu" = "2" ];then
@@ -4022,6 +4311,8 @@ elif [ "$menu" = "10" ];then
 ipsub 5
 elif [ "$menu" = "11" ];then
 extra_menu
+elif [ "$menu" = "12" ];then
+client_warp_menu
 else 
 sing_box
 fi
@@ -5069,14 +5360,16 @@ fi
 }
 
 restartsb(){
+# Only transaction callers that checked the candidate may pass "checked".
+if [[ ${1:-} != checked ]]; then
 local check_args=(-c /etc/s-box/sb.json)
 [[ ! -f /etc/s-box/sb_extra.json ]] || check_args+=(-c /etc/s-box/sb_extra.json)
 /etc/s-box/sing-box check "${check_args[@]}" || return 1
+fi
 if command -v apk >/dev/null 2>&1; then
 rc-service sing-box restart
 else
 systemctl enable sing-box
-systemctl start sing-box
 systemctl restart sing-box
 fi
 }
@@ -5222,7 +5515,7 @@ exit 1
 fi
 cp -p /etc/s-box/sing-box "$work/old-core" && cp -p /etc/s-box/sb.json "$work/old-config" || exit 1
 restore=1
-if mv -f -- "$candidate" /etc/s-box/sing-box && cp "$template" /etc/s-box/sb.json && restartsb; then
+if mv -f -- "$candidate" /etc/s-box/sing-box && cp "$template" /etc/s-box/sb.json && restartsb checked; then
 restore=0
 sbnh=$series
 if ! sbshare > /dev/null 2>&1; then
@@ -5356,8 +5649,8 @@ echo
 clash_sb_share(){
 sbactive
 echo
-yellow "1：刷新并查看各协议分享链接、二维码、聚合节点"
-yellow "2：刷新并查看Mihomo、Sing-box客户端SFA/SFI/SFW三合一配置及订阅链接"
+yellow "1：刷新并查看各协议分享链接、二维码、聚合节点（不含客户端WARP前置）"
+yellow "2：刷新并查看Mihomo、Sing-box完整配置及订阅链接（WARP前置仅在clmi.yaml中）"
 yellow "3：推送最新节点配置信息(选项1+选项2)到Telegram通知"
 yellow "0：返回上层"
 readp "请选择【0-3】：" menu
@@ -5407,7 +5700,7 @@ acme(){
 bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/acme-yg/main/acme.sh)
 }
 cfwarp(){
-bash <(curl -Ls https://raw.githubusercontent.com/yonggekkk/warp-yg/main/CFwarp.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/Linmiao010/warp/main/CFwarp.sh)
 }
 bbr(){
 if [[ $vi =~ lxc|openvz ]]; then

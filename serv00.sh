@@ -83,7 +83,7 @@ yellow "删除端口 $port ($port_type)"
 devil port del "$port_type" "$port"
 done <<< "$portlist"
 fi
-check_port
+check_port || return 1
 if [[ -e $WORKDIR/config.json ]]; then
 hyp=$(jq -r '.inbounds[0].listen_port' $WORKDIR/config.json)
 vlp=$(jq -r '.inbounds[3].listen_port' $WORKDIR/config.json)
@@ -113,82 +113,55 @@ cd
 fi
 }
 
-check_port () {
-port_list=$(devil port list)
-tcp_ports=$(echo "$port_list" | grep -c "tcp")
-udp_ports=$(echo "$port_list" | grep -c "udp")
-if [[ $tcp_ports -ne 2 || $udp_ports -ne 1 ]]; then
-    red "端口数量不符合要求，正在调整..."
-
-    if [[ $tcp_ports -gt 2 ]]; then
-        tcp_to_delete=$((tcp_ports - 2))
-        echo "$port_list" | awk '/tcp/ {print $1, $2}' | head -n $tcp_to_delete | while read port type; do
-            devil port del $type $port
-            green "已删除TCP端口: $port"
-        done
+check_port() {
+local port_list type desired current port result attempt added changed=0
+port_list=$(devil port list) || { red "无法读取端口列表，停止调整" >&2; return 1; }
+for type in tcp udp; do
+    desired=2
+    [[ "$type" == udp ]] && desired=1
+    current=$(echo "$port_list" | awk -v type="$type" '$2 == type {n++} END {print n+0}')
+    if (( current > desired )); then
+        while read -r port; do
+            devil port del "$type" "$port" || { red "删除端口失败，停止调整" >&2; return 1; }
+            changed=1
+        done < <(echo "$port_list" | awk -v type="$type" '$2 == type {print $1}' | head -n "$((current - desired))")
+        current=$desired
     fi
-    if [[ $udp_ports -gt 1 ]]; then
-        udp_to_delete=$((udp_ports - 1))
-        echo "$port_list" | awk '/udp/ {print $1, $2}' | head -n $udp_to_delete | while read port type; do
-            devil port del $type $port
-            green "已删除UDP端口: $port"
-        done
-    fi
-    if [[ $tcp_ports -lt 2 ]]; then
-        tcp_ports_to_add=$((2 - tcp_ports))
-        tcp_ports_added=0
-        while [[ $tcp_ports_added -lt $tcp_ports_to_add ]]; do
-            tcp_port=$(shuf -i 10000-65535 -n 1) 
-            result=$(devil port add tcp $tcp_port 2>&1)
-            if [[ $result == *"succesfully"* ]]; then
-                green "已添加TCP端口: $tcp_port"
-                if [[ $tcp_ports_added -eq 0 ]]; then
-                    tcp_port1=$tcp_port
-                else
-                    tcp_port2=$tcp_port
-                fi
-                tcp_ports_added=$((tcp_ports_added + 1))
-            else
-                yellow "端口 $tcp_port 不可用，尝试其他端口..."
-            fi
-        done
-    fi
-    if [[ $udp_ports -lt 1 ]]; then
-        while true; do
-            udp_port=$(shuf -i 10000-65535 -n 1) 
-            result=$(devil port add udp $udp_port 2>&1)
-            if [[ $result == *"succesfully"* ]]; then
-                green "已添加UDP端口: $udp_port"
+    while (( current < desired )); do
+        added=0
+        for attempt in {1..5}; do
+            port=$(shuf -i 10000-65535 -n 1) || return 1
+            if result=$(devil port add "$type" "$port" 2>&1); then
+                green "已添加${type}端口: $port"
+                added=1
+                changed=1
                 break
-            else
-                yellow "端口 $udp_port 不可用，尝试其他端口..."
             fi
+            case "${result,,}" in
+                *port*already\ in\ use*|*port*already\ used*|*port*already\ exists*|*address\ already\ in\ use*)
+                    yellow "端口 $port 已被占用，尝试其他端口 ($attempt/5)" ;;
+                *) red "添加${type}端口失败，停止调整: $result" >&2; return 1 ;;
+            esac
         done
-    fi
-    #green "端口已调整完成,将断开ssh连接,请重新连接shh重新执行脚本"
-    #devil binexec on >/dev/null 2>&1
-    #kill -9 $(ps -o ppid= -p $$) >/dev/null 2>&1
+        if [[ "$added" != 1 ]]; then
+            red "随机端口连续冲突，停止调整，请稍后重试" >&2
+            return 1
+        fi
+        current=$((current + 1))
+    done
+done
+if (( changed )); then
     sleep 3
-    port_list=$(devil port list)
-    tcp_ports=$(echo "$port_list" | grep -c "tcp")
-    udp_ports=$(echo "$port_list" | grep -c "udp")
-    tcp_ports=$(echo "$port_list" | awk '/tcp/ {print $1}')
-    tcp_port1=$(echo "$tcp_ports" | sed -n '1p')
-    tcp_port2=$(echo "$tcp_ports" | sed -n '2p')
-    udp_port=$(echo "$port_list" | awk '/udp/ {print $1}')
-    purple "当前TCP端口: $tcp_port1 和 $tcp_port2"
-    purple "当前UDP端口: $udp_port"
-else
-    tcp_ports=$(echo "$port_list" | awk '/tcp/ {print $1}')
-    tcp_port1=$(echo "$tcp_ports" | sed -n '1p')
-    tcp_port2=$(echo "$tcp_ports" | sed -n '2p')
-    udp_port=$(echo "$port_list" | awk '/udp/ {print $1}')
-    purple "当前TCP端口: $tcp_port1 和 $tcp_port2"
-    purple "当前UDP端口: $udp_port"
+    port_list=$(devil port list) || { red "无法确认调整后的端口，停止" >&2; return 1; }
+    if [[ $(echo "$port_list" | awk '$2 == "tcp" {n++} END {print n+0}') != 2 ||
+          $(echo "$port_list" | awk '$2 == "udp" {n++} END {print n+0}') != 1 ]]; then
+        red "调整后的端口数量不符合要求，停止" >&2
+        return 1
+    fi
 fi
-export vless_port=$tcp_port1
-export vmess_port=$tcp_port2
-export hy2_port=$udp_port
+export vless_port=$(echo "$port_list" | awk '$2 == "tcp" {print $1; exit}')
+export vmess_port=$(echo "$port_list" | awk '$2 == "tcp" && ++n == 2 {print $1; exit}')
+export hy2_port=$(echo "$port_list" | awk '$2 == "udp" {print $1; exit}')
 green "你的vless-reality端口: $vless_port"
 green "你的vmess-ws端口(设置Argo固定域名端口): $vmess_port"
 green "你的hysteria2端口: $hy2_port"
@@ -207,12 +180,12 @@ sleep 2
 	echo
 	read_uuid
         echo
-        check_port
+        check_port || return 1
 	echo
         sleep 2
         argo_configure
 	echo
-        download_and_run_singbox
+        download_and_run_singbox || return 1
 	cd
         fastrun
 	green "创建快捷方式：sb"
@@ -317,23 +290,18 @@ generate_random_name() {
 download_with_fallback() {
     local URL=$1
     local NEW_FILENAME=$2
+    local temporary="${NEW_FILENAME}.part"
 
-    curl -L -sS --max-time 2 -o "$NEW_FILENAME" "$URL" &
-    CURL_PID=$!
-    CURL_START_SIZE=$(stat -c%s "$NEW_FILENAME" 2>/dev/null || echo 0)
-    
-    sleep 1
-    CURL_CURRENT_SIZE=$(stat -c%s "$NEW_FILENAME" 2>/dev/null || echo 0)
-    
-    if [ "$CURL_CURRENT_SIZE" -le "$CURL_START_SIZE" ]; then
-        kill $CURL_PID 2>/dev/null
-        wait $CURL_PID 2>/dev/null
-        wget -q -O "$NEW_FILENAME" "$URL"
+    if curl --fail -L -sS --connect-timeout 10 --max-time 120 -o "$temporary" "$URL"; then
+        echo -e "\e[1;32mDownloading $NEW_FILENAME by curl\e[0m"
+    elif timeout -k 5 120 wget -q --timeout=30 --tries=1 -O "$temporary" "$URL"; then
         echo -e "\e[1;32mDownloading $NEW_FILENAME by wget\e[0m"
     else
-        wait $CURL_PID
-        echo -e "\e[1;32mDownloading $NEW_FILENAME by curl\e[0m"
+        rm -f "$temporary"
+        red "下载失败，停止安装: $NEW_FILENAME" >&2
+        return 1
     fi
+    mv -f "$temporary" "$NEW_FILENAME" || { rm -f "$temporary"; return 1; }
 }
 
 for entry in "${FILE_INFO[@]}"; do
@@ -344,13 +312,12 @@ for entry in "${FILE_INFO[@]}"; do
     if [ -e "$NEW_FILENAME" ]; then
         echo -e "\e[1;32m$NEW_FILENAME already exists, Skipping download\e[0m"
     else
-        download_with_fallback "$URL" "$NEW_FILENAME"
+        download_with_fallback "$URL" "$NEW_FILENAME" || return 1
     fi
     
     chmod +x "$NEW_FILENAME"
     FILE_MAP[$(echo "$entry" | cut -d ' ' -f 2)]="$NEW_FILENAME"
 done
-wait
 fi
 
 if [ ! -e private_key.txt ]; then
@@ -527,7 +494,6 @@ EOF
 fi
 
 if ! ps aux | grep '[r]un -c con' > /dev/null; then
-ps aux | grep '[r]un -c con' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
 if [ -e "$(basename "${FILE_MAP[web]}")" ]; then
    echo "$(basename "${FILE_MAP[web]}")" > sb.txt
    sbb=$(cat sb.txt)   
@@ -606,21 +572,23 @@ fi
 fi
 }
 
-if [ -f "$WORKDIR/boot.log" ]; then
-argosl=$(cat "$WORKDIR/boot.log" 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
-checkhttp=$(curl -o /dev/null -s -w "%{http_code}\n" "https://$argosl")
+if [[ -z "$ARGO_DOMAIN" ]]; then
+    checkhttp=""
+    if [ -f "$WORKDIR/boot.log" ]; then
+        argosl=$(cat "$WORKDIR/boot.log" 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
+        checkhttp=$(curl --connect-timeout 5 --max-time 10 -o /dev/null -s -w "%{http_code}\n" "https://$argosl")
+    fi
+    if ! ps aux | grep '[t]unnel --u' > /dev/null || [[ "$checkhttp" != 404 ]]; then
+        ps aux | grep '[t]unnel --u' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
+        cfgo
+    else
+        green "Argo进程已启动"
+    fi
+elif ! ps aux | grep '[t]unnel --n' > /dev/null; then
+    ps aux | grep '[t]unnel --n' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
+    cfgo
 else
-argogd=$(cat $WORKDIR/ARGO_DOMAIN.log 2>/dev/null)
-checkhttp=$(curl --max-time 2 -o /dev/null -s -w "%{http_code}\n" "https://$argogd")
-fi
-if ([ -z "$ARGO_DOMAIN" ] && ! ps aux | grep '[t]unnel --u' > /dev/null) || [ "$checkhttp" -ne 404 ]; then
-ps aux | grep '[t]unnel --u' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
-cfgo
-elif ([ -n "$ARGO_DOMAIN" ] && ! ps aux | grep '[t]unnel --n' > /dev/null) || [ "$checkhttp" -ne 404 ]; then
-ps aux | grep '[t]unnel --n' | awk '{print $2}' | xargs -r kill -9 > /dev/null 2>&1
-cfgo
-else
-green "Arog进程已启动"
+    green "Argo进程已启动"
 fi
 sleep 2
 if ! pgrep -x "$(cat sb.txt)" > /dev/null; then
@@ -1502,8 +1470,8 @@ UUID=$(<$WORKDIR/UUID.txt)
 reym=$(<$WORKDIR/reym.txt)
 ARGO_DOMAIN=$(cat "$WORKDIR/ARGO_DOMAIN.log" 2>/dev/null)
 ARGO_AUTH=$(cat "$WORKDIR/ARGO_AUTH.log" 2>/dev/null)
-check_port >/dev/null 2>&1
-download_and_run_singbox >/dev/null 2>&1
+check_port >/dev/null || return 1
+download_and_run_singbox >/dev/null || return 1
 get_links
 }
 
