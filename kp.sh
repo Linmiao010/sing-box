@@ -22,6 +22,7 @@ if [[ -n ${operation:-} ]]; then
     bundle=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
     payload=$(mktemp -d) || exit 1
     trap 'rm -f "$payload/input.json" "$payload/bundle.tar"; rmdir "$payload"' EXIT
+    trap 'exit 1' HUP INT TERM
     # operation is selected exclusively by the case above. Credentials travel on stdin.
     provision='
         umask 077
@@ -31,6 +32,7 @@ if [[ -n ${operation:-} ]]; then
             rmdir "$d"
         }
         trap cleanup EXIT
+        trap "exit 1" HUP INT TERM
         tar -xf - -C "$d" && bash "$d/serv00.sh" "$1" --account-file "$d/input.json"
     '
     remote="sh -c '$provision' sh $operation"
@@ -52,7 +54,9 @@ while IFS= read -r account; do
     fi
     input=/dev/null
     if [[ -n ${operation:-} ]]; then
-        jq '{SUUID, REALITY, IP, TCP1_PORT, TCP2_PORT, UDP_PORT, ARGO_DOMAIN, ARGO_AUTH}' <<< "$account" > "$payload/input.json"
+        jq '{SUUID, REALITY, IP, TCP1_PORT, TCP2_PORT, UDP_PORT, ARGO_DOMAIN, ARGO_AUTH,
+            SERV00_ARGO_PORT, SERV00_LOOPBACK_PORT_CONFIRMED, SERV00_FIXED_ORIGIN_CONFIRMED,
+            SERV00_CLIENT_RULES_REVISION}' <<< "$account" > "$payload/input.json"
         tar -cf "$payload/bundle.tar" -C "$bundle" serv00.sh serv00keep.sh serv00_runtime.py app.js -C "$payload" input.json
         input=$payload/bundle.tar
     fi

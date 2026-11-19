@@ -18,10 +18,11 @@ class SubscriptionRollbackTests(ShellTestCase):
                             ("/etc/systemd/system", "systemd")):
             funcs = funcs.replace(path, local)
         # The identity/permissions of the publishing group are tested separately.
-        funcs = funcs.replace(" -g sboxsub ", " ").replace('chgrp sboxsub "$snapshot" && ', "")
+        funcs = funcs.replace(' -g "$group" ', " ").replace('chgrp "$group" "$snapshot" && ', "")
         script = funcs + f"\nfault={shlex.quote(fault)}\nlegacy_case={int(legacy)}\n" + r'''
 set -u
-mkdir -p box pub/www caddy systemd init.d local.d oldweb
+key=$(sub_https_key same-token) || exit 2
+mkdir -p box pub/www pub-https/www caddy systemd init.d local.d oldweb
 red(){ printf '%s\n' "$*" >&2; }
 sub_prepare_reader(){ :; }
 sub_caddy_prepare(){ echo managed; }
@@ -61,15 +62,17 @@ sub_restore_legacy_httpd(){
     touch old-running
 }
 sub_https_ready(){
-    [[ $(cat "pub/www/$2/sbox.json") == next ]] || return 1
-    if (( ! legacy_case )); then [[ $(cat "pub/www/$saved/sbox.json") == initial ]] || return 1; fi
+    [[ $(cat "pub-https/www/$key/sbox.json") == next ]] || return 1
+    if (( ! legacy_case )); then [[ $(cat "pub-https/www/$saved/sbox.json") == initial ]] || return 1; fi
     case $fault in
         fail|openrc-failure) return 1 ;;
         HUP|TERM) kill "-$fault" "$BASHPID" ;;
     esac
     return 0
 }
-sbshare(){ :; }
+sbshare(){
+    for item in sbox.json clmi.yaml jhsub.txt; do echo next > "box/$item"; done
+}
 for item in sbox.json clmi.yaml jhsub.txt; do echo initial > "box/$item"; done
 echo 18080 > box/subport.log
 echo original-launcher > box/sub-httpd.sh
@@ -82,29 +85,32 @@ else
     echo same-token > box/subtoken.log
     echo old.example.test > box/subdomain.log
     echo 18080 > new-running
-    sub_links same-token || exit 20
-    saved=$(readlink pub/www/same-token) || exit 21
+    sub_root=pub-https sub_links "$key" || exit 20
+    saved=$(readlink pub-https/www/$key) || exit 21
 fi
-for item in sbox.json clmi.yaml jhsub.txt; do echo next > "box/$item"; done
+if (( legacy_case )); then
+    for item in sbox.json clmi.yaml jhsub.txt; do echo next > "box/$item"; done
+fi
 if sub_apply_locked new.example.test same-token 18081; then status=0; else status=$?; fi
 if [[ $fault == ok ]]; then
-    [[ $status == 0 && $(cat pub/www/same-token/sbox.json) == next ]] || exit 31
-    [[ ! -d pub/www/$saved ]] || exit 32
+    [[ $status == 0 && $(cat pub-https/www/$key/sbox.json) == next ]] || exit 31
+    [[ ! -d pub-https/www/$saved ]] || exit 32
 else
     [[ $status != 0 && $(cat box/subport.log) == 18080 && $(cat box/sub-httpd.sh) == original-launcher ]] || exit 33
     [[ $(cat caddy/s-box-subscription.caddy) == prior ]] || exit 34
     [[ ! -e caddy-running && ! -e init.d/sbox-sub-caddy ]] || exit 38
     if (( legacy_case )); then
-        [[ -e old-running && ! -e new-running && -d oldweb/old-token && ! -L pub/www/same-token ]] || exit 35
+        [[ -e old-running && ! -e new-running && -d oldweb/old-token && ! -L pub-https/www/$key ]] || exit 35
     else
-        [[ $(readlink pub/www/same-token) == "$saved" && $(cat pub/www/same-token/sbox.json) == initial ]] || exit 36
+        for item in sbox.json clmi.yaml jhsub.txt; do [[ $(cat "box/$item") == initial ]] || exit 39; done
+        [[ $(readlink pub-https/www/$key) == "$saved" && $(cat pub-https/www/$key/sbox.json) == initial ]] || exit 36
         [[ $(cat new-running) == 18080 && $(cat box/subdomain.log) == old.example.test ]] || exit 37
     fi
 fi
 shopt -s nullglob
 backups=(box/.subscription.* pub/.restore.*)
 [[ ${#backups[@]} == 0 ]] || exit 40
-snapshots=(pub/release.*)
+snapshots=(pub-https/release.*)
 (( ${#snapshots[@]} == 1 - legacy_case ))
 '''
         self.run_shell(script, env=env)
@@ -123,6 +129,35 @@ snapshots=(pub/release.*)
 
     def test_openrc_can_stop_candidate_before_removing_its_init_script(self):
         self.scenario("openrc-failure")
+
+    def test_regular_https_refresh_switches_all_three_files_and_preserves_last_good_snapshot(self):
+        source = section("sub_valid_domain", "sub_apply")
+        source = source.replace("/etc/s-box", "box").replace("/var/lib/sbox-subscription", "pub")
+        source = source.replace(' -g "$group" ', " ").replace('chgrp "$group" "$snapshot" && ', "")
+        script = source + r'''
+mkdir -p box pub-https/www stage || exit 1
+token=fictional-subscription-token
+key=$(sub_https_key "$token") || exit 1
+echo "$token" > box/subtoken.log
+echo sub.example.test > box/subdomain.log
+names=(sbox.json clmi.yaml jhsub.txt)
+for name in "${names[@]}"; do echo first > "box/$name"; done
+sub_root=pub-https sub_links "$key" || exit 1
+for name in "${names[@]}"; do echo second > "stage/$name"; done
+sub_publish_current stage "${names[@]}" || exit 1
+saved=$(readlink "pub-https/www/$key") || exit 1
+for name in "${names[@]}"; do
+    [[ $(cat "pub-https/www/$key/$name") == second && $(cat "box/$name") == second ]] || exit 1
+    echo third > "stage/$name"
+done
+install(){ [[ ${!#} != */clmi.yaml ]] && command install "$@"; }
+if sub_publish_current stage "${names[@]}"; then exit 1; fi
+[[ $(readlink "pub-https/www/$key") == "$saved" ]] || exit 1
+for name in "${names[@]}"; do
+    [[ $(cat "pub-https/www/$key/$name") == second && $(cat "box/$name") == second ]] || exit 1
+done
+'''
+        self.run_shell(script, env={"MSYS": "winsymlinks:sys"} if os.name == "nt" else None)
 
     def test_legacy_backend_stopped_before_failed_commit_is_restarted(self):
         self.scenario("legacy-failure", legacy=True)

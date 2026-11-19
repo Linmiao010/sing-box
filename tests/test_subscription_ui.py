@@ -47,111 +47,77 @@ export -f timeout curl jq
     def functions(self, start, end):
         return section(start, end).replace("/etc/s-box", self.config.as_posix())
 
-    def legacy_telegram(self):
-        source = r'''#!/bin/bash
-# Keep the credentials and unrelated notifications unchanged.
-URL="https://api.telegram.org/botpreserved-bot-token/sendMessage"
-chat_id="preserved-chat-id"
-m1=$(cat /etc/s-box/vl_reality.txt 2>/dev/null)
-m9=$(cat /etc/s-box/sing_box_gitlab.txt 2>/dev/null)
-m10=$(cat /etc/s-box/clash_meta_gitlab.txt 2>/dev/null)
-timeout 20s curl -s -X POST "$URL" -d "chat_id=$chat_id" --data-urlencode "text=original:$m1"
-if [[ -f /etc/s-box/sing_box_gitlab.txt ]]; then
-timeout 20s curl -s -X POST "$URL" --data-urlencode "text=sing-box:$m9"
-fi
-if [[ -f /etc/s-box/clash_meta_gitlab.txt ]]; then
-timeout 20s curl -s -X POST "$URL" --data-urlencode "text=mihomo:$m10"
-fi
-'''
-        self.write("sbtg.sh", source.replace("/etc/s-box", self.config.as_posix()))
-
-    def run_notice(self, extra=""):
-        script = self.preamble + self.functions("tgsbshow", "changeserv") + extra + "\ntgnotice\n"
+    def notice(self, setup="", command="tgnotice"):
+        script = self.functions("tgsbshow", "changeserv") + self.preamble + r'''
+curl(){
+    printf '%s\n' "$@" >> ../curl.argv
+    cat >> ../payload
+    cat <&3 >> ../request.cfg
+    printf '{"ok":true}\n'
+}
+export -f curl
+''' + setup + "\n" + command
         return self.run_shell(script, check=False)
 
-    def requests(self):
-        return (self.root / "requests").read_text(encoding="utf-8")
-
-    def test_existing_telegram_script_migrates_and_prefers_domain_without_gitlab(self):
-        self.legacy_telegram()
-        result = self.run_notice()
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        requests = self.requests()
-        self.assertIn("https://sub.example.com/private_token/sbox.json", requests)
-        self.assertIn("https://sub.example.com/private_token/clmi.yaml", requests)
-        self.assertIn("original:vless://original-node", requests)
-        self.assertIn("botpreserved-bot-token/sendMessage", requests)
-        self.assertIn("chat_id=preserved-chat-id", requests)
-        migrated = (self.config / "sbtg.sh").read_text(encoding="utf-8")
-        self.assertIn("# Keep the credentials and unrelated notifications unchanged.", migrated)
-
-    def test_migrated_telegram_reads_current_domain_and_token_on_each_notice(self):
-        self.legacy_telegram()
-        self.write("sing_box_gitlab.txt", "https://gitlab.invalid/old-singbox\n")
-        self.write("clash_meta_gitlab.txt", "https://gitlab.invalid/old-mihomo\n")
-        self.run_notice()
-        (self.root / "requests").unlink()
-        self.write("subdomain.log", "next.example.com\n")
-        self.write("subtoken.log", "next_token\n")
-        # An already migrated script must not depend on another writable temp file.
-        result = self.run_notice("\nmktemp() { return 31; }\n")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("https://next.example.com/next_token/sbox.json", self.requests())
-        self.assertIn("https://next.example.com/next_token/clmi.yaml", self.requests())
-        self.assertNotIn("gitlab.invalid", self.requests())
-
-    def test_invalid_migrated_script_is_not_executed(self):
-        self.legacy_telegram()
-        self.run_notice()
-        (self.root / "requests").unlink()
-        with (self.config / "sbtg.sh").open("a", encoding="utf-8", newline="\n") as script:
-            script.write("if then\n")
-        original = (self.config / "sbtg.sh").read_bytes()
-        result = self.run_notice()
+    def test_untrusted_legacy_script_requires_reentry(self):
+        self.write("sbtg.sh", "touch executed\n")
+        result = self.notice()
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual((self.config / "sbtg.sh").read_bytes(), original)
-        self.assertFalse((self.root / "requests").exists())
+        self.assertFalse((self.root / "executed").exists())
+        self.assertFalse((self.root / "curl.argv").exists())
 
-    def test_new_telegram_template_uses_domain_and_keeps_node_notifications(self):
-        source = self.functions("tgsbshow", "changeserv")
-        inputs = r'''
-tgnotice() { :; }
-readp() {
-    case "$2" in
-        menu) menu=1 ;;
-        token) token=test-bot-token ;;
-        userid) userid=test-chat-id ;;
-    esac
-}
-tgsbshow
-'''
-        self.run_shell(self.preamble + source + inputs)
-        result = self.run_shell(self.preamble + "bash " + shlex.quote((self.config / "sbtg.sh").as_posix()))
-        requests = self.requests()
-        self.assertIn("https://sub.example.com/private_token/sbox.json", requests)
-        self.assertIn("https://sub.example.com/private_token/clmi.yaml", requests)
-        self.assertIn("vless://original-node", requests)
-        self.assertIn("hysteria2://original-node", requests)
-        self.assertIn("tuic://original-node", requests)
-        self.assertIn("vless://original-aggregate", requests)
-        self.assertIn("bottest-bot-token/sendMessage", requests)
-        self.assertIn("chat_id=test-chat-id", requests)
+    def test_new_telegram_plain_text_and_private_inputs(self):
+        for chat in ("12345", "-12345", "@valid_Name"):
+            with self.subTest(chat=chat):
+                self.write("vl_reality.txt", "vless://demo<example>\n")
+                result = self.notice("readp(){ menu=1; }",
+                                     "tgsbshow <<'INPUT'\n12345:fake_demo\n" + chat + "\nINPUT\n")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                cli = (self.root / "curl.argv").read_text()
+                for secret in ("fake_demo", chat, "private_token", "vless://", "<example>"):
+                    self.assertNotIn(secret, cli + result.stdout + result.stderr)
+                self.assertNotIn("parse_mode", cli)
+                cfg = (self.root / "request.cfg").read_text()
+                self.assertIn("bot12345:fake_demo/sendMessage", cfg)
+                self.assertIn("chat_id=" + chat, cfg)
+                body = (self.root / "payload").read_text()
+                self.assertIn("vless://demo<example>", body)
+                self.assertIn("https://sub.example.com/private_token/sbox.json", body)
+                self.assertNotIn(chat, (self.config / "sbtg.sh").read_text())
+                self.assertEqual((self.config / "telegram.credentials").read_text(), "12345:fake_demo\n" + chat + "\n")
 
-    def test_invalid_existing_telegram_script_is_preserved_and_not_executed(self):
-        self.legacy_telegram()
-        with (self.config / "sbtg.sh").open("a", encoding="utf-8", newline="\n") as script:
-            script.write("if then\n")
-        original = (self.config / "sbtg.sh").read_bytes()
-        result = self.run_notice()
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual((self.config / "sbtg.sh").read_bytes(), original)
-        self.assertFalse((self.root / "requests").exists())
+    def test_bad_credentials_do_not_replace_previous(self):
+        self.write("telegram.credentials", "12345:existing\n-12345\n")
+        for bot, chat in (("invalid", "12345"), ("12345:abc", "a b"), ("12345:abc", "@ab")):
+            result = self.notice("readp(){ menu=1; }", f"tgsbshow <<'INPUT'\n{bot}\n{chat}\nINPUT\n")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((self.config / "telegram.credentials").read_text(), "12345:existing\n-12345\n")
+        self.assertFalse((self.root / "curl.argv").exists())
+
+    def test_migrated_script_reads_updated_token_and_ignores_legacy_gitlab(self):
+        self.write("telegram.credentials", "12345:existing\n-12345\n")
+        self.write("subtoken.log", "new_private\n")
+        self.write("sing_box_gitlab.txt", "old-private-url")
+        result = self.notice()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = (self.root / "payload").read_text()
+        self.assertIn("new_private/clmi.yaml", body)
+        self.assertNotIn("old-private-url", body)
+
+    def test_disable_removes_credentials_and_sender(self):
+        self.write("telegram.credentials", "12345:existing\n-12345\n")
+        self.write("sbtg.sh", "exit 99\n")
+        result = self.notice("readp(){ menu=2; }", "tgsbshow && tgnotice")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.config / "telegram.credentials").exists())
+        self.assertFalse((self.config / "sbtg.sh").exists())
+        self.assertFalse((self.root / "curl.argv").exists())
 
     def test_failed_refresh_prevents_telegram_payloads(self):
-        self.legacy_telegram()
-        result = self.run_notice("\nsbshare() { return 1; }\n")
+        self.write("telegram.credentials", "12345:existing\n-12345\n")
+        result = self.notice("sbshare(){ return 1; }")
         self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((self.root / "requests").exists())
+        self.assertFalse((self.root / "curl.argv").exists())
 
     def test_domain_refresh_without_publisher_displays_domain_links(self):
         script = self.preamble + self.functions("clash_sb_share", "acme")

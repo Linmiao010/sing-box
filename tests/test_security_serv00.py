@@ -46,6 +46,159 @@ class Serv00Security(unittest.TestCase):
         self.addCleanup(self.work.cleanup)
         self.dir = Path(self.work.name)
 
+    def test_connector_uses_issued_origin_and_requires_dashboard_confirmation(self):
+        state = {"backend": 23405, "argo_token": "example", "argo_domain": "t.example"}
+        openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
+        with patch.object(runtime, "ROOT", self.dir), patch.dict(os.environ, PATH=str(Path(openssl).parent) + os.pathsep + os.environ["PATH"]), patch.object(sys.stdin, "isatty", return_value=False):
+            with self.assertRaises(runtime.SetupError):
+                runtime.prepare_origin(state, {})
+            with patch.dict(os.environ, SERV00_FIXED_ORIGIN_CONFIRMED="https://127.0.0.1:23405"):
+                runtime.prepare_origin(state, {})
+            for token in ("example", ""):
+                state["argo_token"] = token
+                with patch.object(runtime, "pid_of", return_value=None), patch.object(runtime, "start") as start:
+                    runtime.ensure_running(self.dir, state)
+                    connector = start.call_args.args
+                    self.assertEqual(connector[0], "server")
+                    if token:
+                        self.assertEqual(connector[1][-1], "run")
+                        self.assertEqual(connector[3]["TUNNEL_TOKEN"], token)
+                    else:
+                        self.assertEqual(connector[1][-6:], ["--url", "https://127.0.0.1:23405", "--origin-server-name",
+                                runtime.ORIGIN_NAME, "--origin-ca-pool", str(self.dir / "origin-tls" / "cert.pem")])
+            for name in ("origin-tls", "wrong"):
+                target = self.dir / name
+                if name == "wrong":
+                    target.mkdir()
+                    runtime.certificate(target, None, {"sni":runtime.ORIGIN_NAME})
+                with socket.socket() as sock:
+                    sock.bind(("127.0.0.1", 0))
+                    sock.listen()
+                    def serve():
+                        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                        ctx.load_cert_chain(target / "cert.pem", target / "private.key")
+                        with sock.accept()[0] as connection, contextlib.suppress(ssl.SSLError):
+                            ctx.wrap_socket(connection, server_side=True).close()
+                    thread = threading.Thread(target=serve)
+                    thread.start()
+                    ctx = ssl.create_default_context(cafile=str(self.dir / "origin-tls" / "cert.pem"))
+                    with socket.create_connection(sock.getsockname(), 3) as plain:
+                        if name == "wrong":
+                            with self.assertRaises(ssl.SSLCertVerificationError):
+                                ctx.wrap_socket(plain, server_hostname=runtime.ORIGIN_NAME)
+                        else:
+                            ctx.wrap_socket(plain, server_hostname=runtime.ORIGIN_NAME).close()
+                    thread.join(4)
+                    self.assertFalse(thread.is_alive())
+
+    def test_legacy_warp_requires_provenance(self):
+        route = {"rules": [{"domain_suffix": ["test.invalid"], "outbound": "wg"}]}
+        with patch.object(sys.stdin, "isatty", return_value=False), self.assertRaises(runtime.SetupError):
+            runtime.legacy_warp_policy(route, None)
+        with patch.object(sys.stdin, "isatty", return_value=True), patch("builtins.input", return_value="IMPORT-WARP"):
+            self.assertEqual(runtime.legacy_warp_policy(route, None)["warp_rules"], route["rules"])
+        backup = self.dir / "trusted.json"
+        runtime.write_json(backup, {"route": {"rules": []}})
+        backup.chmod(0o600)
+        with contextlib.ExitStack() as stack:
+            if os.name == "nt":
+                stack.enter_context(patch.object(os, "getuid", return_value=0, create=True))
+                original = Path.stat
+                def posix_stat(path, *args, **kwargs):
+                    result = original(path, *args, **kwargs)
+                    if path == backup:
+                        return os.stat_result([0o100600, *result[1:]])
+                    return result
+                stack.enter_context(patch.object(Path, "stat", posix_stat))
+            self.assertEqual(runtime.legacy_warp_policy(route, backup)["warp_rules"], [])
+
+    def test_unreviewed_or_plaintext_state_never_starts_a_daemon(self):
+        for state in ({"origin_https": False}, {"origin_https": True, "warp_rules": [{"outbound":"wg"}]}):
+            with patch.object(runtime, "stop") as stop, patch.object(runtime, "start") as start, self.assertRaises(runtime.SetupError):
+                runtime.ensure_running(self.dir, state)
+            stop.assert_called_once_with("server")
+            start.assert_not_called()
+
+    def test_restart_update_ports_and_rotation_switch_origin_before_connector(self):
+        state = {"ip":"192.0.2.9", "addresses":["192.0.2.9"], "path":"/fixture", "sni":"test.invalid",
+                 "uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "origin_https":True,
+                 "backend":21001,"vmess_port":21001,"vless_port":21002,"hy2_port":21003,"token":"a"*48}
+        active = self.dir / "active"
+        active.mkdir()
+        (active / "reality.key").write_text("fixture")
+        (active / "argo-domain").write_text("fixed.example")
+        for fixed in (True,False):
+            working = dict(state, argo_domain="fixed.example" if fixed else "", argo_token="example" if fixed else "")
+            runtime.write_json(active / "state.json", working)
+            for op in ("restart", "update", "ports", "rotate"):
+                with self.subTest(fixed=fixed,op=op), contextlib.ExitStack() as stack:
+                    events = []
+                    stack.enter_context(patch.object(runtime, "ROOT", self.dir))
+                    stack.enter_context(patch.object(runtime, "ACTIVE", active))
+                    stack.enter_context(patch.object(runtime, "stop", side_effect=lambda name: events.append(("stop",name))))
+                    stack.enter_context(patch.object(runtime, "start", side_effect=lambda name,*args:events.append(("start",name))))
+                    stack.enter_context(patch.object(runtime, "pid_of", return_value=None))
+                    for key in ("prepare_assets","install_release","run","emit_clients","publish","switch","retire_token","publish_tunnel_change","prepare_origin"):
+                        stack.enter_context(patch.object(runtime,key))
+                    stack.enter_context(patch.object(runtime, "acquire_state", side_effect=lambda old,m:dict(old, backend=old["vmess_port"])))
+                    stack.enter_context(patch.object(runtime, "server_config", return_value={}))
+                    stack.enter_context(patch.object(runtime, "server_series", return_value="1.10.7"))
+                    stack.enter_context(patch.object(runtime, "running_argo", return_value="fixed.example"))
+                    stack.enter_context(patch.object(runtime, "certificate", side_effect=lambda stage,*args:(stage / "cert.pem").write_text("fixture")))
+                    if op == "restart":
+                        runtime.perform(op)
+                    else:
+                        runtime.configure(op,{"vmess_port":21011} if op == "ports" else None)
+                    self.assertEqual(events,[("stop","server"),("stop","sb"),("start","sb"),("start","server")])
+
+    def test_provider_port_and_rule_revision_state(self):
+        old = {"uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "path":"/fixture", "ip":"192.0.2.9", "sni":"test.invalid", "reality":"handshake.invalid",
+               "addresses":["192.0.2.9"], "backend":49000, "vmess_port":21001, "vless_port":21002, "hy2_port":21003}
+        def ports():
+            return {"tcp":[21001,21002,21004], "udp":[21003]}
+        with patch.object(runtime,"ROOT",self.dir), patch.object(runtime,"allocated_ports",side_effect=ports), patch.object(sys.stdin,"isatty",return_value=False):
+            with self.assertRaises(runtime.SetupError):
+                runtime.acquire_state(old, False)
+            revision = "ab" * 20
+            with patch.dict(os.environ,SERV00_LOOPBACK_PORT_CONFIRMED="1", SERV00_CLIENT_RULES_REVISION=revision):
+                current = runtime.acquire_state(old, False)
+            self.assertEqual(current["backend"],21001)
+            self.assertEqual(runtime.acquire_state(current, False)["rules_revision"],revision)
+            with patch.dict(os.environ,SERV00_ARGO_PORT="21004"):
+                self.assertEqual(runtime.acquire_state(old, False)["backend"],21004)
+
+    def test_server_kernel_series_and_generated_configs(self):
+        openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
+        wg_key = base64.b64encode(bytes(range(32))).decode()
+        state = {"uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "path":"/fixture", "ip":"192.0.2.9",
+                 "addresses":["192.0.2.9"], "backend":21001, "vmess_port":21001, "vless_port":21002,
+                 "hy2_port":21003, "sni":"host.example", "reality":"handshake.example", "rules_revision":"ab"*20}
+        with patch.object(runtime, "ROOT", self.dir), patch.object(runtime,"HOST_ID","s14"), patch.dict(os.environ, PATH=str(Path(openssl).parent) + os.pathsep + os.environ["PATH"]):
+            runtime.prepare_origin(state,{})
+            fp = runtime.certificate(self.dir, None, state)
+            for variable in ("SING_BOX_110_BIN", "SING_BOX_BIN"):
+                binary = os.getenv(variable)
+                if not binary:
+                    self.skipTest("Set SING_BOX_110_BIN and SING_BOX_BIN for native server check")
+                version = runtime.run([binary,"version"],text=True).stdout
+                with patch.object(runtime,"run",return_value=Mock(stdout=version)):
+                    series = runtime.server_series()
+                state["client_series"] = "modern" if series.startswith("1.10.") else "1.10"
+                keys = runtime.run([binary,"generate","reality-keypair"],text=True).stdout
+                private = re.search(r"PrivateKey:\s*(\S+)", keys)[1]
+                state["public_key"] = re.search(r"PublicKey:\s*(\S+)",keys)[1]
+                runtime.emit_clients(self.dir,state,"",(self.dir/"cert.pem").read_text(),fp)
+                profile = runtime.load(self.dir/"singbox.txt")
+                self.assertTrue(all("@"+state["rules_revision"]+"/" in r["url"] for r in profile["route"]["rule_set"]))
+                self.assertNotIn("clash_api",profile["experimental"])
+                for warp in (None, {"type":"wireguard", "tag":"wg", "private_key":wg_key, "peer_public_key":wg_key,
+                                    "local_address":["172.16.0.2/32"],"server":"192.0.2.1","server_port":10000}):
+                    with self.subTest(series=series, warp=bool(warp)):
+                        config = runtime.server_config(state,private,warp,series)
+                        runtime.write_json(self.dir/"server.json", config)
+                        result = subprocess.run([binary,"check","-c","server.json"],cwd=self.dir,capture_output=True)
+                        self.assertEqual(result.returncode,0,result.stderr.decode(errors="replace"))
+
     def test_new_old_and_custom_identity(self):
         old = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
         for path in (old + "-vm", "/" + old + "-vm?ed=2048"):
@@ -70,10 +223,12 @@ class Serv00Security(unittest.TestCase):
             tls_ws, argo_ws = server["inbounds"][-2:]
             self.assertTrue(tls_ws["tls"]["enabled"])
             self.assertEqual((argo_ws["listen"], argo_ws["listen_port"]), ("127.0.0.1", 23404))
+            self.assertTrue(argo_ws["tls"]["enabled"])
             self.assertEqual(argo_ws["transport"]["path"], ws)
             self.assertEqual(tls_ws["transport"]["path"], ws)
             runtime.emit_clients(self.dir, s, "argo.example", "test PEM", "c0ffee")
             sub = json.loads((self.dir / "singbox.txt").read_text())
+            self.assertNotIn("clash_api", sub["experimental"])
             for out in [o for o in sub["outbounds"] if o["type"] == "vmess"]:
                 self.assertEqual(out["transport"]["path"], ws)
                 self.assertTrue(out["tls"]["enabled"])
@@ -115,7 +270,8 @@ class Serv00Security(unittest.TestCase):
                      backend=24404, warp_rules=[{"domain":["test.invalid"],"outbound":"wg"}], warp_sets=[])
         with patch.object(runtime, "ROOT", self.dir):
             config = runtime.server_config(state, "dummy", runtime.warp_outbound())
-        self.assertEqual(config["route"]["rules"], state["warp_rules"])
+        self.assertEqual(config["route"]["rules"][2:], state["warp_rules"])
+        self.assertIn("100.64.0.0/10", config["route"]["rules"][0]["ip_cidr"])
         self.assertEqual(next(o for o in config["outbounds"] if o["tag"] == "wg")["type"], "block")
 
     def test_checksum_blocks_execution_and_replacement(self):
@@ -289,7 +445,10 @@ class Serv00Security(unittest.TestCase):
         archive = self.dir / "archive"
         args = self.dir / "args"
         marker = "fixture-argo-token"
-        env = dict(os.environ, ACCOUNTS=json.dumps([{"SSH_USER":"fake","HOST":"host.test","ARGO_AUTH":marker}]),
+        settings = {"SERV00_ARGO_PORT": 12346, "SERV00_LOOPBACK_PORT_CONFIRMED": "1",
+                    "SERV00_FIXED_ORIGIN_CONFIRMED": "https://127.0.0.1:12346",
+                    "SERV00_CLIENT_RULES_REVISION": "a" * 40}
+        env = dict(os.environ, ACCOUNTS=json.dumps([{"SSH_USER":"fake","HOST":"host.test","ARGO_AUTH":marker, **settings}]),
                    SSH_KNOWN_HOSTS_FILE=known.as_posix(), TEST_BIN=self.dir.as_posix(), JQ_BIN=Path(jq).parent.as_posix(),
                    SCRIPT=(REPO/"kp.sh").as_posix(), ARCHIVE=archive.as_posix(), ARGS=args.as_posix())
         code = 'if command -v cygpath >/dev/null; then TEST_BIN=$(cygpath -u "$TEST_BIN"); JQ_BIN=$(cygpath -u "$JQ_BIN"); fi; '
@@ -305,6 +464,7 @@ class Serv00Security(unittest.TestCase):
                 self.assertEqual(tf.extractfile(name).read(), (REPO/name).read_bytes())
             data = json.load(tf.extractfile("input.json"))
             self.assertEqual(data["ARGO_AUTH"], marker)
+            self.assertEqual({key: data[key] for key in settings}, settings)
             self.assertNotIn("SSH_PASS", data)
 
     def test_native_clients_on_loopback(self):
@@ -350,7 +510,7 @@ class Serv00Security(unittest.TestCase):
         runtime.emit_clients(self.dir, s, "argo.example.com", *certs[0])
         checked = subprocess.run([sb, "check", "-c", "singbox.txt"], cwd=self.dir, capture_output=True)
         self.assertEqual(checked.returncode, 0, checked.stderr)
-        incoming = runtime.server_config(s, "unused", None)["inbounds"]
+        incoming = runtime.server_config(s, "unused", None, version.split()[2])["inbounds"]
         runtime.write_json(self.dir / "server.json", {"inbounds": [i for i in incoming if i["tag"] in
             ("vmess-ws-in", "hysteria-in1")], "outbounds": [{"type":"direct","tag":"direct"}]})
         server = start(sb, "run", "-c", "server.json")
@@ -424,6 +584,7 @@ class Serv00Security(unittest.TestCase):
         client_key.write_private_key_file(str(key))
         ssh_exec = Path(ssh).as_posix()
         endpoints = []
+        exec_requested = threading.Event()
         class Server(paramiko.ServerInterface):
             def check_auth_publickey(self, username, key):
                 return paramiko.AUTH_SUCCESSFUL if key == client_key else paramiko.AUTH_FAILED
@@ -433,6 +594,7 @@ class Serv00Security(unittest.TestCase):
                 return paramiko.OPEN_SUCCEEDED
             def check_channel_exec_request(self, channel, command):
                 endpoints.append(command)
+                exec_requested.set()
                 return True
         with socket.socket() as listener:
             listener.bind(("127.0.0.1", 0))
@@ -444,6 +606,7 @@ class Serv00Security(unittest.TestCase):
             wrapper.chmod(0o700)
             known = self.dir / "known_hosts"
             for mode in ("match", "unknown", "changed"):
+                exec_requested.clear()
                 saved = changed if mode == "changed" else host_key
                 alias = "elsewhere.example" if mode == "unknown" else "127.0.0.1"
                 known.write_text(f"[{alias}]:{num} {saved.get_name()} {saved.get_base64()}\n")
@@ -453,9 +616,8 @@ class Serv00Security(unittest.TestCase):
                         transport.add_server_key(host_key)
                         with contextlib.suppress(EOFError, OSError, paramiko.SSHException):
                             transport.start_server(server=Server())
-                            chan = transport.accept(3)
-                            if chan:
-                                time.sleep(.15)
+                            chan = transport.accept(8)
+                            if chan and exec_requested.wait(8):
                                 chan.send_exit_status(0)
                                 chan.close()
                 t = threading.Thread(target=serve, daemon=True)

@@ -24,6 +24,7 @@ read -e -r -p "$prompt" "$2"
 }
 [[ $EUID -ne 0 ]] && yellow "请以root模式运行脚本" && exit 1
 umask 077
+unset config_lock_held
 if [[ -d /etc/s-box ]]; then
     chmod 700 /etc/s-box || exit 1
     find /etc/s-box -maxdepth 1 -type f -exec chmod go-rwx {} + || exit 1
@@ -396,49 +397,90 @@ showv4=$vps_ipv4 showv6=$vps_ipv6
 }
 
 warpcheck(){
-wgcfv6=$(curl -s6m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
-wgcfv4=$(curl -s4m5 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+local family trace status
+for family in 4 6; do
+    status=unknown
+    if trace=$(curl -q -fsS "-$family" --noproxy '*' --proto '=https' --connect-timeout 2 --max-time 5 \
+        https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null); then
+        trace=$(sed -n 's/^warp=//p' <<< "$trace")
+        case "$trace" in off|on|plus) status=$trace ;; esac
+    fi
+    printf -v "wgcfv$family" '%s' "$status"
+done
+}
+
+warp_unrouted_ips(){
+(
+local service family status address
+local -a stopped=() active=()
+warp_unit(){
+    local action=$1 unit=$2
+    if command -v rc-service >/dev/null 2>&1; then
+        if [[ $unit == wg-quick@wgcf && -e /etc/init.d/wg-quick.wgcf ]]; then unit=wg-quick.wgcf; fi
+        rc-service "$unit" "$action" 8>&- 9>&-
+    elif [[ $action == status ]]; then systemctl is-active --quiet "$unit"
+    else systemctl "$action" "$unit"; fi
+}
+for service in wg-quick@wgcf warp-go; do
+    if warp_unit status "$service" >/dev/null 2>&1; then active+=("$service"); fi
+done
+restore_warp(){
+    local rc=$? unit
+    trap - EXIT
+    for unit in "${stopped[@]}"; do warp_unit start "$unit" >&2 || rc=1; done
+    exit "$rc"
+}
+trap restore_warp EXIT
+trap 'exit 1' HUP INT TERM
+for service in "${active[@]}"; do
+    stopped+=("$service")
+    warp_unit stop "$service" >&2 || exit 1
+done
+warpcheck
+for family in 4 6; do
+    status=wgcfv$family
+    address=
+    if [[ ${!status} == off ]]; then
+        if [[ $1 == node ]]; then address=$(public_ip "$family") || address=
+        else address=$(egress_public_ip "$family") || address=; fi
+    fi
+    printf '%s\n' "${address:--}"
+done
+)
+}
+
+v4orv6(){
+local detected_v4=$1 detected_v6=$2 local_v4 answer backup candidate
+if [[ -z $detected_v4 && -z $detected_v6 ]]; then
+    red "公网地址或 WARP 状态探测失败，已保留 DNS"; return 1
+fi
+ipv=prefer_ipv4
+if [[ -z $detected_v4 ]]; then
+    ipv=prefer_ipv6
+    if local_v4=$(ip -o -4 addr show scope global) && [[ -z $local_v4 ]]; then
+        yellow "仅检测到 IPv6。使用第三方 DNS64 会更改整机 DNS 并通过其网关访问 IPv4。"
+        readp "是否替换 /etc/resolv.conf？输入 YES 确认，回车保留：" answer || answer=
+        if [[ $answer == YES ]]; then
+            backup=$(mktemp -d /etc/s-box/resolver-backup.XXXXXX) || return 1
+            cp -Pp -- /etc/resolv.conf "$backup/original" &&
+                cp -Lp -- /etc/resolv.conf "$backup/contents" || return 1
+            candidate=$(mktemp /etc/.sbox-resolv.XXXXXX) || return 1
+            if ! printf '%s\n' 'nameserver 2a00:1098:2b::1' 'nameserver 2a00:1098:2c::1' > "$candidate" ||
+               ! chmod 644 "$candidate" || ! mv -fT -- "$candidate" /etc/resolv.conf; then
+                rm -f -- "$candidate"; return 1
+            fi
+            green "已备份原内容与链接。恢复命令：cp -a --remove-destination '$backup/original' /etc/resolv.conf"
+        fi
+    fi
+fi
+if [[ -n $detected_v6 ]]; then endip="2606:4700:d0::a29f:c001"; else endip="162.159.192.1"; fi
 }
 
 v6(){
-local result
-v4orv6(){
-local detected_v4 detected_v6
-detected_v4=$(egress_public_ip 4)
-detected_v6=$(egress_public_ip 6)
-if [[ -z $detected_v4 && -z $detected_v6 ]]; then
-red "公网IP探测均未成功，请检查网络或DNS；未修改DNS配置"
-return 1
-fi
-if [[ -z $detected_v4 ]]; then
-echo
-red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-yellow "IPv4公网探测未成功，IPv6探测成功，配置NAT64"
-echo -e "nameserver 2a00:1098:2b::1\nnameserver 2a00:1098:2c::1" > /etc/resolv.conf
-ipv=prefer_ipv6
-else
-ipv=prefer_ipv4
-fi
-if [[ -n $detected_v6 ]]; then
-endip="2606:4700:d0::a29f:c001"
-else
-endip="162.159.192.1"
-fi
-}
-warpcheck
-if [[ ! $wgcfv4 =~ on|plus && ! $wgcfv6 =~ on|plus ]]; then
-v4orv6
-else
-systemctl stop wg-quick@wgcf >/dev/null 2>&1
-kill -15 $(pgrep warp-go) >/dev/null 2>&1 && sleep 2
-v4orv6
-result=$?
-systemctl start wg-quick@wgcf >/dev/null 2>&1
-systemctl restart warp-go >/dev/null 2>&1
-systemctl enable warp-go >/dev/null 2>&1
-systemctl start warp-go >/dev/null 2>&1
-return "$result"
-fi
+local addresses first second
+addresses=$(warp_unrouted_ips) || return 1
+first=${addresses%%$'\n'*}; second=${addresses#*$'\n'}
+v4orv6 "${first#-}" "${second#-}"
 }
 
 firewall_sync(){
@@ -452,6 +494,9 @@ python3 "$SB_RELEASE_DIR/tools/firewall.py" list "$1"
 }
 
 firewall_enable(){
+if [[ -f /etc/systemd/system/sing-box.service || -f /etc/init.d/sing-box ]]; then
+    [[ $(singbox_unit_state) == project ]] || { red "同名服务归属未确认，已保留防火墙与启动配置"; return 1; }
+fi
 python3 "$SB_RELEASE_DIR/tools/firewall.py" enable "$@" || return 1
 # Older installations predate the service startup hook. Leave their main unit intact.
 if [[ -f /etc/systemd/system/sing-box.service ]] && ! grep -q -- --firewall-sync /etc/systemd/system/sing-box.service; then
@@ -484,13 +529,13 @@ done
 openyn(){
 local action zone
 firewall_legacy
-readp "防火墙：回车沿用主机策略；输入 1 按实际启用的节点放行端口：" action || return 1
+readp "防火墙：回车沿用主机策略；输入 1 按实际启用的节点放行。iptables、UFW 或原生 nftables 将在当前输入链尾追加，请先核实该位置保留来源、接口和限速规则：" action || return 1
 case "$action" in
 1) if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
        firewall-cmd --get-active-zones
        readp "输入节点公网接口所属 zone（仅有一个时可回车）：" zone || return 1
    fi
-   if [[ -n "$zone" ]]; then firewall_enable --zone "$zone"; else firewall_enable; fi ;;
+   if [[ -n "$zone" ]]; then firewall_enable --zone "$zone"; else firewall_enable --input-position append; fi ;;
 "") return 0 ;;
 *) red "选项无效"; return 1 ;;
 esac
@@ -547,12 +592,13 @@ fi
 }
 
 inscertificate(){
+local existing_domain
 ymzs(){
 ym_vl_re=apple.com
 echo
 blue "Vless-reality的SNI域名默认为 apple.com"
 tlsyn=true
-ym_vm_ws=$(cat /root/ygkkkca/ca.log 2>/dev/null)
+ym_vm_ws=$(acme_hostname) || return 1
 certificatec_vmess_ws='/root/ygkkkca/cert.crt'
 certificatep_vmess_ws='/root/ygkkkca/private.key'
 certificatec_hy2='/root/ygkkkca/cert.crt'
@@ -594,15 +640,16 @@ if [[ ! -s /etc/s-box/cert.pem || ! -s /etc/s-box/private.key ]]; then
 fi
 echo
 if [[ -f /root/ygkkkca/cert.crt && -f /root/ygkkkca/private.key && -s /root/ygkkkca/cert.crt && -s /root/ygkkkca/private.key ]]; then
-yellow "经检测，之前已使用ACME 脚本申请过Acme域名IP证书：$(cat /root/ygkkkca/ca.log) "
-green "是否使用 $(cat /root/ygkkkca/ca.log) 域名IP证书？"
+existing_domain=$(acme_hostname) || return 1
+yellow "检测到 ACME 域名证书：$existing_domain"
+green "是否使用 $existing_domain 域名IP证书？"
 yellow "1：否！使用自签的证书 (回车默认)"
-yellow "2：是！使用 $(cat /root/ygkkkca/ca.log) 域名IP证书"
+yellow "2：是！使用 $existing_domain 域名IP证书"
 readp "请选择【1-2】：" menu
 if [ -z "$menu" ] || [ "$menu" = "1" ] ; then
 zqzs
 else
-ymzs
+ymzs || return 1
 fi
 else
 green "是否申请一个Acme域名IP证书？"
@@ -617,7 +664,7 @@ if [[ ! -s /root/ygkkkca/cert.crt || ! -s /root/ygkkkca/private.key ]]; then
 red "Acme证书申请失败，继续使用自签证书" 
 zqzs
 else
-ymzs
+ymzs || return 1
 fi
 fi
 fi
@@ -743,6 +790,64 @@ ws_path=/$ws_path
 blue "节点凭据与 WebSocket 路径已独立生成"
 }
 
+valid_node_address(){
+sub_valid_domain "$1" || ip_literal_valid 4 "$1" || ip_literal_valid 6 "$1"
+}
+
+acme_hostname(){
+local value
+value=$(cat /root/ygkkkca/ca.log) && sub_valid_domain "$value" || {
+    red "ACME 记录缺少合法域名" >&2; return 1
+}
+printf '%s\n' "$value"
+}
+
+quick_tunnel_hostname(){
+local host
+host=$(awk '{
+    for (i=1; i<=NF; i++) {
+        if ($i !~ /^https:\/\/[a-z0-9-]+\.trycloudflare\.com(\/[^[:space:]]*)?$/) continue
+        name=$i; sub(/^https:\/\//,"",name); sub(/\/.*/,"",name)
+        split(name,labels,"."); if (length(labels[1]) <= 63 && labels[1] !~ /^-|-$/) last=name
+    }
+} END {if(last) print last}' /etc/s-box/argo.log 2>/dev/null)
+[[ -n $host ]] && printf '%s\n' "$host"
+}
+
+project_process(){
+local kind=$1 port=$2 action=$3 exe pid actual attempt found=1
+local -a argv
+case $kind in
+    temporary) sub_valid_port "$port" || return 1; exe=/etc/s-box/cloudflared ;;
+    fixed) exe=/etc/s-box/cloudflared ;;
+    socks) exe=/etc/s-box/sbwpph ;;
+    *) return 1 ;;
+esac
+while IFS= read -r pid; do
+    actual=$(readlink "/proc/$pid/exe") || continue
+    [[ $actual == "$exe" || $actual == "$exe (deleted)" ]] || continue
+    mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || continue
+    [[ ${argv[0]} == "$exe" ]] || continue
+    case $kind in
+        temporary)
+            [[ ${argv[1]} == tunnel && ${argv[2]} == --url &&
+                ( ${argv[3]} == "http://127.0.0.1:$port" || ${argv[3]} == "http://localhost:$port" ) ]] || continue ;;
+        fixed)
+            [[ ${argv[1]} == tunnel && " ${argv[*]} " == *" run "* ]] || continue ;;
+    esac
+    found=0
+    if [[ $action == stop ]]; then
+        kill -TERM "$pid" || return 1
+        for attempt in {1..30}; do
+            kill -0 "$pid" 2>/dev/null && [[ $(readlink "/proc/$pid/exe") == "$actual" ]] || break
+            sleep .1
+        done
+        if kill -0 "$pid" 2>/dev/null && [[ $(readlink "/proc/$pid/exe") == "$actual" ]]; then return 1; fi
+    fi
+done < <(pgrep -x "${exe##*/}" 2>/dev/null)
+[[ $action == stop ]] || return "$found"
+}
+
 config_jq(){
 local filter=$1 source=${!#}
 shift
@@ -780,7 +885,8 @@ config_jq 'inbound($tag) as $old |
 }
 
 config_patch_identity(){
-config_jq '
+printf '%s\0%s' "$4" "${5:-}" | config_jq '
+  split("\u0000") as [$uuid,$path] | $server[0] |
   (["vless-sb","vmess-sb","hy2-sb","tuic5-sb"] +
     if $series == "1.10" then [] else ["anytls-sb"] end) as $tags |
   reduce $tags[] as $tag (.;
@@ -793,7 +899,7 @@ config_jq '
        else . end) |
       .users[0] |= (if has("uuid") then .uuid=$uuid else . end |
                     if has("password") then .password=$uuid else . end)
-      else . end))' --arg series "$3" --arg uuid "$4" --arg path "${5:-}" "$1" > "$2"
+      else . end))' -Rs --slurpfile server "$1" --arg series "$3" - > "$2"
 }
 
 # A disabled modern WARP rule keeps its original match and explicitly drops it.
@@ -838,14 +944,44 @@ config_jq 'outbound("socks-out") as $node |
   --argjson port "$4" "$1" > "$2"
 }
 
+config_locked(){
+if [[ ${config_lock_held:-0} == 1 ]]; then "$@"; return; fi
+(
+    flock -x 8 || exit 1
+    local config_lock_held=1 installed
+    if [[ -x /etc/s-box/sing-box ]]; then
+        installed=$(/etc/s-box/sing-box version 2>/dev/null)
+        if [[ $installed =~ ^sing-box\ version\ ([0-9]+\.[0-9]+)\. ]]; then local sbnh=${BASH_REMATCH[1]}; fi
+    fi
+    # Keep the lock in the writer and its rollback even if the menu process exits.
+    # Detached services close the lock descriptors at their launch sites.
+    "$@"
+) 8>/run/s-box-config.lock
+}
+
+extra_for_series(){
+if jq -e 'all(.inbounds[]?; .type != "trojan" and (has("domain_strategy") | not))' "$1" >/dev/null; then
+    cp -p -- "$1" "$2"
+    return $?
+fi
+jq -e --arg series "$3" --slurpfile main "$4" '
+    if $series=="1.10" then
+        (($main[0].outbounds[]? | select(.tag=="direct") | .domain_strategy) // "prefer_ipv4") as $s |
+        .inbounds |= map(.domain_strategy=$s)
+    else .inbounds |= map(del(.domain_strategy)) end' "$1" > "$2"
+}
+
 config_apply(){
+config_locked config_apply_locked "$@"
+}
+
+config_apply_locked(){
 (
 local patch=$1 work file series restore=0 failed=0
 local -a check_args files=(sb10.json sb11.json sb.json)
-local old_uuid extra=/etc/s-box/sb_extra.json
+local extra=/etc/s-box/sb_extra.json
 shift
-if [[ $patch == config_patch_identity && -f $extra ]]; then
-    old_uuid=$(config_get vmess-sb '.users[0].uuid') || exit 1
+if [[ -f $extra && ( $patch == secure_server_routes || $patch == ip_priority_patch || $patch == config_patch_identity ) ]]; then
     files+=(sb_extra.json)
 fi
 work=$(mktemp -d /etc/s-box/.config.XXXXXX) || exit 1
@@ -862,6 +998,7 @@ red "恢复配置失败，剩余备份保留在 $work"
 return 1
 fi
 ip_priority_restart >/dev/null 2>&1 || red "原配置已恢复，但服务启动失败，请查看运行日志"
+[[ ! -f /etc/s-box/firewall.json ]] || firewall_sync || red "恢复原配置后的防火墙同步失败"
 red "服务端配置修改失败，已恢复原配置"
 fi
 rm -rf -- "$work"
@@ -872,9 +1009,15 @@ trap 'exit 1' HUP INT TERM
 for file in "${files[@]}"; do
 cp -p "/etc/s-box/$file" "$work/old-$file" && cp -p "/etc/s-box/$file" "$work/$file" || exit 1
 if [[ $file == sb_extra.json ]]; then
-    jq --arg old "$old_uuid" --arg new "$1" \
-        '(.inbounds[] | select(.tag=="trojan-sb") | .users[] | select(.password==$old).password)=$new' \
-        "$extra" > "$work/$file" || exit 1
+    if [[ $patch == config_patch_identity ]]; then
+        jq -e --slurpfile before "$work/old-sb.json" --slurpfile after "$work/sb.json" '
+            def vm_uuid: .inbounds[] | select(.tag=="vmess-sb") | .users[0].uuid;
+            ($before[0] | vm_uuid) as $old | ($after[0] | vm_uuid) as $new |
+            (.inbounds[] | select(.tag=="trojan-sb") | .users[] | select(.password==$old).password)=$new' \
+            "$extra" > "$work/$file" || exit 1
+    else
+        extra_for_series "$extra" "$work/$file" "$sbnh" "$work/sb.json" || exit 1
+    fi
     extra=$work/$file
     continue
 fi
@@ -1424,6 +1567,13 @@ cat > /etc/s-box/sb11.json <<EOF
 }
 }
 EOF
+local file candidate series
+for file in sb10.json sb11.json; do
+    series=1.11; [[ $file != sb10.json ]] || series=1.10
+    candidate=$(mktemp /etc/s-box/.route.XXXXXX) || return 1
+    if ! secure_server_routes "/etc/s-box/$file" "$candidate" "$series" ||
+       ! mv -f -- "$candidate" "/etc/s-box/$file"; then rm -f -- "$candidate"; return 1; fi
+done
 if [[ -s /etc/s-box/server_warp.json ]]; then
     local file series candidate
     for file in sb10.json sb11.json; do
@@ -1435,6 +1585,42 @@ if [[ -s /etc/s-box/server_warp.json ]]; then
 fi
 [[ "$sbnh" == "1.10" ]] && num=10 || num=11
 cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
+}
+
+# Shared by installation and the explicit migration of existing profiles.
+secure_server_routes(){
+local extra='[]'
+if [[ -e /etc/s-box/restricted-cidrs.json ]]; then
+    extra=$(jq -ce 'if type=="array" and all(.[]; type=="string") then . else error("expected CIDR array") end' /etc/s-box/restricted-cidrs.json) || return 1
+fi
+jq -e --arg series "$3" --argjson extra "$extra" '
+  (["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16",
+    "172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4","::/96",
+    "::ffff:0:0/96","fc00::/7","fe80::/10","ff00::/8","168.63.129.16/32"] + $extra | unique) as $restricted |
+  {ip_cidr:["0.0.0.0/0","::/0"],invert:true} as $missing |
+  (if $series == "1.10" then {outbound:"block"} else {action:"reject"} end) as $deny |
+  .route.rules |= map(select((. == ($missing + $deny) or
+      (((.ip_cidr // []) | index("100.64.0.0/10")) != null and
+       ((.ip_cidr // []) | index("168.63.129.16/32")) != null and del(.ip_cidr) == $deny)) | not)) |
+  [{ip_cidr:$restricted} + $deny,$missing + $deny] as $guards |
+  if any(.outbounds[]?; has("override_address")) or any(.route.rules[]?; has("override_address"))
+  then error("请先人工复核目标地址改写规则") else . end |
+  if $series == "1.10" then
+    ((.outbounds[] | select(.tag=="direct") | .domain_strategy) // "prefer_ipv4") as $strategy |
+    .inbounds |= map(.domain_strategy=(if (["prefer_ipv4","prefer_ipv6","ipv4_only","ipv6_only"] | index($strategy)) != null
+        then $strategy else "prefer_ipv4" end) | del(.sniff_override_destination)) |
+    .route.rules = $guards + .route.rules
+  else
+    [.route.rules[] | select(.action=="resolve" and
+       (del(.strategy,.action)=={} or del(.strategy,.action)==$missing))] as $defaults |
+    if ($defaults | length)>1 then error("multiple default resolvers") else . end |
+    [.route.rules[] | select(.action=="resolve" and has("domain_suffix"))] as $split |
+    if any((.route.rules - $defaults - $split)[]; .action=="resolve")
+    then error("请先人工复核自定义解析规则") else . end |
+    [.route.rules[] | select(.action=="sniff")] as $sniff |
+    .route.rules = $sniff + $split + [($missing + {action:"resolve",strategy:($defaults[0].strategy // "prefer_ipv4")})] +
+      $guards + (.route.rules - $sniff - $split - $defaults)
+  end' "$1" > "$2"
 }
 
 snell_supported(){
@@ -1452,15 +1638,18 @@ fi
 }
 
 extra_inbound(){
-local protocol=$1 port=$2 password=$3
+local protocol=$1 port=$2 password=$3 strategy='{}'
 [[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) && [[ -n "$password" ]] || return 1
 case "$protocol" in
 trojan)
-jq -n --argjson port "$port" --arg password "$password" \
+if [[ $sbnh == 1.10 ]]; then
+    strategy=$(jq -ce '{domain_strategy:((.outbounds[] | select(.tag=="direct") | .domain_strategy) // "prefer_ipv4")}' /etc/s-box/sb.json) || return 1
+fi
+jq -n --argjson port "$port" --argjson strategy "$strategy" --arg password "$password" \
     --arg cert "$4" --arg key "$5" --arg sni "$6" '
     {type:"trojan",tag:"trojan-sb",listen:"::",listen_port:$port,
      users:[{password:$password}],tls:{enabled:true,server_name:$sni,
-     certificate_path:$cert,key_path:$key}}'
+     certificate_path:$cert,key_path:$key}} + $strategy'
 ;;
 snell)
 # sing-box v5 inbound implements the TCP wire protocol used by v4 clients.
@@ -1511,7 +1700,14 @@ return 1
 
 extra_apply(){
 (
-local candidate=$1 backup restore=0
+local candidate=$1 backup restore=0 prepared unit_state
+unit_state=$(singbox_unit_state)
+[[ $unit_state == absent || $unit_state == project ]] || { red "同名服务归属未确认，已保留协议配置"; exit 1; }
+if [[ $sbnh == 1.10 ]]; then
+    prepared=$(mktemp /etc/s-box/.extra-legacy.XXXXXX) || exit 1
+    if ! extra_for_series "$candidate" "$prepared" "$sbnh" /etc/s-box/sb.json ||
+       ! mv -f -- "$prepared" "$candidate"; then rm -f -- "$prepared"; exit 1; fi
+fi
 if ! /etc/s-box/sing-box check -c /etc/s-box/sb.json -c "$candidate"; then
 red "新协议配置校验失败，原配置未更改"
 exit 1
@@ -1527,6 +1723,7 @@ red "恢复原配置失败，备份保留在 $backup"
 return 1
 fi
 restartsb >/dev/null 2>&1 || red "原配置已恢复，但服务重启失败，请查看运行日志"
+[[ ! -f /etc/s-box/firewall.json ]] || firewall_sync || red "恢复原配置后的防火墙同步失败"
 red "新协议应用未完成，已恢复原配置"
 fi
 rm -f -- "$backup"
@@ -1550,6 +1747,10 @@ restore=0
 }
 
 extra_set(){
+config_locked extra_set_locked "$@"
+}
+
+extra_set_locked(){
 local protocol=$1 port=$2 password=$3 node candidate
 if [[ "$protocol" == snell ]] && ! snell_supported "$sbnh"; then
 red "Snell 需要 sing-box 1.14.0 或更新的正式版内核，请先通过菜单8升级"
@@ -1575,6 +1776,10 @@ return 1
 }
 
 extra_remove(){
+config_locked extra_remove_locked "$@"
+}
+
+extra_remove_locked(){
 local candidate
 [[ "$1" == trojan || "$1" == snell ]] || return 1
 [[ -f /etc/s-box/sb_extra.json ]] || return 0
@@ -1593,7 +1798,7 @@ extra_port_available trojan "$port_tr" || { red "Trojan端口与其他协议冲�
 if [[ "$certificatec_hy2" == /etc/s-box/cert.pem ]]; then
 sni=www.bing.com
 else
-sni=$(cat /root/ygkkkca/ca.log) || return 1
+sni=$(acme_hostname) || return 1
 fi
 trojan=$(extra_inbound trojan "$port_tr" "$uuid" "$certificatec_hy2" "$certificatep_hy2" "$sni") || return 1
 if snell_supported "$sbnh"; then
@@ -1647,7 +1852,7 @@ if [[ -n "$link" ]]; then
 printf '%s\n' "$link" > /etc/s-box/trojan.txt || return 1
 red "🚀【 Trojan + TLS 】分享链接"
 printf '%s\n' "$link"
-qrencode -o - -t ANSIUTF8 "$link"
+printf '%s' "$link" | qrencode -o - -t ANSIUTF8
 fi
 if printf '%s' "$data" | jq -e '.mihomo[] | select(.type == "snell")' >/dev/null; then
 red "🚀【 Snell 】请通过 clmi.yaml 订阅导入 Clash Verge，单节点 YAML 如下："
@@ -1657,6 +1862,10 @@ return 0
 }
 
 extra_menu(){
+config_locked extra_menu_locked "$@"
+}
+
+extra_menu_locked(){
 local choice protocol old port password cert key sni cert_choice
 [[ -s /etc/s-box/sb.json ]] || { red "请先安装 sing-box"; return 1; }
 readp "1：启用/设置 Trojan + TLS（端口、密码、证书）\n2：启用/设置 Snell（端口、PSK）\n3：停用 Trojan\n4：停用 Snell\n0：返回\n请选择【0-4】：" choice || return 1
@@ -1686,7 +1895,7 @@ sni=$(printf '%s' "$old" | jq -r '.tls.server_name // empty') || return 1
 readp "Trojan证书：1 自签；2 已有ACME域名证书；回车保留当前，首次默认自签：" cert_choice || return 1
 case "$cert_choice" in
 1) cert=/etc/s-box/cert.pem; key=/etc/s-box/private.key; sni=www.bing.com ;;
-2) cert=/root/ygkkkca/cert.crt; key=/root/ygkkkca/private.key; sni=$(cat /root/ygkkkca/ca.log 2>/dev/null) ;;
+2) cert=/root/ygkkkca/cert.crt; key=/root/ygkkkca/private.key; sni=$(acme_hostname) || return 1 ;;
 "") if [[ -z "$cert" ]]; then cert=/etc/s-box/cert.pem; key=/etc/s-box/private.key; sni=www.bing.com; fi ;;
 *) red "证书选项无效"; return 1 ;;
 esac
@@ -1706,7 +1915,54 @@ fi
 green "Trojan / Snell 配置已应用，请在 Clash Verge 中刷新 clmi.yaml 订阅"
 }
 
+singbox_unit_state(){
+local file line state fragment effective executable=/etc/s-box/sing-box
+local args='run -c /etc/s-box/sb.json' extra=' -c /etc/s-box/sb_extra.json'
+if command -v apk >/dev/null 2>&1; then
+    file=/etc/init.d/sing-box
+    if [[ ! -e $file && ! -L $file ]]; then
+        if rc-service -e sing-box >/dev/null 2>&1; then echo foreign; else echo absent; fi
+        return
+    fi
+    if [[ -f $file && ! -L $file ]] &&
+       [[ $(grep '^command=' "$file") == "command=\"$executable\"" ]] &&
+       line=$(grep '^command_args=' "$file") &&
+       [[ $line == "command_args=\"$args\"" || $line == "command_args=\"$args$extra\"" ]]; then
+        echo project
+    else echo foreign; fi
+    return
+fi
+file=/etc/systemd/system/sing-box.service
+state=$(systemctl show -p LoadState --value sing-box.service 2>/dev/null)
+if [[ $state == not-found && ! -e $file && ! -L $file ]]; then
+    local vendor
+    for vendor in /run/systemd/system/sing-box.service /usr/local/lib/systemd/system/sing-box.service \
+                  /usr/lib/systemd/system/sing-box.service /lib/systemd/system/sing-box.service; do
+        if [[ -e $vendor || -L $vendor ]] || compgen -G "$vendor.d/*.conf" >/dev/null; then echo foreign; return; fi
+    done
+    if compgen -G "$file.d/*.conf" >/dev/null; then echo foreign; else echo absent; fi
+    return
+fi
+if [[ $state == loaded && -f $file && ! -L $file ]] &&
+   line=$(grep '^ExecStart=' "$file") &&
+   [[ $line == "ExecStart=$executable $args" || $line == "ExecStart=$executable $args$extra" ]] &&
+   fragment=$(systemctl show -p FragmentPath --value sing-box.service) && [[ $fragment == "$file" ]] &&
+   effective=$(systemctl show -p ExecStart --value sing-box.service) &&
+   [[ $effective != *'}'*'{'* &&
+      ( $effective == "{ path=$executable ; argv[]=$executable $args ;"* ||
+        $effective == "{ path=$executable ; argv[]=$executable $args$extra ;"* ) ]]; then
+    echo project
+else echo foreign; fi
+}
+
+singbox_require_owned(){
+[[ $(singbox_unit_state) == project ]] || { red "同名 sing-box 服务归属未确认"; return 1; }
+}
+
 sbservice(){
+local unit_state
+unit_state=$(singbox_unit_state)
+[[ $unit_state == absent || $unit_state == project ]] || { red "同名 sing-box 服务归属未确认，保留原服务"; return 1; }
 extra_config_init || return 1
 if [[ ${1:-} != checked ]]; then
 /etc/s-box/sing-box check -c /etc/s-box/sb.json -c /etc/s-box/sb_extra.json || return 1
@@ -1718,14 +1974,16 @@ command="/etc/s-box/sing-box"
 command_args="run -c /etc/s-box/sb.json -c /etc/s-box/sb_extra.json"
 command_background=true
 depend(){ after firewall nftables iptables ip6tables; }
-start_pre(){ if [ -f /etc/s-box/firewall.json ]; then /usr/bin/sing_box --firewall-sync; fi; }
-pidfile="/var/run/sing-box.pid"' > /etc/init.d/sing-box
-chmod +x /etc/init.d/sing-box
-rc-update add sing-box default
-rc-service sing-box restart
+start_pre(){ [ ! -f /etc/s-box/admin-stopped ] || return 1; if [ -f /etc/s-box/firewall.json ]; then /usr/bin/sing_box --firewall-sync; fi; }
+pidfile="/var/run/sing-box.pid"' > /etc/init.d/sing-box || return 1
+chmod +x /etc/init.d/sing-box && singbox_require_owned || return 1
+[[ ! -e /etc/s-box/admin-stopped ]] || return 0
+rc-update add sing-box default || return 1
+rc-service sing-box restart 8>&- 9>&-
 else
-cat > /etc/systemd/system/sing-box.service <<EOF
+cat > /etc/systemd/system/sing-box.service <<EOF || return 1
 [Unit]
+ConditionPathExists=!/etc/s-box/admin-stopped
 After=network.target nss-lookup.target firewalld.service nftables.service ufw.service
 [Service]
 User=root
@@ -1741,8 +1999,9 @@ LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload || return 1
-systemctl enable sing-box >/dev/null 2>&1
+systemctl daemon-reload && singbox_require_owned || return 1
+[[ ! -e /etc/s-box/admin-stopped ]] || return 0
+systemctl enable sing-box >/dev/null 2>&1 || return 1
 systemctl restart sing-box
 fi
 }
@@ -1764,7 +2023,12 @@ red "检测到活动的系统级WARP，公网探测可能为WARP出口，已保�
 return 1
 fi
 # Selected egress observations are not evidence for the server advertised to clients.
-if [[ ${1:-} != select || -e /etc/s-box/egress.json ]]; then v4v6; fi
+if [[ ${1:-} != verified && ( ${1:-} != select || -e /etc/s-box/egress.json ) ]]; then v4v6; fi
+if [[ ${1:-} == select ]]; then
+    warpcheck
+    [[ $wgcfv4 == off ]] || v4=
+    [[ $wgcfv6 == off ]] || v6=
+fi
 if [[ -z $v4 && -z $v6 ]]; then
 red "公网IP探测未成功，已保留原节点地址"
 return 1
@@ -1795,21 +2059,17 @@ fi
 }
 
 wgcfgo(){
-local result
-warpcheck
-if [[ ! $wgcfv4 =~ on|plus && ! $wgcfv6 =~ on|plus ]]; then
-ipuuid
-else
-systemctl stop wg-quick@wgcf >/dev/null 2>&1
-kill -15 $(pgrep warp-go) >/dev/null 2>&1 && sleep 2
-ipuuid
-result=$?
-systemctl start wg-quick@wgcf >/dev/null 2>&1
-systemctl restart warp-go >/dev/null 2>&1
-systemctl enable warp-go >/dev/null 2>&1
-systemctl start warp-go >/dev/null 2>&1
-return "$result"
+local addresses v4 v6
+addresses=$(warp_unrouted_ips node) || return 1
+v4=${addresses%%$'\n'*}; v6=${addresses#*$'\n'}; v4=${v4#-}; v6=${v6#-}
+if [[ -s /etc/s-box/server_ipcl.log ]]; then
+    local previous
+    previous=$(< /etc/s-box/server_ipcl.log)
+    if [[ ( $previous == *:* && -z $v6 ) || ( $previous != *:* && -z $v4 ) ]]; then
+        red "原节点地址族探测失败，已保留节点地址"; return 1
+    fi
 fi
+ipuuid verified
 }
 
 result_vl_vm_hy_tu(){
@@ -1818,30 +2078,39 @@ server_ip=$(cat /etc/s-box/server_ip.log)
 server_ipcl=$(cat /etc/s-box/server_ipcl.log)
 uuid=$(config_get vless-sb '.users[0].uuid') || return 1
 vl_port=$(config_get vless-sb '.listen_port') || return 1
-vl_name=$(config_get vless-sb '.tls.server_name') || return 1
+vl_name=$(config_get vless-sb '.tls.server_name') && sub_valid_domain "$vl_name" || return 1
 public_key=$(cat /etc/s-box/public.key)
 short_id=$(config_get vless-sb '.tls.reality.short_id[0]') || return 1
-argo=$(cat /etc/s-box/argo.log 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
-argogd=$(cat /etc/s-box/sbargoym.log 2>/dev/null)
+argo=$(quick_tunnel_hostname)
+argogd=
+if [[ -e /etc/s-box/sbargoym.log ]]; then
+    argogd=$(cat /etc/s-box/sbargoym.log) && sub_valid_domain "$argogd" || return 1
+fi
 ws_path=$(config_get vmess-sb '.transport.path') || return 1
 if [[ ${ws_path,,} == *"${uuid,,}"* ]]; then yellow "旧 WS 路径含凭据；通过 3 → 2 → 3 迁移并刷新所有客户端" >&2; fi
 vm_port=$(config_get vmess-sb '.listen_port') || return 1
 tls=$(config_get vmess-sb '.tls.enabled') || return 1
-vm_name=$(config_get vmess-sb '.tls.server_name') || return 1
+vm_name=$(config_get vmess-sb '.tls.server_name') && sub_valid_domain "$vm_name" || return 1
 local vm_cert
 vm_cert=$(config_get vmess-sb '.tls.certificate_path') || return 1
 vm_self=false
 if [[ $tls == true && $vm_cert == /etc/s-box/cert.pem ]]; then
     selfsigned_material "$vm_cert" "$vm_name" >/dev/null || return 1
     vm_self=true; vmadd_local=$server_ipcl; vmadd_are_local=$server_ip
-elif [[ -s /etc/s-box/cfvmadd_local.txt ]]; then
+elif [[ -e /etc/s-box/cfvmadd_local.txt ]]; then
     vmadd_local=$(cat /etc/s-box/cfvmadd_local.txt) || return 1
+    valid_node_address "$vmadd_local" || return 1
     vmadd_are_local=$vmadd_local
 else
     vmadd_local=$vm_name; vmadd_are_local=$vm_name
 fi
+if [[ -e /etc/s-box/cfymjx.txt ]]; then
+    local host_override
+    host_override=$(cat /etc/s-box/cfymjx.txt) && sub_valid_domain "$host_override" || return 1
+    [[ $vm_self == true ]] || vm_name=$host_override
+fi
 if [[ -f /etc/s-box/cfvmadd_argo.txt ]]; then
-vmadd_argo=$(cat /etc/s-box/cfvmadd_argo.txt 2>/dev/null)
+vmadd_argo=$(cat /etc/s-box/cfvmadd_argo.txt) && valid_node_address "$vmadd_argo" || return 1
 else
 vmadd_argo=cloudflare-ech.com
 fi
@@ -1854,7 +2123,6 @@ sbhy2pt=$(echo "$hy2_ports" | grep -o '[0-9]\+:[0-9]\+' | sed 's/.*/"&"/' | past
 else
 hyps=
 fi
-ym=$(cat /root/ygkkkca/ca.log 2>/dev/null)
 hy2_sniname=$(config_get hy2-sb '.tls.key_path') || return 1
 if [[ "$hy2_sniname" = '/etc/s-box/private.key' ]]; then
 local material
@@ -1866,13 +2134,13 @@ sb_hy2_ip=$server_ip
 cl_hy2_ip=$server_ipcl
 hy2_self=true
 else
+ym=$(acme_hostname) || return 1
 hy2_name=$ym
 sb_hy2_ip=$ym
 cl_hy2_ip=$ym
 hy2_self=false; SHA256=
 fi
 tu5_port=$(config_get tuic5-sb '.listen_port') || return 1
-ym=$(cat /root/ygkkkca/ca.log 2>/dev/null)
 tu5_sniname=$(config_get tuic5-sb '.tls.key_path') || return 1
 if [[ "$tu5_sniname" = '/etc/s-box/private.key' ]]; then
 tu5_name=www.bing.com
@@ -1880,20 +2148,21 @@ sb_tu5_ip=$server_ip
 cl_tu5_ip=$server_ipcl
 tu5_self=true
 else
+ym=$(acme_hostname) || return 1
 tu5_name=$ym
 sb_tu5_ip=$ym
 cl_tu5_ip=$ym
 tu5_self=false
 fi
 an_port=; [[ "$sbnh" == "1.10" ]] || an_port=$(config_get anytls-sb '.listen_port') || return 1
-ym=$(cat /root/ygkkkca/ca.log 2>/dev/null)
 an_sniname=; [[ "$sbnh" == "1.10" ]] || an_sniname=$(config_get anytls-sb '.tls.key_path') || return 1
 if [[ "$an_sniname" = '/etc/s-box/private.key' ]]; then
 an_name=www.bing.com
 sb_an_ip=$server_ip
 cl_an_ip=$server_ipcl
 an_self=true
-else
+elif [[ "$sbnh" != 1.10 ]]; then
+ym=$(acme_hostname) || return 1
 an_name=$ym
 sb_an_ip=$ym
 cl_an_ip=$ym
@@ -1912,7 +2181,7 @@ echo "分享链接【v2ran(切换singbox内核)、nekobox、小火箭shadowrocke
 echo -e "${yellow}$vl_link${plain}"
 echo
 echo "二维码【v2ran(切换singbox内核)、nekobox、小火箭shadowrocket】"
-qrencode -o - -t ANSIUTF8 "$(cat /etc/s-box/vl_reality.txt)"
+printf '%s' "$vl_link" | qrencode -o - -t ANSIUTF8
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
 }
@@ -1923,8 +2192,9 @@ local vm_link
 vmess_encode(){
 (
 set -o pipefail
-jq -cn --arg add "$1" --arg host "$2" --arg port "$3" --arg name "$4" --arg tls "$5" \
-  --arg uuid "$uuid" --arg path "$ws_path" '
+printf '%s\0%s' "$uuid" "$ws_path" | jq -Rsc --arg add "$1" --arg host "$2" --arg port "$3" --arg name "$4" --arg tls "$5" \
+  '
+  split("\u0000") as [$uuid,$path] |
   {add:$add,aid:"0",host:$host,id:$uuid,net:"ws",path:$path,port:$port,
    ps:$name,tls:$tls,type:"none",v:"2"} +
   (if $tls == "tls" then {sni:$host,fp:"chrome"} else {} end)
@@ -1932,7 +2202,7 @@ jq -cn --arg add "$1" --arg host "$2" --arg port "$3" --arg name "$4" --arg tls 
 )
 }
 if [[ "$tls" = "false" ]]; then
-if [[ -n $argo ]] && ps -ef 2>/dev/null | grep "[l]ocalhost:$(config_get vmess-sb '.listen_port')" >/dev/null 2>&1; then
+if [[ -n $argo ]] && project_process temporary "$vm_port" status; then
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 red "🚀【 vmess-ws(tls)+Argo 】临时节点信息如下(可选择3-8-3，自定义CDN优选地址)：" && { [[ ! -t 1 ]] || sleep 2; }
@@ -1943,9 +2213,9 @@ echo -e "${yellow}vmess://$vm_link${plain}"
 echo
 echo "二维码【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo "vmess://$vm_link" > /etc/s-box/vm_ws_argols.txt || return 1
-qrencode -o - -t ANSIUTF8 "$(cat /etc/s-box/vm_ws_argols.txt)"
+printf '%s' "vmess://$vm_link" | qrencode -o - -t ANSIUTF8
 fi
-if [[ -n $argogd ]] && ps -ef 2>/dev/null | grep '[c]loudflared.*run' >/dev/null; then
+if [[ -n $argogd ]] && project_process fixed '' status; then
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 red "🚀【 vmess-ws(tls)+Argo 】固定节点信息如下 (可选择3-8-3，自定义CDN优选地址)：" && { [[ ! -t 1 ]] || sleep 2; }
@@ -1956,7 +2226,7 @@ echo -e "${yellow}vmess://$vm_link${plain}"
 echo
 echo "二维码【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo "vmess://$vm_link" > /etc/s-box/vm_ws_argogd.txt || return 1
-qrencode -o - -t ANSIUTF8 "$(cat /etc/s-box/vm_ws_argogd.txt)"
+printf '%s' "vmess://$vm_link" | qrencode -o - -t ANSIUTF8
 fi
 blue "明文 WS 仅用于回环隧道后端；启用 Argo 后分发公网 WSS 节点"
 else
@@ -1970,7 +2240,7 @@ echo -e "${yellow}vmess://$vm_link${plain}"
 echo
 echo "二维码【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo "vmess://$vm_link" > /etc/s-box/vm_ws_tls.txt || return 1
-qrencode -o - -t ANSIUTF8 "$(cat /etc/s-box/vm_ws_tls.txt)"
+printf '%s' "vmess://$vm_link" | qrencode -o - -t ANSIUTF8
 fi
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
@@ -1989,7 +2259,7 @@ echo "分享链接【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}$hy2_link${plain}"
 echo
 echo "二维码【v2rayn、v2rayng、nekobox、小火箭shadowrocket】"
-qrencode -o - -t ANSIUTF8 "$(cat /etc/s-box/hy2.txt)"
+printf '%s' "$hy2_link" | qrencode -o - -t ANSIUTF8
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
 }
@@ -2006,7 +2276,7 @@ echo "分享链接【v2rayn、nekobox、小火箭shadowrocket】"
 echo -e "${yellow}$tuic5_link${plain}"
 echo
 echo "二维码【v2rayn、nekobox、小火箭shadowrocket】"
-qrencode -o - -t ANSIUTF8 "$(cat /etc/s-box/tuic5.txt)"
+printf '%s' "$tuic5_link" | qrencode -o - -t ANSIUTF8
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
 }
@@ -2023,7 +2293,7 @@ echo "分享链接【v2rayn、小火箭shadowrocket】"
 echo -e "${yellow}$an_link${plain}"
 echo
 echo "二维码【v2rayn、nekobox、小火箭shadowrocket】"
-qrencode -o - -t ANSIUTF8 "$(cat /etc/s-box/an.txt)"
+printf '%s' "$an_link" | qrencode -o - -t ANSIUTF8
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
 }
@@ -2160,6 +2430,10 @@ chmod 600 "$register_dir/validated.json" && mv -f -- "$register_dir/validated.js
 }
 
 client_warp_apply(){
+config_locked client_warp_apply_locked "$@"
+}
+
+client_warp_apply_locked(){
 (
 local candidate=$1 apply_dir client_warp_config_file sub_switching=0
 umask 077
@@ -2273,7 +2547,11 @@ done
 sb_client(){
 (
 local publish_dir sb_all sb_any1 sb_any2 cl_all cl_any1 cl_any2 sb_hy2ports vm_listen_port extra_data extra_piece
-local client_destination=${1:-/etc/s-box}
+local client_destination=${1:-/etc/s-box} rules_revision=sing
+if [[ -e /etc/s-box/client-rules-revision ]]; then
+    rules_revision=$(cat /etc/s-box/client-rules-revision) || exit 1
+    [[ $rules_revision =~ ^[0-9a-f]{40}$ ]] || { red "地域规则版本必须为已审查的 40 位小写提交号"; exit 1; }
+fi
 local cert_json fingerprint material hy2_sb_cert= tu5_sb_cert= an_sb_cert= hy2_cl_pin= tu5_cl_pin= an_cl_pin=
 if [[ $vm_self == true || $hy2_self == true || $tu5_self == true || $an_self == true ]]; then
     material=$(selfsigned_material /etc/s-box/cert.pem www.bing.com) || exit 1
@@ -2432,13 +2710,15 @@ cat <<EOF
         "tag": "geosite-cn",
         "type": "remote",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/cn.srs"
+        "update_interval": "1d",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@$rules_revision/geo/geosite/cn.srs"
       },
       {
         "tag": "geoip-cn",
         "type": "remote",
         "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip/cn.srs"
+        "update_interval": "1d",
+        "url": "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@$rules_revision/geo/geoip/cn.srs"
       }
     ],
     "rules": [
@@ -2495,11 +2775,6 @@ cat <<EOF
     "cache_file": {
       "enabled": true,
       "store_dns": true
-    },
-    "clash_api": {
-      "external_controller": "127.0.0.1:9090",
-      "external_ui": "ui",
-      "default_mode": "Rule"
     }
   },
   "outbounds": [
@@ -2688,8 +2963,8 @@ local -a vm_nodes=()
 if [[ $tls == true ]]; then
     vm_nodes+=(direct)
 else
-    if [[ -n $argo ]] && ps -ef | grep "[l]ocalhost:$vm_listen_port" >/dev/null; then vm_nodes+=(temporary); fi
-    if [[ -n $argogd ]] && ps -ef | grep '[c]loudflared.*run' >/dev/null; then vm_nodes+=(fixed); fi
+    if [[ -n $argo ]] && project_process temporary "$vm_listen_port" status; then vm_nodes+=(temporary); fi
+    if [[ -n $argogd ]] && project_process fixed '' status; then vm_nodes+=(fixed); fi
 fi
 for vm_node in "${vm_nodes[@]}"; do
     case "$vm_node" in
@@ -2699,18 +2974,20 @@ for vm_node in "${vm_nodes[@]}"; do
     esac
     local node_port=443
     [[ $vm_node != direct ]] || node_port=$vm_port
-    extra_piece=$(jq -cn --arg server "$vm_server" --arg host "$vm_host" --arg name "$vm_tag" \
-        --arg uuid "$uuid" --arg path "$ws_path" --argjson port "$node_port" --argjson trust "${cert_json:-null}" --arg self "$vm_self" \
-        '{type:"vmess",tag:$name,server:$server,server_port:$port,uuid:$uuid,security:"auto",
+    extra_piece=$(printf '%s\0%s' "$uuid" "$ws_path" | jq -Rsc --arg server "$vm_server" --arg host "$vm_host" --arg name "$vm_tag" \
+        --argjson port "$node_port" --argjson trust "${cert_json:-null}" --arg self "$vm_self" \
+        'split("\u0000") as [$uuid,$path] |
+         {type:"vmess",tag:$name,server:$server,server_port:$port,uuid:$uuid,security:"auto",
           tls:({enabled:true,server_name:$host,utls:{enabled:true,fingerprint:"chrome"}} +
                (if $self=="true" then {certificate:$trust} else {} end)),
           transport:{type:"ws",path:$path,headers:{Host:[$host]}}} | tojson + ","' -r) || exit 1
     sb_any2+=$'\n'"$extra_piece"
     extra_piece=$(jq -nr --arg name "$vm_tag" '$name|tojson + ","') || exit 1
     sb_any1+=$'\n'"$extra_piece"
-    extra_piece=$(jq -cn --arg server "$vm_server" --arg host "$vm_host" --arg name "$vm_cl_name" \
-        --arg uuid "$uuid" --arg path "$ws_path" --argjson port "$node_port" --arg dialer "$client_warp_dialer" --arg self "$vm_self" --arg pin "$fingerprint" \
-        '{type:"vmess",name:$name,server:$server,port:$port,uuid:$uuid,alterId:0,cipher:"auto",udp:true,
+    extra_piece=$(printf '%s\0%s' "$uuid" "$ws_path" | jq -Rsc --arg server "$vm_server" --arg host "$vm_host" --arg name "$vm_cl_name" \
+        --argjson port "$node_port" --arg dialer "$client_warp_dialer" --arg self "$vm_self" --arg pin "$fingerprint" \
+        'split("\u0000") as [$uuid,$path] |
+         {type:"vmess",name:$name,server:$server,port:$port,uuid:$uuid,alterId:0,cipher:"auto",udp:true,
           tls:true,network:"ws",servername:$host,"ws-opts":{path:$path,headers:{Host:$host}}}
           + (if $self=="true" then {fingerprint:$pin} else {} end)
           + (if $dialer!="" then {"dialer-proxy":"WARP-前置"} else {} end) | "- " + tojson' -r) || exit 1
@@ -2742,7 +3019,7 @@ $sb_any1
         "hy2-$hostname",
         "tuic5-$hostname"
             ],
-            "url": "http://www.gstatic.com/generate_204",
+            "url": "https://www.gstatic.com/generate_204",
             "interval": "10m",
             "tolerance": 30,
             "idle_timeout": "30m"
@@ -2852,10 +3129,24 @@ fi
 /etc/s-box/cloudflared version
 }
 
+argo_unit_owned(){
+local unit=/etc/systemd/system/argo.service
+if command -v rc-service >/dev/null 2>&1; then
+    grep -Eq '^command="/etc/s-box/cloudflared( tunnel)?"$' /etc/init.d/argo 2>/dev/null
+else
+    grep -Fq 'ExecStart=/etc/s-box/cloudflared tunnel ' "$unit" &&
+        [[ $(systemctl show -p FragmentPath --value argo) == "$unit" ]] &&
+        [[ $(systemctl show -p ExecStart --value argo) == *"path=/etc/s-box/cloudflared ;"* ]]
+fi
+}
+
 cfargoym(){
+local fixed_host
 echo
 if [[ -f /etc/s-box/sbargotoken.log && -f /etc/s-box/sbargoym.log ]]; then
-green "当前Argo固定隧道域名：$(cat /etc/s-box/sbargoym.log 2>/dev/null)"
+fixed_host=$(cat /etc/s-box/sbargoym.log)
+if sub_valid_domain "$fixed_host"; then green "当前 Argo 固定隧道域名：$fixed_host"
+else yellow "现有固定隧道域名无效，请重新设置"; fi
 green "固定隧道凭据已配置"
 fi
 echo
@@ -2865,16 +3156,19 @@ yellow "2：停止Argo固定隧道"
 yellow "0：返回上层"
 readp "请选择【0-2】：" menu
 if [ "$menu" = "1" ]; then
-cloudflaredargo || return 1
 IFS= read -rs -p "输入 Argo 固定隧道 Token：" argotoken || return 1
 printf '\n'
-readp "输入Argo固定隧道域名: " argoym
+readp "输入Argo固定隧道域名: " argoym || return 1
+sub_valid_domain "$argoym" && [[ -n $argotoken ]] || { red "固定隧道域名或 Token 无效"; return 1; }
 vm_port=$(config_get vmess-sb '.listen_port') || return 1
 echo
-yellow "注意！Zero Trust设置固定隧道URL端口填写Vmess端口：localhost:$vm_port"
+yellow "Zero Trust 的固定隧道源站请填写 http://127.0.0.1:$vm_port"
+if [[ -e /etc/init.d/argo || -e /etc/systemd/system/argo.service || -n $(systemctl show -p FragmentPath --value argo 2>/dev/null) ]]; then
+    argo_unit_owned || { red "已存在其他 argo 服务，请先解决服务名冲突"; return 1; }
+fi
+cloudflaredargo || return 1
 echo
-pid=$(ps -ef 2>/dev/null | awk '/[c]loudflared.*run/ {print $2}')
-[ -n "$pid" ] && kill -9 "$pid" >/dev/null 2>&1
+project_process fixed '' stop || return 1
 echo
 if [[ -n "${argotoken}" && -n "${argoym}" ]]; then
 (umask 077; printf '%s' "$argotoken" > /etc/s-box/sbargotoken.log) || return 1
@@ -2896,13 +3190,13 @@ WantedBy=multi-user.target
 EOF
 systemctl daemon-reload >/dev/null 2>&1
 systemctl enable argo >/dev/null 2>&1
-systemctl start argo >/dev/null 2>&1
+systemctl restart argo >/dev/null 2>&1 || return 1
 elif command -v rc-service >/dev/null 2>&1; then
 cat > /etc/init.d/argo <<EOF
 #!/sbin/openrc-run
 description="argo service"
-command="/etc/s-box/cloudflared tunnel"
-command_args="--no-autoupdate --edge-ip-version auto --protocol http2 run --token-file /etc/s-box/sbargotoken.log"
+command="/etc/s-box/cloudflared"
+command_args="tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token-file /etc/s-box/sbargotoken.log"
 pidfile="/run/argo.pid"
 command_background="yes"
 depend() {
@@ -2911,15 +3205,16 @@ need net
 EOF
 chmod +x /etc/init.d/argo >/dev/null 2>&1
 rc-update add argo default >/dev/null 2>&1
-rc-service argo start >/dev/null 2>&1
+rc-service argo restart >/dev/null 2>&1 || return 1
 fi
 fi
-echo ${argoym} > /etc/s-box/sbargoym.log
+printf '%s\n' "$argoym" > /etc/s-box/sbargoym.log || return 1
 
 argosh=$(cat /etc/s-box/sbargoym.log 2>/dev/null)
 sbshare > /dev/null 2>&1
 blue "Argo固定隧道设置完成，固定域名：$argosh"
 elif [ "$menu" = "2" ]; then
+argo_unit_owned || { red "未识别项目管理的 argo 服务"; return 1; }
 if pidof systemd >/dev/null 2>&1; then
 systemctl stop argo >/dev/null 2>&1
 systemctl disable argo >/dev/null 2>&1
@@ -2929,7 +3224,7 @@ rc-service argo stop >/dev/null 2>&1
 rc-update del argo default >/dev/null 2>&1
 rm -rf /etc/init.d/argo
 fi
-rm -rf /etc/s-box/vm_ws_argogd.txt /etc/s-box/cloudflared
+rm -f -- /etc/s-box/vm_ws_argogd.txt /etc/s-box/sbargoym.log /etc/s-box/sbargotoken.log
 sbshare > /dev/null 2>&1
 green "Argo固定隧道已停止"
 else
@@ -2946,18 +3241,19 @@ readp "请选择【0-2】：" menu
 if [ "$menu" = "1" ]; then
 green "请稍等……"
 cloudflaredargo || return 1
-ps -ef | grep "[l]ocalhost:$(config_get vmess-sb '.listen_port')" | awk '{print $2}' | xargs kill 2>/dev/null
-nohup /etc/s-box/cloudflared tunnel --url http://localhost:$(config_get vmess-sb '.listen_port') --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 &
+vm_port=$(config_get vmess-sb '.listen_port') && sub_valid_port "$vm_port" && project_process temporary "$vm_port" stop || return 1
+nohup /etc/s-box/cloudflared tunnel --url "http://127.0.0.1:$vm_port" --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 &
 sleep 20
-if [[ -n $(curl -sL https://$(cat /etc/s-box/argo.log 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')/ -I | awk 'NR==1 && /404|400|503/') ]]; then
-argo=$(cat /etc/s-box/argo.log 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')
+argo=$(quick_tunnel_hostname)
+if [[ -n $argo ]] && status=$(curl -q -sIL --proto '=https' --proto-redir '=https' --max-time 8 -o /dev/null -w '%{http_code}' "https://$argo/") && [[ $status =~ ^(400|404|503)$ ]]; then
 sbshare > /dev/null 2>&1
 blue "Argo临时隧道申请成功，域名验证有效：$argo" && sleep 2
 if command -v apk >/dev/null 2>&1; then
 cat > /etc/local.d/alpineargo.start <<'EOF'
 #!/bin/bash
 sleep 10
-nohup /etc/s-box/cloudflared tunnel --url http://localhost:$(jq -r '.inbounds[] | select(.tag == "vmess-sb") | .listen_port' /etc/s-box/sb.json) --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 &
+port=$(jq -er '.inbounds[] | select(.tag == "vmess-sb") | .listen_port | numbers | select(. >= 1 and . <= 65535)' /etc/s-box/sb.json) || exit 1
+nohup /etc/s-box/cloudflared tunnel --url "http://127.0.0.1:$port" --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 &
 sleep 10
 printf "9\n1\n" | bash /usr/bin/sing_box > /dev/null 2>&1
 EOF
@@ -2969,7 +3265,7 @@ cron_tmp=$(mktemp) || return 1
 crontab -l 2>/dev/null > "$cron_tmp"
 sed -i '/^@reboot .*\/etc\/s-box\/cloudflared tunnel --url /d' "$cron_tmp" || return 1
 cat >> "$cron_tmp" <<'ARGO_CRON'
-@reboot sleep 10 && /bin/bash -c 'port=$(jq -er ".inbounds[] | select(.tag == \"vmess-sb\") | .listen_port" /etc/s-box/sb.json) || exit 1; nohup /etc/s-box/cloudflared tunnel --url "http://localhost:$port" --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 & sleep 10; printf "9\n1\n" | /usr/bin/sing_box >/dev/null 2>&1'
+@reboot sleep 10 && /bin/bash -c 'port=$(jq -er ".inbounds[] | select(.tag == \"vmess-sb\") | .listen_port" /etc/s-box/sb.json) || exit 1; nohup /etc/s-box/cloudflared tunnel --url "http://127.0.0.1:$port" --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 & sleep 10; printf "9\n1\n" | /usr/bin/sing_box >/dev/null 2>&1'
 ARGO_CRON
 crontab "$cron_tmp" >/dev/null 2>&1
 rm "$cron_tmp"
@@ -2978,14 +3274,14 @@ else
 yellow "Argo临时域名验证暂不可用，请稍后再试"
 fi
 elif [ "$menu" = "2" ]; then
-ps -ef | grep "[l]ocalhost:$(config_get vmess-sb '.listen_port')" | awk '{print $2}' | xargs kill 2>/dev/null
+vm_port=$(config_get vmess-sb '.listen_port') && project_process temporary "$vm_port" stop
 local cron_tmp
 cron_tmp=$(mktemp) || return 1
 crontab -l 2>/dev/null > "$cron_tmp"
 sed -i '/^@reboot .*\/etc\/s-box\/cloudflared tunnel --url /d' "$cron_tmp" || return 1
 crontab "$cron_tmp" >/dev/null 2>&1
 rm "$cron_tmp"
-rm -rf /etc/s-box/vm_ws_argols.txt /etc/s-box/cloudflared
+rm -f -- /etc/s-box/vm_ws_argols.txt /etc/s-box/argo.log
 rm -rf /etc/local.d/alpineargo.start
 sbshare > /dev/null 2>&1
 green "Argo临时隧道已停止"
@@ -2995,8 +3291,12 @@ fi
 }
 
 instsllsingbox(){
-if [[ -e /etc/s-box/sb.json || -f '/etc/systemd/system/sing-box.service' ]]; then
-red "已存在 sing-box 配置或服务，已保留原部署" && exit
+config_locked instsllsingbox_locked "$@"
+}
+
+instsllsingbox_locked(){
+if [[ -e /etc/s-box/sb.json || $(singbox_unit_state) != absent ]]; then
+red "已存在 sing-box 配置、同名服务或无法确认服务状态，已保留原部署"; return 1
 fi
 ensure_dependencies && setup_tun || return 1
 install -d -m 700 /etc/s-box || return 1
@@ -3026,8 +3326,7 @@ red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 awk -F '更新内容' 'NR==1 {print $1}' "$SB_RELEASE_DIR/version" > /etc/s-box/v
 blue "sing-box脚本安装成功，脚本快捷方式：sing_box" && cronsb
 echo
-wgcfgo
-sbshare
+wgcfgo && sbshare || return 1
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 blue "可选择9，刷新并显示所有协议配置及分享链接"
 red "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
@@ -3035,6 +3334,12 @@ echo
 }
 
 changeym(){
+local result
+config_locked changeym_locked "$@"; result=$?
+if [[ $result == 10 ]]; then sing_box; else return "$result"; fi
+}
+
+changeym_locked(){
 local menu tag domain current patch cert key enabled
 green "请选择要切换域名/证书模式的协议"
 green "1：Vless Reality 域名：$(config_get vless-sb '.tls.server_name')"
@@ -3052,6 +3357,7 @@ case "$menu" in
 1)
 readp "请输入vless-reality域名 (回车使用apple.com)：" domain || return 1
 domain=${domain:-apple.com}
+sub_valid_domain "$domain" || { red "Reality 域名无效"; return 1; }
 tag=vless-sb
 patch=$(jq -cn --arg domain "$domain" '{tls:{server_name:$domain,reality:{handshake:{server:$domain}}}}') || return 1
 ;;
@@ -3060,7 +3366,7 @@ tag=vmess-sb
 readp "1：自签 WSS 直连；2：ACME WSS 直连；3：仅回环 WS（Argo）：" menu || return 1
 case "$menu" in
 1|3) cert=/etc/s-box/cert.pem; key=/etc/s-box/private.key; domain=www.bing.com ;;
-2) cert=/root/ygkkkca/cert.crt; key=/root/ygkkkca/private.key; domain=$(cat /root/ygkkkca/ca.log) || return 1 ;;
+2) cert=/root/ygkkkca/cert.crt; key=/root/ygkkkca/private.key; domain=$(acme_hostname) || return 1 ;;
 *) return 1 ;;
 esac
 enabled=true; [[ $menu != 3 ]] || enabled=false
@@ -3078,6 +3384,7 @@ esac
 current=$(config_get "$tag" '.tls') || return 1
 key=$(jq -r '.key_path' <<< "$current") || return 1
 if [[ "$key" == /etc/s-box/private.key ]]; then
+acme_hostname >/dev/null || return 1
 cert=/root/ygkkkca/cert.crt; key=/root/ygkkkca/private.key
 else
 cert=/etc/s-box/cert.pem; key=/etc/s-box/private.key
@@ -3085,7 +3392,7 @@ fi
 patch=$(jq -cn --arg cert "$cert" --arg key "$key" '{tls:{certificate_path:$cert,key_path:$key}}') || return 1
 
 ;;
-*) sing_box; return ;;
+*) return 10 ;;
 esac
 config_apply config_patch_inbound "$tag" "$patch" && config_refresh || return 1
 blue "协议域名/证书设置已更新"
@@ -3231,6 +3538,12 @@ fi
 }
 
 changeuuid(){
+local result
+config_locked changeuuid_locked "$@"; result=$?
+if [[ $result == 10 ]]; then changeserv; else return "$result"; fi
+}
+
+changeuuid_locked(){
 local menu uuid path old
 old=$(config_get vless-sb '.users[0].uuid') || return 1
 path=$(config_get vmess-sb '.transport.path') || return 1
@@ -3265,7 +3578,7 @@ local patch
 patch=$(jq -cn --arg path "$path" '{transport:{path:$path}}') || return 1
 config_apply config_patch_inbound vmess-sb "$patch" && config_refresh || return 1
 ;;
-*) changeserv; return ;;
+*) return 10 ;;
 esac
 blue "已确认Vmess的path路径：$(config_get vmess-sb '.transport.path')"
 }
@@ -3285,9 +3598,10 @@ jq -er '
       one("默认 direct 路由")) as $route |
     [.route.rules | to_entries[] |
       select(.value.action == "resolve" and
-             ((.value | keys) - ["action", "strategy"] | length) == 0)] as $resolve |
+             (((.value | keys) - ["action", "strategy"] | length) == 0 or
+               (.value | del(.action,.strategy)) == {ip_cidr:["0.0.0.0/0","::/0"],invert:true}))] as $resolve |
     if ($resolve | length) == 0 then "default"
-    elif ($resolve | length) == 1 and $resolve[0].key == ($route - 1)
+    elif ($resolve | length) == 1 and ($resolve[0].key == ($route - 1) or ($resolve[0].key < $route and $resolve[0].value.invert == true))
     then $resolve[0].value.strategy // "default"
     else error("默认解析规则位置不明确") end
   end
@@ -3313,7 +3627,8 @@ jq -e --arg series "$3" --arg strategy "$4" '
     ([.outbounds | to_entries[] |
       select(.value.type == "direct" and .value.tag == "direct") | .key] |
       one("默认 direct 出站")) as $direct |
-    .outbounds[$direct].domain_strategy = $strategy
+    .outbounds[$direct].domain_strategy = $strategy |
+    (.inbounds[]? | select(has("domain_strategy")).domain_strategy) = $strategy
   else
     ([.route.rules | to_entries[] |
       select(.value.outbound == "direct" and .value.network == "udp,tcp" and
@@ -3322,10 +3637,15 @@ jq -e --arg series "$3" --arg strategy "$4" '
       one("默认 direct 路由")) as $route |
     [.route.rules | to_entries[] |
       select(.value.action == "resolve" and
-             ((.value | keys) - ["action", "strategy"] | length) == 0) | .key] as $resolve |
-    if ($resolve | length) == 0 then
+             (((.value | keys) - ["action", "strategy"] | length) == 0 or
+               (.value | del(.action,.strategy)) == {ip_cidr:["0.0.0.0/0","::/0"],invert:true})) | .key] as $resolve |
+    if ($resolve | length) == 0 and any(.route.rules[]; .invert==true and .action=="reject" and .ip_cidr==["0.0.0.0/0","::/0"]) then
+      ([.route.rules | to_entries[] | select(.value.action=="reject" and
+          (.value.ip_cidr // [] | index("100.64.0.0/10")) != null) | .key] | one("目标地址保护规则")) as $guard |
+      .route.rules |= .[:$guard] + [{action:"resolve",strategy:$strategy,invert:true,ip_cidr:["0.0.0.0/0","::/0"]}] + .[$guard:]
+    elif ($resolve | length) == 0 then
       .route.rules |= .[:$route] + [{"action":"resolve", "strategy":$strategy}] + .[$route:]
-    elif ($resolve | length) == 1 and $resolve[0] == ($route - 1)
+    elif ($resolve | length) == 1 and ($resolve[0] == ($route - 1) or ($resolve[0] < $route and .route.rules[$resolve[0]].invert == true))
     then .route.rules[$resolve[0]].strategy = $strategy
     else error("默认解析规则位置不明确") end
   end
@@ -3333,6 +3653,7 @@ jq -e --arg series "$3" --arg strategy "$4" '
 }
 
 ip_priority_restart(){
+[[ ! -e /etc/s-box/admin-stopped ]] || return 0
 restartsb "$@" || return 1
 # Type=simple can acknowledge restart before the process fails during startup.
 sleep 1
@@ -3369,6 +3690,10 @@ jq -e --arg ipv4 "$3" --arg ipv6 "$4" '
 }
 
 egress_apply(){
+config_locked egress_apply_locked "$@"
+}
+
+egress_apply_locked(){
 (
 local family=$1 source=$2 egress_ipv4 egress_ipv6 work file url verified=0 restore=0 had_state=0 failed=0
 local -a check_args
@@ -3405,6 +3730,7 @@ red "恢复配置失败，剩余备份保留在 $work"
 return 1
 fi
 ip_priority_restart >/dev/null 2>&1 || red "原配置已恢复，但服务启动失败，请查看运行日志"
+[[ ! -f /etc/s-box/firewall.json ]] || firewall_sync || red "恢复原配置后的防火墙同步失败"
 red "出站源地址切换失败，已恢复原配置和地址设置"
 fi
 rm -rf -- "$work"
@@ -3433,6 +3759,7 @@ for file in sb10.json sb11.json sb.json egress.json; do
 mv -f -- "$work/$file" "/etc/s-box/$file" || exit 1
 done
 ip_priority_restart checked || exit 1
+[[ ! -f /etc/s-box/firewall.json ]] || firewall_sync || exit 1
 restore=0
 )
 }
@@ -3553,159 +3880,87 @@ done
 }
 
 tgsbshow(){
-echo
-yellow "1：重置/设置Telegram机器人的Token、用户ID"
-yellow "0：返回上层"
-readp "请选择【0-1】：" menu
-if [ "$menu" = "1" ]; then
-rm -rf /etc/s-box/sbtg.sh
-readp "输入Telegram机器人Token: " token
-telegram_token=$token
-readp "输入Telegram机器人用户ID: " userid
-telegram_id=$userid
-echo '#!/bin/bash
-export LANG=en_US.UTF-8
-sbnh=$(/etc/s-box/sing-box version 2>/dev/null | awk '/version/{print $NF}' 2>/dev/null | cut -d '.' -f 1,2)
-total_lines=$(wc -l < /etc/s-box/clmi.yaml)
-half=$((total_lines / 2))
-head -n $half /etc/s-box/clmi.yaml > /etc/s-box/clash_meta_client1.txt
-tail -n +$((half + 1)) /etc/s-box/clmi.yaml > /etc/s-box/clash_meta_client2.txt
-
-total_lines=$(wc -l < /etc/s-box/sbox.json)
-quarter=$((total_lines / 4))
-head -n $quarter /etc/s-box/sbox.json > /etc/s-box/sing_box_client1.txt
-tail -n +$((quarter + 1)) /etc/s-box/sbox.json | head -n $quarter > /etc/s-box/sing_box_client2.txt
-tail -n +$((2 * quarter + 1)) /etc/s-box/sbox.json | head -n $quarter > /etc/s-box/sing_box_client3.txt
-tail -n +$((3 * quarter + 1)) /etc/s-box/sbox.json > /etc/s-box/sing_box_client4.txt
-
-m1=$(cat /etc/s-box/vl_reality.txt 2>/dev/null)
-m2=$(cat /etc/s-box/vm_ws.txt 2>/dev/null)
-m3=$(cat /etc/s-box/vm_ws_argols.txt 2>/dev/null)
-m3_5=$(cat /etc/s-box/vm_ws_argogd.txt 2>/dev/null)
-m4=$(cat /etc/s-box/vm_ws_tls.txt 2>/dev/null)
-m5=$(cat /etc/s-box/hy2.txt 2>/dev/null)
-m6=$(cat /etc/s-box/tuic5.txt 2>/dev/null)
-m7=$(cat /etc/s-box/sing_box_client1.txt 2>/dev/null)
-m7_5=$(cat /etc/s-box/sing_box_client2.txt 2>/dev/null)
-m7_5_5=$(cat /etc/s-box/sing_box_client3.txt 2>/dev/null)
-m7_5_5_5=$(cat /etc/s-box/sing_box_client4.txt 2>/dev/null)
-m8=$(cat /etc/s-box/clash_meta_client1.txt 2>/dev/null)
-m8_5=$(cat /etc/s-box/clash_meta_client2.txt 2>/dev/null)
-m9=$(if [[ -s /etc/s-box/subdomain.log && -s /etc/s-box/subtoken.log ]]; then printf "https://%s/%s/sbox.json" "$(cat /etc/s-box/subdomain.log)" "$(cat /etc/s-box/subtoken.log)"; fi)
-m10=$(if [[ -s /etc/s-box/subdomain.log && -s /etc/s-box/subtoken.log ]]; then printf "https://%s/%s/clmi.yaml" "$(cat /etc/s-box/subdomain.log)" "$(cat /etc/s-box/subtoken.log)"; fi)
-m11=$(cat /etc/s-box/jhsub.txt 2>/dev/null)
-m12=$(cat /etc/s-box/an.txt 2>/dev/null)
-message_text_m1=$(echo "$m1")
-message_text_m2=$(echo "$m2")
-message_text_m3=$(echo "$m3")
-message_text_m3_5=$(echo "$m3_5")
-message_text_m4=$(echo "$m4")
-message_text_m5=$(echo "$m5")
-message_text_m6=$(echo "$m6")
-message_text_m7=$(echo "$m7")
-message_text_m7_5=$(echo "$m7_5")
-message_text_m7_5_5=$(echo "$m7_5_5")
-message_text_m7_5_5_5=$(echo "$m7_5_5_5")
-message_text_m8=$(echo "$m8")
-message_text_m8_5=$(echo "$m8_5")
-message_text_m9=$(echo "$m9")
-message_text_m10=$(echo "$m10")
-message_text_m11=$(echo "$m11")
-message_text_m12=$(echo "$m12")
-MODE=HTML
-URL="https://api.telegram.org/bottelegram_token/sendMessage"
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Vless-reality-vision 分享链接 】：支持v2rayng、nekobox "$'"'"'\n\n'"'"'"${message_text_m1}")
-if [[ -f /etc/s-box/vm_ws.txt ]]; then
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Vmess-ws 分享链接 】：支持v2rayng、nekobox "$'"'"'\n\n'"'"'"${message_text_m2}")
-fi
-if [[ -f /etc/s-box/vm_ws_argols.txt ]]; then
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Vmess-ws(tls)+Argo临时域名分享链接 】：支持v2rayng、nekobox "$'"'"'\n\n'"'"'"${message_text_m3}")
-fi
-if [[ -f /etc/s-box/vm_ws_argogd.txt ]]; then
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Vmess-ws(tls)+Argo固定域名分享链接 】：支持v2rayng、nekobox "$'"'"'\n\n'"'"'"${message_text_m3_5}")
-fi
-if [[ -f /etc/s-box/vm_ws_tls.txt ]]; then
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Vmess-ws-tls 分享链接 】：支持v2rayng、nekobox "$'"'"'\n\n'"'"'"${message_text_m4}")
-fi
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Hysteria-2 分享链接 】：支持v2rayng、nekobox "$'"'"'\n\n'"'"'"${message_text_m5}")
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Tuic-v5 分享链接 】：支持nekobox "$'"'"'\n\n'"'"'"${message_text_m6}")
-if [[ "$sbnh" != "1.10" ]]; then
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Anytls 分享链接 】：仅最新内核可用 "$'"'"'\n\n'"'"'"${message_text_m12}")
-fi
-if [[ -n "$m9" ]]; then
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Sing-box 订阅链接 】：支持SFA、SFW、SFI "$'"'"'\n\n'"'"'"${message_text_m9}")
-else
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Sing-box 配置文件(4段) 】：支持SFA、SFW、SFI "$'"'"'\n\n'"'"'"${message_text_m7}")
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=${message_text_m7_5}")
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=${message_text_m7_5_5}")
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=${message_text_m7_5_5_5}")
-fi
-
-if [[ -n "$m10" ]]; then
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Mihomo 订阅链接 】：支持Mihomo相关客户端 "$'"'"'\n\n'"'"'"${message_text_m10}")
-else
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 Mihomo 配置文件(2段) 】：支持Mihomo相关客户端 "$'"'"'\n\n'"'"'"${message_text_m8}")
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=${message_text_m8_5}")
-fi
-res=$(timeout 20s curl -s -X POST $URL -d chat_id=telegram_id  -d parse_mode=${MODE} --data-urlencode "text=🚀【 聚合节点 】：支持nekobox "$'"'"'\n\n'"'"'"${message_text_m11}")
-
-if [ $? == 124 ];then
-echo TG_api请求超时,请检查网络是否重启完成并是否能够访问TG
-fi
-resSuccess=$(echo "$res" | jq -r ".ok")
-if [[ $resSuccess = "true" ]]; then
-echo "TG推送成功";
-else
-echo "TG推送失败，请检查TG机器人Token和ID";
-fi
-' > /etc/s-box/sbtg.sh
-sed -i "s/telegram_token/$telegram_token/g" /etc/s-box/sbtg.sh
-sed -i "s/telegram_id/$telegram_id/g" /etc/s-box/sbtg.sh
-green "设置完成！请确保TG机器人已处于激活状态！"
-tgnotice
-else
-changeserv
-fi
+local menu token userid candidate
+yellow "1：设置 Telegram 凭据    2：关闭推送并删除本机凭据    0：返回"
+readp "请选择【0-2】：" menu || return 1
+case "$menu" in
+1)
+    IFS= read -rs -p "输入 Telegram Bot Token：" token || return 1
+    printf '\n'
+    IFS= read -rs -p "输入数字聊天 ID 或 @用户名：" userid || return 1
+    printf '\n'
+    [[ $token =~ ^[0-9]+:[A-Za-z0-9_-]+$ && ( $userid =~ ^-?[0-9]+$ || $userid =~ ^@[A-Za-z0-9_]{5,}$ ) ]] ||
+        { red "Telegram 凭据格式无效"; return 1; }
+    (umask 077
+     candidate=$(mktemp /etc/s-box/.telegram.XXXXXX) || exit 1
+     trap 'rm -f -- "$candidate"' EXIT
+     trap 'exit 1' HUP INT TERM
+     printf '%s\n' "$token" "$userid" > "$candidate" &&
+         chmod 600 "$candidate" && mv -f -- "$candidate" /etc/s-box/telegram.credentials
+    ) || return 1
+    unset token userid
+    tgnotice ;;
+2) rm -f -- /etc/s-box/sbtg.sh /etc/s-box/telegram.credentials ;;
+*) changeserv ;;
+esac
 }
 
 sub_migrate_tg(){
-[[ -f /etc/s-box/sbtg.sh ]] || return 0
-if ! grep -Eq '^m(9|10)=.*_gitlab\.txt|^m(9|10)=\$\(cat |^if \[\[ -f /etc/s-box/(sing_box|clash_meta)_gitlab\.txt \]\]; then$' /etc/s-box/sbtg.sh; then
-bash -n /etc/s-box/sbtg.sh || { red "TG通知脚本语法检查失败，未执行"; return 1; }
-return 0
-fi
-local tg_tmp
-tg_tmp=$(mktemp /etc/s-box/.sbtg.XXXXXX) || return 1
-if ! sed \
--e '/^m9=/c\m9=$(if [[ -s /etc/s-box/subdomain.log && -s /etc/s-box/subtoken.log ]]; then printf "https://%s/%s/sbox.json" "$(cat /etc/s-box/subdomain.log)" "$(cat /etc/s-box/subtoken.log)"; fi)' \
--e '/^m10=/c\m10=$(if [[ -s /etc/s-box/subdomain.log && -s /etc/s-box/subtoken.log ]]; then printf "https://%s/%s/clmi.yaml" "$(cat /etc/s-box/subdomain.log)" "$(cat /etc/s-box/subtoken.log)"; fi)' \
--e '\|^if \[\[ -f /etc/s-box/sing_box_gitlab.txt \]\]; then$|c\if [[ -n "$m9" ]]; then' \
--e '\|^if \[\[ -f /etc/s-box/clash_meta_gitlab.txt \]\]; then$|c\if [[ -n "$m10" ]]; then' \
-/etc/s-box/sbtg.sh > "$tg_tmp" || ! bash -n "$tg_tmp"; then
-rm -f "$tg_tmp"
-red "TG订阅链接迁移失败，已保留原通知脚本"
-return 1
-fi
-if ! chmod +x "$tg_tmp" || ! mv -f "$tg_tmp" /etc/s-box/sbtg.sh; then
-rm -f "$tg_tmp"
-red "TG通知脚本替换失败，已保留原通知脚本"
-return 1
-fi
+(
+umask 077
+[[ -s /etc/s-box/telegram.credentials ]] || {
+    red "旧 Telegram 配置须通过 3 → 5 重新输入凭据"; exit 1
+}
+local candidate
+candidate=$(mktemp /etc/s-box/.sbtg.XXXXXX) || exit 1
+trap 'rm -f -- "$candidate"' EXIT
+trap 'exit 1' HUP INT TERM
+cat > "$candidate" <<'TG_SCRIPT' || exit 1
+#!/bin/bash
+set +x
+set -o pipefail
+cd /etc/s-box || exit 1
+{ IFS= read -r token && IFS= read -r chat; } < telegram.credentials || exit 1
+[[ $token =~ ^[0-9]+:[A-Za-z0-9_-]+$ && ( $chat =~ ^-?[0-9]+$ || $chat =~ ^@[A-Za-z0-9_]{5,}$ ) ]] || exit 1
+send_text(){
+    local message=$1
+    while [[ -n $message ]]; do
+        printf '%s' "${message:0:3500}" |
+            curl -q -fs --proto '=https' --connect-timeout 5 --max-time 20 \
+                --data-urlencode 'text@-' --config /dev/fd/3 3<<TG_REQUEST |
+url = "https://api.telegram.org/bot$token/sendMessage"
+data-urlencode = "chat_id=$chat"
+TG_REQUEST
+            jq -e '.ok == true' >/dev/null || return 1
+        message=${message:3500}
+    done
+}
+for file in vl_reality.txt vm_ws_argols.txt vm_ws_argogd.txt vm_ws_tls.txt hy2.txt tuic5.txt an.txt trojan.txt jhsub.txt; do
+    [[ ! -s $file ]] || send_text "$file"$'\n'"$(< "$file")" || exit 1
+done
+for file in sbox.json clmi.yaml; do
+    if [[ -s subdomain.log && -s subtoken.log ]]; then
+        send_text "https://$(< subdomain.log)/$(< subtoken.log)/$file" || exit 1
+    elif [[ -s $file ]]; then
+        send_text "$file"$'\n'"$(< "$file")" || exit 1
+    fi
+done
+TG_SCRIPT
+chmod 700 "$candidate" && mv -f -- "$candidate" /etc/s-box/sbtg.sh
+)
 }
 
 tgnotice(){
-if [[ -f /etc/s-box/sbtg.sh ]]; then
-green "请稍等5秒，TG机器人准备推送……"
-if ! sbshare > /dev/null 2>&1; then
-red "节点配置刷新失败，未发送TG通知"
-return 1
-fi
-sub_migrate_tg || return 1
-bash /etc/s-box/sbtg.sh
+if [[ -s /etc/s-box/telegram.credentials ]]; then
+    sub_migrate_tg || return 1
+    sbshare >/dev/null 2>&1 || { red "节点配置刷新失败"; return 1; }
+    bash /etc/s-box/sbtg.sh || { red "Telegram 推送失败"; return 1; }
+    green "Telegram 推送成功"
+elif [[ -f /etc/s-box/sbtg.sh ]]; then
+    red "请先在 Telegram 设置中重新输入凭据或关闭推送"; return 1
 else
-yellow "未设置TG通知功能"
+    yellow "未设置 TG 通知"
 fi
-exit
 }
 
 changeserv(){
@@ -3767,7 +4022,7 @@ case "$action" in
 enable) rc-update add "$name" default ;;
 disable) rc-update del "$name" default ;;
 enabled) rc-update show default | grep -qw "$name" ;;
-*) rc-service "$name" "$action" ;;
+*) rc-service "$name" "$action" 8>&- 9>&- ;;
 esac
 else
 case "$action" in
@@ -3779,18 +4034,29 @@ fi
 }
 
 sub_caddy_site(){
+local key
+key=$(sub_https_key "$2") || return 1
 cat <<EOF
 $1 {
-    @subscription path /$2/sbox.json /$2/clmi.yaml /$2/jhsub.txt
+    @subscription path_regexp subscription ^/$2/(sbox[.]json|clmi[.]yaml|jhsub[.]txt)$
     handle @subscription {
         header Cache-Control "no-store"
-        reverse_proxy 127.0.0.1:$3
+        uri strip_prefix /$2
+        root * /var/lib/sbox-subscription-https/www/$key
+        file_server
     }
     handle {
         respond 404
     }
 }
 EOF
+}
+
+sub_https_key(){
+local digest
+digest=$(printf '%s' "$1" | sha256sum) || return 1
+digest=${digest%% *}
+[[ $digest =~ ^[0-9a-f]{64}$ ]] && printf '%s\n' "$digest"
 }
 
 sub_caddy_download(){
@@ -3805,11 +4071,67 @@ mv -f -- "$work/caddy" /etc/s-box/caddy
 )
 }
 
+sub_caddy_admin_uid(){
+local pid user pidfile
+if command -v rc-service >/dev/null 2>&1; then
+    for pidfile in /run/caddy/caddy.pid /run/caddy.pid; do
+        [[ -r $pidfile ]] && { read -r pid < "$pidfile"; break; }
+    done
+else
+    pid=$(systemctl show -p MainPID --value caddy 2>/dev/null)
+fi
+if [[ $pid =~ ^[1-9][0-9]*$ && -r /proc/$pid/status &&
+      $(readlink -f "/proc/$pid/exe") == "$(readlink -f "$(command -v caddy)")" ]]; then
+    awk '$1=="Uid:" {print $3; found=1} END {exit !found}' "/proc/$pid/status"; return
+fi
+if ! command -v rc-service >/dev/null 2>&1 &&
+   [[ $(systemctl show -p LoadState --value caddy 2>/dev/null) == loaded ]]; then
+    user=$(systemctl show -p User --value caddy) && id -u "${user:-root}"; return
+fi
+return 1
+}
+
+sub_caddy_admin_safe(){
+local address path directory uid metadata owner mode first=1
+address=$(set -o pipefail; caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile 2>/dev/null |
+    jq -er 'if .admin.disabled == true then "off" else .admin.listen // "localhost:2019" end') || {
+    red "无法核对共享 Caddy 的管理端点" >&2; return 1
+}
+[[ $address != off ]] || return 0
+if [[ $address != unix//* ]]; then
+    # A local TCP API can also be reached by other users on the host.
+    if [[ ${SBOX_CADDY_SINGLE_USER:-} == 1 && $address =~ ^(tcp[46]?/)?(localhost|127\.0\.0\.1|\[::1\]):[0-9]+$ ]]; then return 0; fi
+    red "共享 Caddy 请配置 admin off 或受保护目录内的 Unix 管理套接字；单用户回环 TCP 需显式设置 SBOX_CADDY_SINGLE_USER=1" >&2
+    return 1
+fi
+path=${address#unix/}; path=${path%%|*}
+[[ $path =~ ^(/[[:alnum:]_.~-]+)+$ && /${path#/}/ != */../* && /${path#/}/ != */./* && ! -L $path ]] || return 1
+uid=$(sub_caddy_admin_uid) && [[ $uid =~ ^[0-9]+$ ]] || {
+    red "无法确认 Caddy 服务 UID，请使用 admin off 或核对服务用户" >&2; return 1
+}
+directory=${path%/*}
+while [[ -n $directory ]]; do
+    [[ -d $directory && ! -L $directory ]] || return 1
+    metadata=$(stat -c '%u %a' -- "$directory") || return 1
+    read -r owner mode <<< "$metadata"
+    [[ $owner == 0 || $owner == "$uid" ]] && (( (8#$mode & 0022) == 0 )) || return 1
+    if (( first )); then
+        [[ $owner == "$uid" ]] && (( (8#$mode & 0777) == 0700 )) || {
+            red "管理套接字目录须归 Caddy 服务 UID 所有，权限为 0700" >&2; return 1
+        }
+        first=0
+    fi
+    directory=${directory%/*}
+done
+(( ! first ))
+}
+
 sub_caddy_prepare(){
 local mode arch
 mode=$(cat /etc/s-box/sub-caddy-mode 2>/dev/null)
 if [[ "$mode" == shared || ( -z "$mode" && -f /etc/caddy/Caddyfile ) ]]; then
 command -v caddy >/dev/null 2>&1 || { red "已有 /etc/caddy/Caddyfile，但未找到 caddy 命令" >&2; return 1; }
+sub_caddy_admin_safe || return 1
 echo shared
 return
 fi
@@ -3834,14 +4156,14 @@ echo managed
 
 sub_caddy_reload(){
 if [[ "$1" == shared ]]; then
-# 233boy 的配置可能禁用了 admin API；验证后采用服务重启。
-if caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile >/dev/null 2>&1; then
-return 0
-fi
-yellow "现有 Caddy 无法热加载，正在通过服务重启应用已校验的配置" >&2
-sub_service restart caddy
+    if grep -Fxq 'import /etc/caddy/s-box-subscription.caddy # s-box subscription' /etc/caddy/Caddyfile; then
+        sub_caddy_admin_safe || return 1
+    fi
+    # The running daemon may still use its previous admin address. Apply the checked file
+    # via the service manager without transmitting a token-bearing config to that endpoint.
+    sub_service restart caddy
 else
-sub_service restart sbox-sub-caddy
+    sub_service restart sbox-sub-caddy
 fi
 }
 
@@ -3993,17 +4315,19 @@ EOF
 }
 
 sub_httpd_start(){
+sub_valid_port "$1" && sub_valid_token "$2" || return 1
 sub_httpd_stop || return 1
-nohup /bin/bash /etc/s-box/sub-httpd.sh 9>&- > /etc/s-box/sub-httpd.log 2>&1 &
+nohup /bin/bash /etc/s-box/sub-httpd.sh 8>&- 9>&- > /etc/s-box/sub-httpd.log 2>&1 &
 local pid=$!
 sleep 1
 kill -0 "$pid" 2>/dev/null || { red "订阅后台启动失败，请查看 /etc/s-box/sub-httpd.log"; return 1; }
-curl -q --noproxy '*' -fs --max-time 5 "http://127.0.0.1:$1/$2/sbox.json" -o /dev/null
+curl -q --noproxy '*' -fs --max-time 5 --config - -o /dev/null <<< "url = \"http://127.0.0.1:$1/$2/sbox.json\""
 }
 
 sub_httpd_boot(){
 local cronfile
 if command -v rc-service >/dev/null 2>&1; then
+if [[ ${1:-} == remove ]]; then rm -f /etc/local.d/alpinesub.start; return; fi
 mkdir -p /etc/local.d || return 1
 printf '#!/bin/bash\nsleep 10\n/bin/bash /etc/s-box/sub-httpd.sh >/dev/null 2>&1 &\n' > /etc/local.d/alpinesub.start || return 1
 chmod 755 /etc/local.d/alpinesub.start && rc-update add local default
@@ -4011,7 +4335,7 @@ else
 cronfile=$(mktemp) || return 1
 crontab -l > "$cronfile" 2>/dev/null
 sed -i -e '\@/root/websbox\([^[:alnum:]_.-]\|$\)@d' -e '\@/etc/s-box/sub-httpd\.sh\([^[:alnum:]_.-]\|$\)@d' "$cronfile" || { rm -f "$cronfile"; return 1; }
-echo '@reboot sleep 10 && /bin/bash /etc/s-box/sub-httpd.sh >/dev/null 2>&1 &' >> "$cronfile"
+[[ ${1:-} == remove ]] || echo '@reboot sleep 10 && /bin/bash /etc/s-box/sub-httpd.sh >/dev/null 2>&1 &' >> "$cronfile"
 crontab "$cronfile"
 local status=$?
 rm -f "$cronfile"
@@ -4021,11 +4345,12 @@ fi
 
 sub_https_ready(){
 local domain=$1 token=$2 probe=$3 attempt name ok
+sub_valid_domain "$domain" && sub_valid_token "$token" || return 1
 for attempt in {1..12}; do
     ok=1
     for name in sbox.json clmi.yaml jhsub.txt; do
         if ! curl -q --noproxy '*' -fs --connect-timeout 3 --max-time 5 --resolve "$domain:443:127.0.0.1" \
-            "https://$domain/$token/$name" -o "$probe" || ! cmp -s "$probe" "/etc/s-box/$name"; then
+            --config - -o "$probe" <<< "url = \"https://$domain/$token/$name\"" || ! cmp -s "$probe" "/etc/s-box/$name"; then
             ok=0; break
         fi
     done
@@ -4049,52 +4374,77 @@ fi
 }
 
 sub_prepare_reader(){
-sub_service_user sboxsub &&
-install -d -m 0750 -o root -g sboxsub /var/lib/sbox-subscription /var/lib/sbox-subscription/www
+local root=${sub_root:-/var/lib/sbox-subscription} group=${sub_group:-sboxsub}
+case "$group" in sboxcaddy|sboxsub) sub_service_user "$group" || return 1 ;; esac
+install -d -m 0750 -o root -g "$group" "$root" "$root/www"
 }
 
 sub_unlink(){
-local root=/var/lib/sbox-subscription old
+local root=${sub_root:-/var/lib/sbox-subscription} old
 sub_valid_token "$1" || return 1
-old=$(readlink "$root/www/$1")
-rm -f -- "$root/www/$1" || return 1
+old=$(sub_snapshot_target "$root" "$1")
+sub_snapshot_replace '' "$root" "$1" || return 1
 if [[ "$old" =~ ^\.\./(release\.[a-zA-Z0-9]+)$ ]]; then rm -rf -- "$root/${BASH_REMATCH[1]}"; fi
 }
 
 sub_links(){
 (
-local root=/var/lib/sbox-subscription snapshot link old name token=$1
+local root=${sub_root:-/var/lib/sbox-subscription} group=${sub_group:-sboxsub} snapshot link old name token=$1
 sub_valid_token "$token" || exit 1
 snapshot=$(mktemp -d "$root/release.XXXXXX") || exit 1
 link="$root/.link.${snapshot##*.}"
-trap 'rm -f -- "$link"; if [[ -n $snapshot && $(readlink "$root/www/$token") != "../${snapshot##*/}" ]]; then rm -rf -- "$snapshot"; fi' EXIT
+trap 'rm -f -- "$link"; if [[ -n $snapshot && $(sub_snapshot_target "$root" "$token") != "../${snapshot##*/}" ]]; then rm -rf -- "$snapshot"; fi' EXIT
 trap 'exit 1' HUP INT TERM
 for name in sbox.json clmi.yaml jhsub.txt; do
-    [[ -s "/etc/s-box/$name" ]] && install -m 640 -g sboxsub "/etc/s-box/$name" "$snapshot/$name" || exit 1
+    [[ -s "/etc/s-box/$name" ]] && install -m 640 -g "$group" "/etc/s-box/$name" "$snapshot/$name" || exit 1
 done
-chgrp sboxsub "$snapshot" && chmod 750 "$snapshot" || exit 1
-old=$(readlink "$root/www/$1")
-ln -s "../${snapshot##*/}" "$link" && mv -Tf -- "$link" "$root/www/$1" || exit 1
+chgrp "$group" "$snapshot" && chmod 750 "$snapshot" || exit 1
+old=''
+if [[ -L $root/www/$1 ]]; then old=$(sub_snapshot_target "$root" "$1") || exit 1; fi
+ln -s "../${snapshot##*/}" "$link" && sub_snapshot_replace "$link" "$root" "$1" || exit 1
 snapshot=''
 [[ ${2:-} == keep-previous ]] || sub_drop_snapshot "$old"
 )
 }
 
+sub_snapshot_target(){
+local root target
+[[ -L $1/www/$2 ]] || return 1
+root=$(cd -P -- "$1" && pwd -P) && target=$(cd -P -- "$1/www/$2" 2>/dev/null && pwd -P) || return 1
+[[ ${target%/*} == "$root" && ${target##*/} =~ ^release\.[a-zA-Z0-9]+$ ]] || return 1
+printf '../%s\n' "${target##*/}"
+}
+
+sub_snapshot_replace(){
+printf '%s' "$3" | python3 -c 'import os, sys
+path = os.path.join(sys.argv[2], sys.stdin.read())
+try:
+    if sys.argv[1]:
+        os.replace(sys.argv[1], path)
+    else:
+        os.unlink(path)
+except FileNotFoundError:
+    if sys.argv[1]:
+        sys.exit("找不到候选快照链接")
+except OSError:
+    sys.exit("无法原子切换订阅快照")' "$1" "$2/www"
+}
+
 sub_drop_snapshot(){
 if [[ $1 =~ ^\.\./(release\.[a-zA-Z0-9]+)$ ]]; then
-    rm -rf -- "/var/lib/sbox-subscription/${BASH_REMATCH[1]}"
+    rm -rf -- "${sub_root:-/var/lib/sbox-subscription}/${BASH_REMATCH[1]}"
 fi
 }
 
 sub_restore_snapshot(){
-local root=/var/lib/sbox-subscription token=$1 previous=$2 link=$3 current
-current=$(readlink "$root/www/$token")
+local root=${sub_root:-/var/lib/sbox-subscription} token=$1 previous=$2 link=$3 current
+current=$(sub_snapshot_target "$root" "$token")
 [[ $current != "$previous" ]] || return 0
 if [[ -z $previous ]]; then
     sub_unlink "$token"
 else
     [[ $previous =~ ^\.\./release\.[a-zA-Z0-9]+$ && -d $root/www/$previous ]] || return 1
-    ln -s "$previous" "$link" && mv -Tf -- "$link" "$root/www/$token" && sub_drop_snapshot "$current"
+    ln -s "$previous" "$link" && sub_snapshot_replace "$link" "$root" "$token" && sub_drop_snapshot "$current"
 fi
 }
 
@@ -4104,10 +4454,10 @@ sub_httpd_running /root/websbox && return 0
 sub_valid_port "$port" && sub_valid_token "$token" || return 1
 [[ -z $domain ]] || address=127.0.0.1:$port
 command -v busybox-extras >/dev/null 2>&1 && binary=busybox-extras
-nohup "$binary" httpd -f -p "$address" -h /root/websbox 9>&- > /etc/s-box/sub-httpd.log 2>&1 &
+nohup "$binary" httpd -f -p "$address" -h /root/websbox 8>&- 9>&- > /etc/s-box/sub-httpd.log 2>&1 &
 pid=$!
 sleep 1
-kill -0 "$pid" 2>/dev/null && curl -q --noproxy '*' -fs --max-time 5 "http://127.0.0.1:$port/$token/sbox.json" -o /dev/null
+kill -0 "$pid" 2>/dev/null && curl -q --noproxy '*' -fs --max-time 5 --config - -o /dev/null <<< "url = \"http://127.0.0.1:$port/$token/sbox.json\""
 }
 
 # Callers hold subscription.lock from the first read through this commit.
@@ -4116,11 +4466,18 @@ sub_publish_current(){
 local stage=$1 backup name mutating=0 committed=0 token='' previous='' restore_link
 shift
 local -a files=("$@")
-local web=/var/lib/sbox-subscription/www
+local sub_root=/var/lib/sbox-subscription sub_group=sboxsub
+if [[ -s /etc/s-box/subdomain.log && ${sub_switching:-0} != 1 ]]; then
+    sub_root=/var/lib/sbox-subscription-https
+    token=$(cat /etc/s-box/subtoken.log) && sub_valid_token "$token" && token=$(sub_https_key "$token") || exit 1
+    [[ -L $sub_root/www/$token ]] || { red "请先通过菜单 3 → 10 将旧 HTTPS 订阅切换为直接读取快照" >&2; exit 1; }
+    sub_group=$(stat -c %g "$sub_root") || exit 1
+fi
+local web=$sub_root/www
 if [[ ${sub_switching:-0} != 1 && -d $web && -s /etc/s-box/subtoken.log ]]; then
-    token=$(cat /etc/s-box/subtoken.log) && sub_valid_token "$token" || exit 1
+    if [[ -z $token ]]; then token=$(cat /etc/s-box/subtoken.log) && sub_valid_token "$token" || exit 1; fi
     if [[ -L $web/$token ]]; then
-        previous=$(readlink "$web/$token")
+        previous=$(sub_snapshot_target "$sub_root" "$token")
         [[ $previous =~ ^\.\./release\.[a-zA-Z0-9]+$ && -d $web/$previous ]] || exit 1
     else
         # A first migration may have prepared directories but rolled back to the legacy HTTP listener.
@@ -4128,7 +4485,7 @@ if [[ ${sub_switching:-0} != 1 && -d $web && -s /etc/s-box/subtoken.log ]]; then
     fi
 fi
 backup=$(mktemp -d /etc/s-box/.publish-backup.XXXXXX) || exit 1
-restore_link="/var/lib/sbox-subscription/.restore.${backup##*.}"
+restore_link="$sub_root/.restore.${backup##*.}"
 sub_finish_publish(){
     local status=$? restored=1
     trap - EXIT
@@ -4136,6 +4493,7 @@ sub_finish_publish(){
     if (( committed )); then
         status=0
         [[ -z $token ]] || sub_drop_snapshot "$previous" || status=1
+        (( ! status )) || red "新订阅文件已发布。清理前一份快照失败，请检查发布目录权限。" >&2
     elif (( mutating )); then
         [[ -z $token ]] || sub_restore_snapshot "$token" "$previous" "$restore_link" || restored=0
         for name in "${files[@]}"; do
@@ -4165,16 +4523,22 @@ committed=1
 }
 
 sub_apply(){
+config_locked sub_apply_serialized "$@"
+}
+
+sub_apply_serialized(){
 ( flock -x 9 && sub_apply_locked "$@" ) 9>/etc/s-box/subscription.lock
 }
 
 sub_apply_locked(){
 (
-local legacy=0
+local legacy=0 generate=1
 local domain=$1 token=$2 port=$3 mode='' olddomain oldtoken oldport backup i name
 local httpd_active=0 caddy_active=0 caddy_enabled=0 service='' committed=0 boot_changed=0
+local sub_root=/var/lib/sbox-subscription sub_group=sboxsub snapshot_key=$token
+local -a reader_groups=()
 local previous restore_link legacy_stopping=0 httpd_touched=0 caddy_touched=0 local_enabled=0
-sub_valid_token "$token" && sub_valid_port "$port" && { [[ -z "$domain" ]] || sub_valid_domain "$domain"; } || {
+sub_valid_token "$token" && { if [[ -n "$domain" ]]; then sub_valid_domain "$domain"; else sub_valid_port "$port"; fi; } || {
 red "域名、订阅令牌或端口格式无效"; return 1;
 }
 olddomain=$(cat /etc/s-box/subdomain.log 2>/dev/null)
@@ -4187,7 +4551,7 @@ if [[ -f /etc/s-box/gitlab-publisher && "$token" == "$(sed -n '3p' /etc/s-box/gi
     red "订阅路径必须使用独立令牌"; return 1
 fi
 sub_httpd_running /root/websbox && legacy=1
-if (( legacy )) && [[ "$port" == "$oldport" ]]; then
+if (( legacy )) && [[ -z $domain && "$port" == "$oldport" ]]; then
     red "旧订阅仍在运行，请为 HTTPS 验证选择另一个后台端口"; return 1
 fi
 if [[ -z "$olddomain" && -n "$oldtoken" && -d /root/websbox ]]; then
@@ -4195,20 +4559,25 @@ if [[ -z "$olddomain" && -n "$oldtoken" && -d /root/websbox ]]; then
         red "旧公网 HTTP 入口需用 3 → 10 迁移到新 HTTPS 令牌，或用 3 → 8 → 4 停用"; return 1;
     }
     # The legacy listener follows the files in /etc/s-box. Rotate node secrets after cutover.
-else
-    sbshare subscription-switch >/dev/null 2>&1 || { red "订阅生成失败，保留现有入口"; return 1; }
+    generate=0
 fi
-sub_prepare_reader || { red "无法设置专用订阅读取账户"; return 1; }
 if [[ -n "$domain" ]]; then
 mode=$(sub_caddy_prepare) || return 1
 service=sbox-sub-caddy
-[[ "$mode" != shared ]] || service=caddy
+sub_root=/var/lib/sbox-subscription-https
+snapshot_key=$(sub_https_key "$token") || return 1
+sub_group=sboxcaddy
+if [[ $mode == shared ]]; then
+    service=caddy
+    sub_group=$(sub_caddy_group) || return 1
+fi
 sub_service status "$service" >/dev/null 2>&1 && caddy_active=1
 sub_service enabled "$service" >/dev/null 2>&1 && caddy_enabled=1
 fi
 sub_httpd_running && httpd_active=1
 backup=$(mktemp -d /etc/s-box/.subscription.XXXXXX) || return 1
 local -a files=(/etc/s-box/subdomain.log /etc/s-box/subtoken.log /etc/s-box/subport.log
+/etc/s-box/sbox.json /etc/s-box/clmi.yaml /etc/s-box/jhsub.txt
 /etc/s-box/sub-caddy-mode /etc/s-box/sub-httpd.sh /etc/s-box/sub-Caddyfile
 /etc/caddy/s-box-subscription.caddy /etc/local.d/alpinesub.start
 /etc/init.d/sbox-sub-caddy /etc/systemd/system/sbox-sub-caddy.service)
@@ -4220,12 +4589,20 @@ fi
 done
 crontab -l > "$backup/cron" 2>/dev/null
 if command -v rc-service >/dev/null && sub_service enabled local >/dev/null 2>&1; then local_enabled=1; fi
-previous=$(readlink "/var/lib/sbox-subscription/www/$token")
-if [[ -n $previous && ! $previous =~ ^\.\./release\.[a-zA-Z0-9]+$ ]]; then
-    red "现有订阅目录不是项目快照，保留原配置"; rm -rf -- "$backup"; exit 1
+previous=''
+if [[ -L $sub_root/www/$snapshot_key || -e $sub_root/www/$snapshot_key ]]; then
+    previous=$(sub_snapshot_target "$sub_root" "$snapshot_key") || {
+        red "现有订阅目录无法定位到项目快照，保留原配置"; rm -rf -- "$backup"; exit 1
+    }
 fi
 printf '%s\n' "$previous" > "$backup/previous-snapshot" || { rm -rf -- "$backup"; exit 1; }
-restore_link="/var/lib/sbox-subscription/.restore.${backup##*.}"
+restore_link="$sub_root/.restore.${backup##*.}"
+local -a reader_dirs=("$sub_root" "$sub_root/www")
+for i in "${!reader_dirs[@]}"; do
+    if [[ -d ${reader_dirs[$i]} ]]; then
+        reader_groups[$i]=$(stat -c %g "${reader_dirs[$i]}") || exit 1
+    fi
+done
 sub_finish_apply(){
     local status=$? rollback_ok=1
     trap - EXIT
@@ -4234,9 +4611,18 @@ sub_finish_apply(){
         status=0
         sub_drop_snapshot "$previous" || status=1
         if sub_valid_token "$oldtoken"; then
-            [[ $oldtoken == "$token" ]] || sub_unlink "$oldtoken" || status=1
+            if [[ -n $domain ]]; then
+                if [[ $oldtoken != "$token" && -n $olddomain ]]; then
+                    local old_key
+                    old_key=$(sub_https_key "$oldtoken") && sub_unlink "$old_key" || status=1
+                fi
+                ( sub_root=/var/lib/sbox-subscription; sub_unlink "$oldtoken" ) || status=1
+            else
+                [[ $oldtoken == "$token" ]] || sub_unlink "$oldtoken" || status=1
+            fi
             if [[ -d /root/websbox/$oldtoken ]]; then rm -rf -- "/root/websbox/$oldtoken" || status=1; fi
         fi
+        (( ! status )) || red "新订阅入口已生效。清理旧快照失败，请检查旧文件权限。"
     else
         (( ! httpd_touched )) || sub_httpd_stop || rollback_ok=0
         # OpenRC needs the candidate init script to stop a newly started service.
@@ -4246,7 +4632,12 @@ sub_finish_apply(){
         if (( caddy_touched && ! caddy_enabled )) && sub_service enabled "$service" >/dev/null 2>&1; then
             sub_service disable "$service" >/dev/null 2>&1 || rollback_ok=0
         fi
-        sub_restore_snapshot "$token" "$previous" "$restore_link" || rollback_ok=0
+        sub_restore_snapshot "$snapshot_key" "$previous" "$restore_link" || rollback_ok=0
+        for i in "${!reader_groups[@]}"; do
+            if [[ $(stat -c %g "${reader_dirs[$i]}") != "${reader_groups[$i]}" ]]; then
+                chgrp "${reader_groups[$i]}" "${reader_dirs[$i]}" || rollback_ok=0
+            fi
+        done
         for i in "${!files[@]}"; do
             if [[ -f "$backup/$i" ]]; then cp -p "$backup/$i" "${files[$i]}" || rollback_ok=0
             else rm -f "${files[$i]}" || rollback_ok=0; fi
@@ -4281,9 +4672,16 @@ sub_finish_apply(){
 }
 trap sub_finish_apply EXIT
 trap 'exit 1' HUP INT TERM
-sub_links "$token" keep-previous && sub_httpd_write "$domain" "$port" || exit 1
-httpd_touched=1
-sub_httpd_start "$port" "$token" || exit 1
+if (( generate )); then
+    sbshare subscription-switch >/dev/null 2>&1 || { red "订阅生成失败，保留现有入口"; exit 1; }
+fi
+sub_prepare_reader || { red "无法设置订阅快照读取组"; exit 1; }
+sub_links "$snapshot_key" keep-previous || exit 1
+if [[ -z $domain ]]; then
+    sub_httpd_write "$domain" "$port" || exit 1
+    httpd_touched=1
+    sub_httpd_start "$port" "$token" || exit 1
+fi
 if [[ -n $domain ]]; then
     caddy_touched=1
     sub_caddy_apply "$domain" "$token" "$port" "$mode" &&
@@ -4297,7 +4695,11 @@ if [[ -n $domain ]]; then
 fi
 [[ -z $service ]] || sub_service enable "$service" || exit 1
 boot_changed=1
-sub_httpd_boot || exit 1
+sub_httpd_boot "${domain:+remove}" || exit 1
+if [[ -n $domain ]]; then
+    if (( httpd_active )); then httpd_touched=1; sub_httpd_stop || exit 1; fi
+    rm -f /etc/s-box/sub-httpd.sh || exit 1
+fi
 if (( legacy )); then
     legacy_stopping=1
     sub_httpd_stop /root/websbox || exit 1
@@ -4343,7 +4745,7 @@ crontab "$cronfile" >/dev/null 2>&1
 rm -f "$cronfile" /etc/local.d/alpinesub.start
 rm -f /etc/caddy/s-box-subscription.caddy /etc/s-box/sub-Caddyfile /etc/s-box/sub-httpd.sh
 rm -f /etc/s-box/subdomain.log /etc/s-box/subtoken.log /etc/s-box/subport.log /etc/s-box/sub-caddy-mode
-rm -rf /root/websbox /var/lib/sbox-subscription
+rm -rf /root/websbox /var/lib/sbox-subscription /var/lib/sbox-subscription-https
 # Keep Caddy's certificates for reactivation under the same service account.
 rm -f /etc/init.d/sbox-sub-caddy /etc/systemd/system/sbox-sub-caddy.service
 command -v rc-service >/dev/null 2>&1 || systemctl daemon-reload
@@ -4366,7 +4768,7 @@ fi
 for name in sbox.json clmi.yaml jhsub.txt; do
 blue "$base/$name"
 if [[ "$1" != noqr ]] && command -v qrencode >/dev/null 2>&1; then
-qrencode -o - -t ANSIUTF8 "$base/$name"
+printf '%s' "$base/$name" | qrencode -o - -t ANSIUTF8
 fi
 done
 }
@@ -4393,10 +4795,11 @@ readp "输入订阅路径密码（仅字母数字、下划线、短横线；回�
 readp "输入未占用的订阅端口（回车随机）：" port
 ;;
 2)
-[[ -n "$port" ]] || { red "请先启用订阅"; return 1; }
+[[ -n "$token" ]] || { red "请先启用订阅"; return 1; }
 readp "输入新的订阅路径密码（回车随机生成）：" token
 ;;
 3)
+[[ -z "$domain" ]] || { red "HTTPS 订阅直接读取快照，无后台端口"; return 1; }
 [[ -n "$token" ]] || { red "请先启用订阅"; return 1; }
 readp "输入未占用的订阅后台端口（回车随机）：" port
 ;;
@@ -4408,14 +4811,14 @@ domain=${domain,,}
 sub_valid_domain "$domain" || { red "请输入有效的订阅域名"; return 1; }
 readp "输入订阅令牌（至少16位字母数字、下划线或短横线；回车随机生成）：" token
 [[ -z "$token" || ${#token} -ge 16 ]] || { red "域名订阅令牌至少16位"; return 1; }
-readp "输入未占用的本机后台端口（回车随机）：" port
+port=
 ;;
 6) sub_show_urls; return ;;
 *) changeserv; return ;;
 esac
 [[ -n "$token" ]] || token=$(openssl rand -hex 24) || return 1
 [[ -z "$domain" || ${#token} -ge 16 ]] || { red "域名订阅令牌至少16位"; return 1; }
-[[ -n "$port" ]] || port=$(shuf -i 10000-65535 -n 1)
+if [[ -n $domain ]]; then port=; elif [[ -z $port ]]; then port=$(shuf -i 10000-65535 -n 1) || return 1; fi
 if sub_apply "$domain" "$token" "$port"; then
 green "订阅入口已更新；客户端刷新订阅后获取最新节点"
 sub_show_urls
@@ -4425,6 +4828,7 @@ fi
 }
 
 vmesscfadd(){
+local host= menu
 echo
 green "推荐使用稳定的世界大厂或组织的官方CDN域名作为CDN优选地址："
 blue "cloudflare-ech.com"
@@ -4443,12 +4847,14 @@ if [ "$menu" = "1" ]; then
 echo
 green "请确保VPS的IP已解析到Cloudflare的域名上"
 if [[ ! -f /etc/s-box/cfymjx.txt ]] 2>/dev/null; then
-readp "输入客户端host/sni域名(IP解析到CF上的域名)：" menu
-echo "$menu" > /etc/s-box/cfymjx.txt
+readp "输入客户端host/sni域名(IP解析到CF上的域名)：" host || return 1
+sub_valid_domain "$host" || { red "域名无效"; return 1; }
 fi
 echo
-readp "输入自定义的优选IP/域名：" menu
-echo "$menu" > /etc/s-box/cfvmadd_local.txt
+readp "输入自定义的优选IP/域名：" menu || return 1
+valid_node_address "$menu" || { red "优选地址无效"; return 1; }
+[[ -z $host ]] || printf '%s\n' "$host" > /etc/s-box/cfymjx.txt || return 1
+printf '%s\n' "$menu" > /etc/s-box/cfvmadd_local.txt || return 1
 sbshare > /dev/null 2>&1
 green "设置成功，选择主菜单9进行节点配置更新" && sleep 2 && vmesscfadd
 elif  [ "$menu" = "2" ]; then
@@ -4456,8 +4862,9 @@ rm -rf /etc/s-box/cfymjx.txt
 sbshare > /dev/null 2>&1
 green "重置成功，可选择1重新设置" && sleep 2 && vmesscfadd
 elif  [ "$menu" = "3" ]; then
-readp "输入自定义的优选IP/域名：" menu
-echo "$menu" > /etc/s-box/cfvmadd_argo.txt
+readp "输入自定义的优选IP/域名：" menu || return 1
+valid_node_address "$menu" || { red "优选地址无效"; return 1; }
+printf '%s\n' "$menu" > /etc/s-box/cfvmadd_argo.txt || return 1
 sbshare > /dev/null 2>&1
 green "设置成功，选择主菜单9进行节点配置更新" && sleep 2 && vmesscfadd
 else
@@ -4570,6 +4977,7 @@ case "$menu" in
         { red "请新建独立发布令牌"; exit 1; }
     candidate=$(mktemp /etc/s-box/.gitlab-settings.XXXXXX) || exit 1
     trap 'rm -f -- "$candidate"' EXIT
+    trap 'exit 1' HUP INT TERM
     printf '%s\n' "$project" "$branch" "$secret" > "$candidate" || exit 1
     unset secret
     if ! sbshare >/dev/null 2>&1 || ! gitlab_publish "$candidate" verify-write; then
@@ -4608,6 +5016,7 @@ readp "1：重新注册独立 WARP 账户\n2：从本地文件导入独立服务
 [[ $choice == 1 || $choice == 2 ]] || exit 0
 candidate=$(mktemp /etc/s-box/.server-warp.XXXXXX) || exit 1
 trap 'rm -f -- "$candidate"' EXIT
+trap 'exit 1' HUP INT TERM
 if [[ $choice == 1 ]]; then
     client_warp_register "$candidate" || { red "WARP 注册失败，保留现有出站与分流规则"; exit 1; }
 else
@@ -4704,6 +5113,8 @@ done
 }
 
 restartsb(){
+[[ ! -e /etc/s-box/admin-stopped ]] || return 0
+singbox_require_owned || return 1
 # Only transaction callers that checked the candidate may pass "checked".
 if [[ ${1:-} != checked ]]; then
 local check_args=(-c /etc/s-box/sb.json)
@@ -4711,42 +5122,90 @@ local check_args=(-c /etc/s-box/sb.json)
 /etc/s-box/sing-box check "${check_args[@]}" || return 1
 fi
 if command -v apk >/dev/null 2>&1; then
-rc-service sing-box restart
+rc-service sing-box restart 8>&- 9>&-
 else
-systemctl enable sing-box
 systemctl restart sing-box
 fi
 }
 
-stclre(){
-if [[ ! -f '/etc/s-box/sb.json' ]]; then
-red "未正常安装Sing-box" && exit
-fi
-readp "1：重启\n2：关闭\n请选择：" menu
-if [ "$menu" = "1" ]; then
+singbox_maintenance(){
+[[ ! -e /etc/s-box/admin-stopped ]] || return 0
+sub_service status sing-box >/dev/null 2>&1 || return 0
 restartsb
-sbactive
-green "Sing-box服务已重启\n" && sleep 3 && sing_box
-elif [ "$menu" = "2" ]; then
-if command -v apk >/dev/null 2>&1; then
-rc-service sing-box stop
-else
-systemctl stop sing-box
-systemctl disable sing-box
+}
+
+singbox_finish_stop(){
+singbox_require_owned || return 1
+local failed=0
+sub_service stop sing-box || failed=1
+cronsb remove || failed=1
+if command -v rc-service >/dev/null 2>&1; then
+    local runlevel
+    for runlevel in /etc/runlevels/*; do
+        if [[ -L $runlevel/sing-box ]]; then
+            rc-update del sing-box "${runlevel##*/}" && [[ ! -L $runlevel/sing-box ]] || failed=1
+        fi
+    done
+elif sub_service enabled sing-box; then
+    sub_service disable sing-box || failed=1
 fi
-green "Sing-box服务已关闭\n" && sleep 3 && sing_box
-else
-stclre
+if sub_service status sing-box >/dev/null 2>&1 || sub_service enabled sing-box >/dev/null 2>&1; then
+    red "Sing-box 仍在运行或自启仍启用"; failed=1
 fi
+return "$failed"
+}
+
+singbox_stop(){
+(
+singbox_require_owned || exit 1
+trap 'exit 1' HUP INT TERM
+trap 'status=$?; trap - EXIT; trap "" HUP INT TERM
+    if (( status )) && [[ -e /etc/s-box/admin-stopped ]]; then
+        singbox_finish_stop || red "停服清理未完成，请检查服务、定时任务和自启项"
+    fi
+    exit "$status"' EXIT
+: > /etc/s-box/admin-stopped && singbox_finish_stop
+)
+}
+
+singbox_enable(){
+(
+singbox_require_owned || exit 1
+local stopped=0 committed=0
+[[ ! -e /etc/s-box/admin-stopped ]] || stopped=1
+trap 'exit 1' HUP INT TERM
+trap 'status=$?; trap - EXIT; trap "" HUP INT TERM
+    if (( stopped && ! committed )); then
+        : > /etc/s-box/admin-stopped || red "停服标记恢复失败，请检查文件系统"
+        singbox_finish_stop || red "恢复停服状态失败，请检查服务、定时任务和自启项"
+    fi
+    exit "$status"' EXIT
+rm -f /etc/s-box/admin-stopped &&
+    restartsb && sub_service status sing-box && sub_service enable sing-box && cronsb || exit 1
+committed=1
+)
+}
+
+stclre(){
+[[ -f /etc/s-box/sb.json ]] || { red "未正常安装Sing-box"; return 1; }
+local menu
+readp "1：启用并重启\n2：关闭并取消自启\n请选择：" menu || return 1
+case "$menu" in
+1) config_locked singbox_enable && green "Sing-box 服务已启用并重启" ;;
+2) config_locked singbox_stop && green "Sing-box 服务已关闭" ;;
+*) return 1 ;;
+esac
 }
 
 cronsb(){
 (
-local cron_tmp line='0 1 * * * systemctl restart sing-box;rc-service sing-box restart'
+local cron_tmp line='0 1 * * * /usr/bin/sing_box --maintenance'
 cron_tmp=$(mktemp) || exit 1
 trap 'rm -f -- "$cron_tmp"' EXIT
 crontab -l > "$cron_tmp" 2>/dev/null
-grep -Fxq "$line" "$cron_tmp" || printf '%s\n' "$line" >> "$cron_tmp" || exit 1
+sed -i -e '/^0 1 [*] [*] [*] systemctl restart sing-box;rc-service sing-box restart$/d' \
+       -e '\|^0 1 [*] [*] [*] /usr/bin/sing_box --maintenance$|d' "$cron_tmp" || exit 1
+if [[ ${1:-} != remove && ! -e /etc/s-box/admin-stopped ]]; then printf '%s\n' "$line" >> "$cron_tmp" || exit 1; fi
 crontab "$cron_tmp"
 )
 }
@@ -4754,13 +5213,12 @@ crontab "$cron_tmp"
 uncronsb(){
 (
 local cron_tmp
+cronsb remove || exit 1
 cron_tmp=$(mktemp) || exit 1
 trap 'rm -f -- "$cron_tmp"' EXIT
 crontab -l > "$cron_tmp" 2>/dev/null
-# sub_remove handles the subscription job. Here remove only the other project launchers.
-sed -i -e '/^0 1 [*] [*] [*] systemctl restart sing-box;rc-service sing-box restart$/d' \
-       -e '/^@reboot .*\/etc\/s-box\/cloudflared tunnel --url /d' \
-       -e '/^@reboot .*cat \/etc\/s-box\/sbwpph\.log /d' "$cron_tmp" || exit 1
+sed -i -e '/^@reboot .*\/etc\/s-box\/cloudflared tunnel --url /d' \
+       -e '/^@reboot .*cat \/etc\/s-box\/sbwpph\.log /d' -e '\|^@reboot sleep 10 && /etc/s-box/sbwpph-run.sh |d' "$cron_tmp" || exit 1
 crontab "$cron_tmp"
 )
 }
@@ -4788,7 +5246,18 @@ local revision dir
 readp "输入已按 README 验证并解包的完整提交号：" revision || return 1
 [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || { red "需要 40 位小写 Git 提交号"; return 1; }
 dir="/etc/s-box/releases/$revision"
+config_locked update_script_install "$dir" "$revision"
+}
+
+update_script_install(){
+local dir=$1 revision=$2
 lnsb "$dir" || return 1
+if ! sub_service status sing-box >/dev/null 2>&1 && ! sub_service enabled sing-box >/dev/null 2>&1; then
+    : > /etc/s-box/admin-stopped || return 1
+fi
+if crontab -l 2>/dev/null | grep -Eq '^0 1 [*] [*] [*] (systemctl restart sing-box;rc-service sing-box restart|/usr/bin/sing_box --maintenance)$'; then
+    cronsb || return 1
+fi
 awk -F '更新内容' 'NR==1 {print $1}' "$dir/version" > /etc/s-box/v
 green "已切换到受审提交 $revision"
 }
@@ -4846,8 +5315,12 @@ echo -e "当前 Sing-box 内核版本：${bblue}${inscore:-未安装}${plain}；
 }
 
 core_update(){
+config_locked core_update_locked "$@"
+}
+
+core_update_locked(){
 (
-local requested=$1 work name candidate actual series template restore=0
+local requested=$1 work name candidate actual series template restore=0 extra=/etc/s-box/sb_extra.json
 local check_args
 [[ "$requested" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$ ]] || { red "内核版本号格式无效"; exit 1; }
 work=$(mktemp -d /etc/s-box/.core.XXXXXX) || exit 1
@@ -4856,11 +5329,13 @@ local status=$?
 trap - EXIT
 trap '' HUP INT TERM
 if (( restore )); then
+if [[ -f "$work/old-extra" ]]; then cp -p "$work/old-extra" "$extra" || return 1; fi
 if ! mv -f -- "$work/old-core" /etc/s-box/sing-box || ! cp -p "$work/old-config" /etc/s-box/sb.json; then
 red "恢复旧内核或配置失败，备份保留在 $work"
 return 1
 fi
 restartsb >/dev/null 2>&1 || red "旧内核及配置已恢复，但服务启动失败，请查看运行日志"
+[[ ! -f /etc/s-box/firewall.json ]] || firewall_sync || red "恢复原内核后的防火墙同步失败"
 red "内核切换未完成，已恢复旧内核及配置"
 fi
 rm -rf -- "$work"
@@ -4882,14 +5357,18 @@ actual=$(printf '%s\n' "$actual" | awk '/^sing-box version /{print $3; exit}')
 series=$(printf '%s' "$actual" | cut -d . -f 1,2)
 [[ "$series" == 1.10 ]] && template=/etc/s-box/sb10.json || template=/etc/s-box/sb11.json
 check_args=(-c "$template")
-[[ ! -f /etc/s-box/sb_extra.json ]] || check_args+=(-c /etc/s-box/sb_extra.json)
+if [[ -f $extra ]]; then
+    cp -p "$extra" "$work/old-extra" && extra_for_series "$extra" "$work/sb_extra.json" "$series" "$template" || exit 1
+    check_args+=(-c "$work/sb_extra.json")
+fi
 if ! "$candidate" check "${check_args[@]}"; then
 red "候选内核不兼容现有配置（Snell 需要 1.14.0+），已保留当前内核及配置"
 exit 1
 fi
 cp -p /etc/s-box/sing-box "$work/old-core" && cp -p /etc/s-box/sb.json "$work/old-config" || exit 1
 restore=1
-if mv -f -- "$candidate" /etc/s-box/sing-box && cp "$template" /etc/s-box/sb.json && restartsb checked && { [[ ! -f /etc/s-box/firewall.json ]] || firewall_sync; }; then
+if { [[ ! -f "$work/sb_extra.json" ]] || mv -f -- "$work/sb_extra.json" "$extra"; } &&
+    mv -f -- "$candidate" /etc/s-box/sing-box && cp "$template" /etc/s-box/sb.json && restartsb checked && { [[ ! -f /etc/s-box/firewall.json ]] || firewall_sync; }; then
 restore=0
 sbnh=$series
 if ! sbshare > /dev/null 2>&1; then
@@ -4928,6 +5407,13 @@ fi
 }
 
 unins(){
+config_locked unins_locked "$@"
+}
+
+unins_locked(){
+local unit_state svc
+unit_state=$(singbox_unit_state)
+[[ $unit_state == absent || $unit_state == project ]] || { red "同名 sing-box 服务归属未确认，已中止卸载"; return 1; }
 firewall_legacy
 sub_remove || { red "订阅入口清理失败，已中止卸载"; return 1; }
 if [[ -f /etc/s-box/firewall.json ]]; then
@@ -4942,19 +5428,23 @@ rm -f -- /etc/init.d/sing-box-managed-firewall
 fi
 if command -v apk >/dev/null 2>&1; then
 for svc in sing-box argo; do
+[[ $svc != sing-box || $unit_state == project ]] || continue
+[[ $svc != argo ]] || argo_unit_owned || continue
 rc-service "$svc" stop >/dev/null 2>&1
 rc-update del "$svc" default >/dev/null 2>&1
+rm -f -- "/etc/init.d/$svc"
 done
-rm -rf /etc/init.d/{sing-box,argo}
 else
 for svc in sing-box argo; do
+[[ $svc != sing-box || $unit_state == project ]] || continue
+[[ $svc != argo ]] || argo_unit_owned || continue
 systemctl stop "$svc" >/dev/null 2>&1
 systemctl disable "$svc" >/dev/null 2>&1
+rm -f -- "/etc/systemd/system/$svc.service"
 done
-rm -rf /etc/systemd/system/{sing-box.service,argo.service}
 fi
-ps -ef | grep "[l]ocalhost:$(config_get vmess-sb '.listen_port')" | awk '{print $2}' | xargs kill 2>/dev/null
-ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
+vm_port=$(config_get vmess-sb '.listen_port') && project_process temporary "$vm_port" stop
+project_process socks '' stop
 rm -rf /etc/s-box sing_box_update sbyg_update /usr/bin/sing_box /usr/bin/sb /root/geoip.db /root/geosite.db /root/warpapi /root/warpip /root/websbox
 rm -f /etc/local.d/alpineargo.start /etc/local.d/alpinesub.start /etc/local.d/alpinews5.start
 uncronsb
@@ -4980,6 +5470,10 @@ fi
 }
 
 sbshare(){
+config_locked sbshare_locked "$@"
+}
+
+sbshare_locked(){
 (
 local publish_dir node_file v2sub sub_switching=0
 if [[ ${1:-} == subscription-switch ]]; then
@@ -5128,7 +5622,7 @@ allports
 sbymfl
 tls=$(config_get vmess-sb '.tls.enabled') || return 1
 if [[ "$tls" = "false" ]]; then
-if ps -ef 2>/dev/null | grep -q '[c]loudflared.*run' || ps -ef 2>/dev/null | grep "[l]ocalhost:$(config_get vmess-sb '.listen_port')" >/dev/null 2>&1; then
+if project_process fixed '' status || project_process temporary "$vm_port" status; then
 vm_zs="TLS关闭"
 argoym="已开启"
 else
@@ -5166,17 +5660,20 @@ if [[ -s /etc/s-box/subtoken.log ]]; then sub_show_urls noqr; fi
 if [ "$argoym" = "已开启" ]; then
 #echo -e "Vmess-UUID：${yellow}$(config_get vless-sb '.users[0].uuid')${plain}"
 #echo -e "Vmess-Path：${yellow}$(config_get vmess-sb '.transport.path')${plain}"
-if ps -ef 2>/dev/null | grep "[l]ocalhost:$(config_get vmess-sb '.listen_port')" >/dev/null 2>&1; then
-echo -e "Argo临时域名：${yellow}$(cat /etc/s-box/argo.log 2>/dev/null | grep -a trycloudflare.com | awk 'NR==2{print}' | awk -F// '{print $2}' | awk '{print $1}')${plain}"
+if project_process temporary "$vm_port" status; then
+echo -e "Argo临时域名：${yellow}$(quick_tunnel_hostname)${plain}"
 fi
-if ps -ef 2>/dev/null | grep -q '[c]loudflared.*run'; then
-echo -e "Argo固定域名：${yellow}$(cat /etc/s-box/sbargoym.log 2>/dev/null)${plain}"
+if project_process fixed '' status; then
+local fixed_host
+fixed_host=$(cat /etc/s-box/sbargoym.log 2>/dev/null)
+if sub_valid_domain "$fixed_host"; then echo -e "Argo固定域名：${yellow}$fixed_host${plain}"
+else yellow "固定隧道域名无效，请重新设置"; fi
 fi
 fi
 echo "------------------------------------------------------------------------------------"
-if [[ -n $(ps -e | grep sbwpph) ]]; then
-s5port=$(cat /etc/s-box/sbwpph.log 2>/dev/null | awk '{print $3}'| awk -F":" '{print $NF}')
-s5gj=$(cat /etc/s-box/sbwpph.log 2>/dev/null | awk '{print $6}')
+if project_process socks '' status; then
+s5port=$(sed -n '1p' /etc/s-box/sbwpph.args)
+s5gj=$(sed -n '3p' /etc/s-box/sbwpph.args)
 case "$s5gj" in
 AT) showgj="奥地利" ;;
 AU) showgj="澳大利亚" ;;
@@ -5211,7 +5708,7 @@ SG) showgj="新加坡" ;;
 SK) showgj="斯洛伐克" ;;
 US) showgj="美国" ;;
 esac
-grep -q "country" /etc/s-box/sbwpph.log 2>/dev/null && s5ms="多地区Psiphon代理模式 (端口:$s5port  国家:$showgj)" || s5ms="本地Warp代理模式 (端口:$s5port)"
+[[ -n $s5gj ]] && s5ms="多地区Psiphon代理模式 (端口:$s5port  国家:$showgj)" || s5ms="本地Warp代理模式 (端口:$s5port)"
 echo -e "WARP-plus-Socks5状态：$yellow已启动 $s5ms$plain"
 else
 echo -e "WARP-plus-Socks5状态：$yellow未启动$plain"
@@ -5234,143 +5731,85 @@ echo -e "未设置域名分流"
 fi
 }
 
+warp_socks_boot(){
+(
+local enable=$1 cron_tmp
+cron_tmp=$(mktemp) || exit 1
+trap 'rm -f -- "$cron_tmp"' EXIT
+crontab -l > "$cron_tmp" 2>/dev/null
+sed -i -e '\|^@reboot .*cat /etc/s-box/sbwpph\.log |d' -e '\|^@reboot sleep 10 && /etc/s-box/sbwpph-run.sh |d' "$cron_tmp" || exit 1
+if [[ $enable == yes ]] && ! command -v apk >/dev/null 2>&1; then
+    printf '%s\n' '@reboot sleep 10 && /etc/s-box/sbwpph-run.sh >/dev/null 2>&1' >> "$cron_tmp" || exit 1
+fi
+crontab "$cron_tmp" || exit 1
+rm -f /etc/local.d/alpinews5.start || exit 1
+if [[ $enable == yes ]] && command -v apk >/dev/null 2>&1; then
+    printf '%s\n' '#!/bin/sh' 'sleep 10' '/etc/s-box/sbwpph-run.sh >/dev/null 2>&1 &' > /etc/local.d/alpinews5.start &&
+        chmod 700 /etc/local.d/alpinews5.start && rc-update add local default || exit 1
+fi
+)
+}
+
+warp_socks_probe(){
+local port=$1 proxy response address code
+sub_valid_port "$port" || return 1
+for proxy in socks5 socks5h; do
+    response=$(curl -q -fsS --proto '=https' --noproxy '' --proxy "$proxy://127.0.0.1:$port" \
+        --connect-timeout 2 --max-time 5 --write-out $'\n%{http_code}' https://icanhazip.com 2>/dev/null) || continue
+    code=${response##*$'\n'}; address=${response%$'\n'*}
+    address=${address%$'\n'}; address=${address%$'\r'}
+    [[ $code == 200 ]] && { ip_literal_valid 4 "$address" || ip_literal_valid 6 "$address"; } && return 0
+done
+return 1
+}
+
 inssbwpph(){
+local choice port country= family=6
 sbactive
-ins(){
-if ! release_matches "sbwpph_$cpu" /etc/s-box/sbwpph; then
-case $(uname -m) in
-aarch64) cpu=arm64;;
-x86_64) cpu=amd64;;
+yellow "1：启用本地 WARP Socks5   2：启用多地区 Psiphon   3：停止   0：返回"
+readp "请选择【0-3】：" choice || return 1
+case "$choice" in
+3) warp_socks_boot no && project_process socks '' stop &&
+       rm -f /etc/s-box/{sbwpph.log,sbwpph.args,sbwpph-run.sh}; return ;;
+1|2) ;;
+*) return ;;
 esac
-release_fetch "sbwpph_$cpu" /etc/s-box/sbwpph && chmod 755 /etc/s-box/sbwpph || return 1
+readp "WARP Socks5 端口（回车使用 40000）：" port || return 1
+port=${port:-40000}
+sub_valid_port "$port" || { red "无效的端口"; return 1; }
+if [[ $choice == 2 ]]; then
+    readp "输入两位大写国家代码（例如 US）：" country || return 1
+    [[ $country =~ ^[A-Z]{2}$ ]] || { red "国家代码无效"; return 1; }
 fi
-v4v6
-if [[ -n $v4 ]]; then
-sw46=4
-else
-red "IPV4不存在，确保安装过WARP-IPV4模式"
-sw46=6
+if ! release_matches "sbwpph_$cpu" /etc/s-box/sbwpph; then
+    release_fetch "sbwpph_$cpu" /etc/s-box/sbwpph && chmod 755 /etc/s-box/sbwpph || return 1
 fi
-echo
-readp "设置WARP-plus-Socks5端口（回车跳过端口默认40000）：" port
-if [[ -z $port ]]; then
-port=40000
-until [[ -z $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") && -z $(ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]] 
-do
-[[ -n $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") || -n $(ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]] && yellow "\n端口被占用，请重新输入端口" && readp "自定义端口:" port
-done
-else
-until [[ -z $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") && -z $(ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]]
-do
-[[ -n $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") || -n $(ss -tunlp | grep -w tcp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]] && yellow "\n端口被占用，请重新输入端口" && readp "自定义端口:" port
-done
+v4v6; [[ -z $v4 ]] || family=4
+warp_socks_boot no && project_process socks '' stop || return 1
+if ss -H -lntu | awk -v p="$port" '$5 ~ (":"p"$") {found=1} END {exit !found}'; then
+    red "端口已被占用"; return 1
 fi
-config_apply config_patch_socks_port "$port" || return 1
-ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
-return 0
-}
-unins(){
-ps -ef | grep '[s]bwpph' | awk '{print $2}' | xargs kill 2>/dev/null
-rm -rf /etc/s-box/sbwpph.log
-local cron_tmp
-cron_tmp=$(mktemp) || return 1
-crontab -l 2>/dev/null > "$cron_tmp"
-sed -i '/^@reboot .*cat \/etc\/s-box\/sbwpph\.log /d' "$cron_tmp" || return 1
-crontab "$cron_tmp" >/dev/null 2>&1
-rm "$cron_tmp"
-rm -rf /etc/local.d/alpinews5.start
-}
-aplws5(){
-if command -v apk >/dev/null 2>&1; then
-cat > /etc/local.d/alpinews5.start <<'EOF'
+rm -f -- /etc/s-box/sbwpph.log || return 1
+printf '%s\n' "$port" "$family" "$country" > /etc/s-box/sbwpph.args || return 1
+cat > /etc/s-box/sbwpph-run.sh <<'RUN' || return 1
 #!/bin/bash
-sleep 10
-nohup $(cat /etc/s-box/sbwpph.log 2>/dev/null)
-EOF
-chmod +x /etc/local.d/alpinews5.start
-rc-update add local default >/dev/null 2>&1
-else
-local cron_tmp
-cron_tmp=$(mktemp) || return 1
-crontab -l 2>/dev/null > "$cron_tmp"
-sed -i '/^@reboot .*cat \/etc\/s-box\/sbwpph\.log /d' "$cron_tmp" || return 1
-echo '@reboot sleep 10 && /bin/bash -c "nohup $(cat /etc/s-box/sbwpph.log 2>/dev/null) &"' >> "$cron_tmp"
-crontab "$cron_tmp" >/dev/null 2>&1
-rm "$cron_tmp"
+{ IFS= read -r port && IFS= read -r family && IFS= read -r country; } < /etc/s-box/sbwpph.args || exit 1
+[[ $port =~ ^[1-9][0-9]{0,4}$ && $port -le 65535 && $family =~ ^[46]$ ]] || exit 1
+args=(-b "127.0.0.1:$port")
+if [[ -n $country ]]; then
+    [[ $country =~ ^[A-Z]{2}$ ]] || exit 1
+    args+=(--cfon --country "$country")
 fi
-}
-echo
-yellow "1：重置启用WARP-plus-Socks5本地Warp代理模式"
-yellow "2：重置启用WARP-plus-Socks5多地区Psiphon代理模式"
-yellow "3：停止WARP-plus-Socks5代理模式"
-yellow "0：返回上层"
-readp "请选择【0-3】：" menu
-if [ "$menu" = "1" ]; then
-ins || return 1
-nohup /etc/s-box/sbwpph -b 127.0.0.1:$port -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1 &
-green "申请IP中……请稍等……" && sleep 20
-resv1=$(curl -sm3 --socks5 localhost:$port icanhazip.com)
-resv2=$(curl -sm3 -x socks5h://localhost:$port icanhazip.com)
-if [[ -z $resv1 && -z $resv2 ]]; then
-red "WARP-plus-Socks5的IP获取失败" && unins && exit
-else
-echo "/etc/s-box/sbwpph -b 127.0.0.1:$port -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1" > /etc/s-box/sbwpph.log
-aplws5
-green "WARP-plus-Socks5的IP获取成功，可进行Socks5代理分流"
+exec /etc/s-box/sbwpph "${args[@]}" "-$family" --endpoint 162.159.192.1:2408
+RUN
+chmod 700 /etc/s-box/sbwpph-run.sh || return 1
+nohup /etc/s-box/sbwpph-run.sh >/dev/null 2>&1 &
+sleep 20
+if ! warp_socks_probe "$port" || ! config_apply config_patch_socks_port "$port" || ! warp_socks_boot yes; then
+    project_process socks '' stop
+    red "WARP Socks5 探测或启用失败"; return 1
 fi
-elif [ "$menu" = "2" ]; then
-ins || return 1
-echo '
-奥地利（AT）
-澳大利亚（AU）
-比利时（BE）
-保加利亚（BG）
-加拿大（CA）
-瑞士（CH）
-捷克 (CZ)
-德国（DE）
-丹麦（DK）
-爱沙尼亚（EE）
-西班牙（ES）
-芬兰（FI）
-法国（FR）
-英国（GB）
-克罗地亚（HR）
-匈牙利 (HU)
-爱尔兰（IE）
-印度（IN）
-意大利 (IT)
-日本（JP）
-立陶宛（LT）
-拉脱维亚（LV）
-荷兰（NL）
-挪威 (NO)
-波兰（PL）
-葡萄牙（PT）
-罗马尼亚 (RO)
-塞尔维亚（RS）
-瑞典（SE）
-新加坡 (SG)
-斯洛伐克（SK）
-美国（US）
-'
-readp "可选择国家地区（输入末尾两个大写字母，如美国，则输入US）：" guojia
-nohup /etc/s-box/sbwpph -b 127.0.0.1:$port --cfon --country $guojia -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1 &
-green "申请IP中……请稍等……" && sleep 20
-resv1=$(curl -sm3 --socks5 localhost:$port icanhazip.com)
-resv2=$(curl -sm3 -x socks5h://localhost:$port icanhazip.com)
-if [[ -z $resv1 && -z $resv2 ]]; then
-red "WARP-plus-Socks5的IP获取失败，尝试换个国家地区吧" && unins && exit
-else
-echo "/etc/s-box/sbwpph -b 127.0.0.1:$port --cfon --country $guojia -$sw46 --endpoint 162.159.192.1:2408 >/dev/null 2>&1" > /etc/s-box/sbwpph.log
-aplws5
-green "WARP-plus-Socks5的IP获取成功，可进行Socks5代理分流"
-fi
-elif [ "$menu" = "3" ]; then
-unins && green "已停止WARP-plus-Socks5代理功能"
-else
-sing_box
-fi
+green "已启用 WARP Socks5"
 }
 
 sbsm(){
@@ -5383,11 +5822,21 @@ echo
 }
 
 # Older menu-7 updaters still save and launch the new script as /usr/bin/sb.
+if [[ "${1:-}" == --secure-routes ]]; then
+    [[ -s /etc/s-box/sb.json && -n $sbnh ]] || { red "未找到已安装的服务端配置"; exit 1; }
+    config_apply secure_server_routes
+    exit $?
+fi
+if [[ "${1:-}" == --maintenance ]]; then config_locked singbox_maintenance; exit $?; fi
 if [[ "${1:-}" == --firewall-enable ]]; then
 shift
 firewall_legacy
 firewall_enable "$@"
 exit $?
+fi
+if [[ -f /etc/s-box/sbwpph.log ]]; then
+    warp_socks_boot no && rm -f -- /etc/s-box/sbwpph.log || { red "旧菜单 14 启动项清理失败"; exit 1; }
+    yellow "已清理旧菜单 14 自启动命令。需要继续使用时，请在菜单 14 重新设置。"
 fi
 if [[ "$0" == /usr/bin/sb ]]; then
 migrate_shortcut || exit 1

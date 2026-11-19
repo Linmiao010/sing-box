@@ -80,6 +80,7 @@ export TEST_ROOT="$(pwd)"
 SB_RELEASE_DIR="$TEST_ROOT"
 cpu=amd64
 sbnh=1.14
+singbox_unit_state(){ echo project; }
 red(){ printf '%s\n' "$*"; }
 yellow(){ printf '%s\n' "$*"; }
 green(){ printf '%s\n' "$*"; }
@@ -125,7 +126,7 @@ sbshare(){ printf 'published\n' > "$TEST_ROOT/published"; }
 chmod +x s-box/sing-box
 '''
         return self.run_shell(
-            stubs + functions + "\ncore_update " + shlex.quote(version) + "\n",
+            functions + stubs + "\ncore_update " + shlex.quote(version) + "\n",
             check=False,
             env={
                 "TEST_SCENARIO": scenario,

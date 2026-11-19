@@ -130,8 +130,9 @@ class DistributionTests(ShellTestCase):
         funcs = (section("sub_migrate_tg", "tgnotice") + section("sub_valid_domain", "sub_service")
                  + section("sub_show_urls", "ipsub") + section("gitlab_clear_legacy", "gitlabsub"))
         script = funcs.replace("/etc/s-box", self.box.as_posix()) + """
-blue(){ echo "$1"; }; qrencode(){ echo "$5"; }; red(){ echo "$1" >&2; }
-sub_migrate_tg && bash box/sbtg.sh && sub_show_urls && gitlab_clear_legacy
+blue(){ echo "$1"; }; qrencode(){ cat; echo; }; red(){ echo "$1" >&2; }
+printf '%s\\n' '12345:fake' '98765' > box/telegram.credentials
+sub_migrate_tg && sub_show_urls && gitlab_clear_legacy
 """
         result = self.run_shell(script)
         self.assertNotIn(write, result.stdout + result.stderr)
@@ -149,7 +150,7 @@ sub_migrate_tg && bash box/sbtg.sh && sub_show_urls && gitlab_clear_legacy
         functions = section("cronsb", "lnsb") + '\ncrontab(){ if [[ $1 == -l ]]; then cat cron; else cp "$1" cron; fi; }\n'
         self.run_shell(functions + "cronsb && cronsb")
         self.assertIn(owned, cron.read_text())
-        self.assertEqual(cron.read_text().count("systemctl restart sing-box"), 1)
+        self.assertEqual(cron.read_text().count("/usr/bin/sing_box --maintenance"), 1)
         self.run_shell(functions + "uncronsb")
         self.assertEqual(cron.read_text(), unrelated)
 
@@ -261,8 +262,11 @@ sub_https_ready(){ echo probe >> events; [[ $can_verify == yes ]]; }
         script = fn + """
 sleep(){ :; }; red(){ :; }
 curl(){
-    local name
-    for arg; do [[ $arg != https://* ]] || name=${arg##*/}; done
+    local config name
+    [[ "$*" != *https://* ]] || return 1
+    IFS= read -r config || return 1
+    name=${config##*/}
+    name=${name%?}
     cp "box/$name" "${@: -1}" || return 1
     if [[ $name == jhsub.txt && $damage == yes ]]; then echo broken > "${@: -1}"; fi
 }

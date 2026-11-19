@@ -70,7 +70,7 @@ class Serv00RecoveryTests(unittest.TestCase):
                 allocate.assert_not_called()
 
     def test_failed_reset_restores_only_owned_allocations(self):
-        state = dict(vless_port=10001, vmess_port=10002, hy2_port=20001)
+        state = dict(vless_port=10001, vmess_port=10002, hy2_port=20001, origin_https=True)
         with patch.object(runtime, "load", return_value=state), patch.object(
             runtime, "allocated_ports", return_value={"tcp":[10001,10002,12345], "udp":[20001]}
         ), patch("builtins.input", side_effect=["", "", ""]), patch.object(

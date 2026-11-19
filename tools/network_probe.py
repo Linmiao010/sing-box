@@ -54,19 +54,32 @@ def arguments(argv):
         ),
     )
     parser.add_argument("--label", required=True, help="人工脱敏标签，例如 A1-cold-fixed-node")
-    parser.add_argument("--url", required=True, help="HTTP/HTTPS 目标；不会写入采集结果")
+    target_input = parser.add_mutually_exclusive_group(required=True)
+    target_input.add_argument("--url", help="公开的 HTTP/HTTPS 目标；敏感地址使用 --private-stdin")
+    target_input.add_argument("--private-stdin", action="store_true",
+                              help='从标准输入读取 JSON 对象，字段为 url 和可选的 proxy')
     parser.add_argument("--output", required=True, type=Path, help="追加 CSV 文件；不同进程请勿同时写入")
     parser.add_argument("--count", type=int, default=10, help="批次数，默认 10")
     parser.add_argument("--concurrency", type=int, default=1, help="每批请求并发数，默认 1")
     route = parser.add_mutually_exclusive_group()
     route.add_argument("--system-path", action="store_true", help="系统路由/TUN，禁用环境代理（默认）")
-    route.add_argument("--proxy", help="已核实端口的 HTTP/SOCKS 代理，例如 http://127.0.0.1:7890")
+    route.add_argument("--proxy", help="公开的 HTTP/SOCKS 代理；带认证的地址使用 --private-stdin")
     parser.add_argument("--family", choices=("auto", "4", "6"), default="auto", help="curl 连接地址族")
     parser.add_argument("--connect-timeout", type=float, default=10, help="连接预算，秒")
     parser.add_argument("--timeout", type=float, default=60, help="每次 curl 总预算，秒（含重定向）")
     parser.add_argument("--expected-bytes", type=int, help="可选：成功响应必须匹配的下载字节数")
     args = parser.parse_args(argv)
     try:
+        if args.private_stdin:
+            private = json.load(sys.stdin)
+            if (args.proxy or not isinstance(private, dict) or set(private) - {"url", "proxy"}
+                    or not isinstance(private.get("url"), str)
+                    or ("proxy" in private and not isinstance(private["proxy"], str))
+                    or (args.system_path and private.get("proxy"))):
+                raise ValueError
+            args.url, args.proxy = private["url"], private.get("proxy")
+        if any(ord(c) < 32 or ord(c) == 127 for c in (args.url + (args.proxy or ""))):
+            raise ValueError
         target = urlsplit(args.url)
         valid_url = target.scheme in ("http", "https") and bool(target.hostname)
     except ValueError:
@@ -83,8 +96,8 @@ def sample(command, args):
     row = {key: "" for key in METRICS}
     row.update(curl_exit_code="", success=0, probe_error="")
     try:
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                text=True, encoding="ascii", errors="replace", timeout=args.timeout + 5)
+        result = subprocess.run(command, input=args.curl_config, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, encoding="utf-8", errors="replace", timeout=args.timeout + 5)
         row["curl_exit_code"] = result.returncode
         values = result.stdout.strip().split("\t")
         try:
@@ -123,17 +136,18 @@ def collect(args):
     if not curl:
         raise OSError("curl unavailable")
     command = [curl, "--disable", "--silent", "--location", "--max-redirs", "10",
-               "--globoff", "--proto", "=http,https", "--proto-redir", "=http,https",
+               "--globoff", "--proto", "=http,https", "--proto-redir",
+               "=https" if urlsplit(args.url).scheme == "https" else "=http,https",
                "--connect-timeout", str(args.connect_timeout), "--max-time", str(args.timeout),
                "--output", os.devnull, "--write-out",
                "\t".join("%{" + field + "}" for field in METRICS)]
-    if args.proxy:
-        command += ["--proxy", args.proxy, "--noproxy", ""]
-    else:
-        command += ["--proxy", "", "--noproxy", "*"]
+    def config_value(value):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    args.curl_config = f"url = {config_value(args.url)}\nproxy = {config_value(args.proxy or '')}\n"
+    command += ["--config", "-", "--noproxy", "" if args.proxy else "*"]
     if args.family != "auto":
         command += ["-" + args.family]
-    command += ["--url", args.url]
     run_id = uuid.uuid4().hex
     metadata = dict(run_id=run_id, started_utc=datetime.now(timezone.utc).isoformat(),
                     label=args.label, path="proxy" if args.proxy else "system",

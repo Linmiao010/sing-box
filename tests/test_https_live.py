@@ -1,7 +1,7 @@
 """Real loopback HTTPS routing; no public certificates or system trust changes."""
-from functools import partial
 from http.client import HTTPResponse
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import hashlib
 import os
 import shlex
 import shutil
@@ -15,6 +15,10 @@ from shell_testlib import REPO, ShellTestCase, section
 
 
 class QuietFileHandler(SimpleHTTPRequestHandler):
+    def do_GET(self):
+        self.server.requests += 1
+        self.send_error(503)
+
     def log_message(self, format, *args):
         pass
 
@@ -35,15 +39,15 @@ class HTTPSLiveTests(ShellTestCase):
             "clmi.yaml": b"proxies: []\nproxy-groups: []\n",
             "jhsub.txt": b"vless://11111111-1111-1111-1111-111111111111@example.test:443\n",
         }
-        for token in (self.token, self.next_token, "wrong-token"):
-            directory = self.webroot / token
+        for token in (self.token, self.next_token):
+            directory = self.webroot / hashlib.sha256(token.encode()).hexdigest()
             directory.mkdir(parents=True)
             for name, content in self.files.items():
                 (directory / name).write_bytes(content)
-            (directory / "sb.json").write_bytes(b"private server configuration\n")
-
-        handler = partial(QuietFileHandler, directory=str(self.webroot))
-        self.backend = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            (directory / "sb.json").write_bytes(b"private server configuration")
+        self.snapshot = self.webroot / hashlib.sha256(self.token.encode()).hexdigest()
+        self.backend = ThreadingHTTPServer(("127.0.0.1", 0), QuietFileHandler)
+        self.backend.requests = 0
         self.backend_thread = threading.Thread(
             target=self.backend.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True,
         )
@@ -102,6 +106,8 @@ class HTTPSLiveTests(ShellTestCase):
             section("sub_caddy_site", "sub_caddy_prepare")
             + f"\nsub_caddy_site localhost:{self.https_port} {shlex.quote(token)} {self.backend.server_port}\n"
         ).stdout
+        key = hashlib.sha256(token.encode()).hexdigest()
+        generated = generated.replace(f"/var/lib/sbox-subscription-https/www/{key}", f'"{(self.webroot / key).as_posix()}"')
         # Only the local listener and certificate issuer differ from production.
         generated = generated.replace(" {\n", " {\n    bind 127.0.0.1\n    tls internal\n", 1)
         global_options = (
@@ -155,6 +161,7 @@ class HTTPSLiveTests(ShellTestCase):
         for path in (
             "/", f"/{self.token}", f"/{self.token}/", "/wrong-token/sbox.json",
             f"/{self.next_token}/sbox.json", f"/{self.token}/sb.json",
+            f"/{self.token.upper()}/sbox.json", f"/{self.token}/SBOX.JSON",
             f"/{self.token}/sbox.json/extra", "/sbox.json",
         ):
             with self.subTest(path=path):
@@ -162,7 +169,7 @@ class HTTPSLiveTests(ShellTestCase):
 
     def test_https_reads_new_content_after_atomic_file_replacement(self):
         self.assert_subscription(self.token, "sbox.json", self.files["sbox.json"])
-        directory = self.webroot / self.token
+        directory = self.snapshot
         replacement = directory / ".sbox.json.next"
         content = b'{"updated":true,"padding":"' + b"x" * 65536 + b'"}\n'
         replacement.write_bytes(content)
@@ -185,3 +192,9 @@ class HTTPSLiveTests(ShellTestCase):
             with self.subTest(name=name):
                 self.assertEqual(self.get(f"/{self.token}/{name}")[0], 404)
                 self.assert_subscription(self.next_token, name, content)
+
+    def test_missing_snapshot_returns_error_and_never_contacts_tcp_backend(self):
+        self.snapshot.rename(self.webroot / "retired")
+        for name in self.files:
+            self.assertEqual(self.get(f"/{self.token}/{name}")[0], 404)
+        self.assertEqual(self.backend.requests, 0)

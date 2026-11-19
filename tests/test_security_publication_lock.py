@@ -13,7 +13,7 @@ class PublicationLockTests(ShellTestCase):
             ("gitlab_copy_subscriptions", "gitlab_publish"), ("sbshare", "clash_sb_share"),
             ("client_warp_apply", "client_warp_egress_status")))
         source = source.replace("/etc/s-box", "box").replace("/var/lib/sbox-subscription", "public")
-        source = source.replace(" -g sboxsub ", " ").replace('chgrp sboxsub "$snapshot" && ', "")
+        source = source.replace(' -g "$group" ', " ").replace('chgrp "$group" "$snapshot" && ', "")
         if os.name == "nt":
             source += "\nflock(){ :; }\n"  # Only the rollback test runs on Windows.
         return source + r'''

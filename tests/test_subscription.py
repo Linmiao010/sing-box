@@ -23,25 +23,25 @@ class SubscriptionTests(ShellTestCase):
             funcs = funcs.replace(path, local)
         return funcs + r'''
 flock(){ [[ $1 == -x && $2 == 9 ]] && : >&9; }
-sub_service_user(){ [[ $1 == sboxsub ]]; }
+sub_service_user(){ [[ $1 == sboxsub || $1 == sboxcaddy ]]; }
 install(){
     local directory=0 mode=''
     while [[ $1 == -* ]]; do
         case $1 in
             -d) directory=1; shift ;;
             -m) mode=$2; shift 2 ;;
-            -g) [[ $2 == sboxsub ]] || return 1; shift 2 ;;
+            -g) [[ $2 == sboxsub || $2 == sboxcaddy ]] || return 1; shift 2 ;;
             -o) [[ $2 == root ]] || return 1; shift 2 ;;
             *) return 1 ;;
         esac
     done
     if (( directory )); then
-        [[ $mode == 0750 && $1 == publish && $2 == publish/www ]] && mkdir -p -- "$@"
+        [[ $mode == 0750 && ( $1 == publish || $1 == publish-https ) && $2 == "$1/www" ]] && mkdir -p -- "$@"
     else
-        [[ $mode == 640 && $1 == s-box/* && $2 == publish/release.*/* ]] && cp -- "$1" "$2"
+        [[ $mode == 640 && $1 == s-box/* && $2 == publish*/release.*/* ]] && cp -- "$1" "$2"
     fi
 }
-chgrp(){ [[ $1 == sboxsub && -d $2 ]]; }
+chgrp(){ [[ ( $1 == sboxsub || $1 == sboxcaddy ) && -d $2 ]]; }
 sub_service(){ case $1 in status|enabled) [[ -f "service-$1" ]];; *) return 0;; esac; }
 sub_httpd_running(){ [[ ${1:-} != legacy-websbox && -f httpd-active ]]; }
 sub_httpd_start(){ touch httpd-active; }
@@ -71,7 +71,7 @@ command(){
             script += f"! sub_valid_port {shlex.quote(value)} || exit 15\n"
         self.run_shell(script)
 
-    def test_caddy_routes_only_subscription_files_to_loopback(self):
+    def test_caddy_serves_only_subscription_files_from_snapshot(self):
         caddy = REPO / ".test-tools" / ("caddy.exe" if os.name == "nt" else "caddy")
         caddy_cmd = str(caddy) if caddy.exists() else shutil.which("caddy")
         if not caddy_cmd:
@@ -98,9 +98,10 @@ command(){
                 for value in item:
                     yield from walk(value)
         nodes = list(walk(config))
-        paths = [node["path"] for node in nodes if "path" in node]
-        self.assertEqual(paths, [["/abc_123-xyz/sbox.json", "/abc_123-xyz/clmi.yaml", "/abc_123-xyz/jhsub.txt"]])
-        self.assertEqual([node["dial"] for node in nodes if "dial" in node], ["127.0.0.1:18080"])
+        patterns = [node["path_regexp"]["pattern"] for node in nodes if "path_regexp" in node]
+        self.assertEqual(patterns, ["^/abc_123-xyz/(sbox[.]json|clmi[.]yaml|jhsub[.]txt)$"])
+        self.assertEqual([node["dial"] for node in nodes if "dial" in node], [])
+        self.assertTrue(any(node.get("handler") == "file_server" for node in nodes))
         self.assertTrue(any(node.get("status_code") == 404 for node in nodes))
 
     def test_failed_activation_preserves_previous_links_and_configuration(self):
@@ -172,20 +173,27 @@ touch httpd-active service-status service-enabled
 sub_caddy_apply(){ sub_caddy_site "$1" "$2" "$3" > site.caddy; }
 sub_https_ready(){
     [[ $(cat s-box/subdomain.log) == old.example.com && $(cat s-box/subtoken.log) == old_token_12345678 ]] || return 1
+    [[ $(cat "publish-https/www/$(sub_https_key old_token_12345678)/sbox.json") == old-private ]] || return 1
     local file
     for file in sbox.json clmi.yaml jhsub.txt; do
-        cmp -s "s-box/$file" "publish/www/$2/$file" || return 1
+        cmp -s "s-box/$file" "publish-https/www/$(sub_https_key "$2")/$file" || return 1
     done
     touch probe-passed
 }
 sbshare(){ return 0; }
+mkdir -p publish-https/www
+mv s-box/sbox.json s-box/next
+echo old-private > s-box/sbox.json
+sub_root=publish-https sub_group=sboxcaddy sub_links "$(sub_https_key old_token_12345678)" || exit 74
+mv s-box/next s-box/sbox.json
 sub_apply new.example.com new_token_12345678 18081 || exit 75
-[[ -f probe-passed && $(cat publish/www/new_token_12345678/sbox.json) == '{}' ]]
+[[ ! -L publish-https/www/$(sub_https_key old_token_12345678) ]] || exit 76
+[[ -f probe-passed && $(cat publish-https/www/$(sub_https_key new_token_12345678)/sbox.json) == '{}' ]]
 '''
         self.run_shell(script)
         self.assertEqual((box / "subdomain.log").read_text().strip(), "new.example.com")
         self.assertEqual((box / "subtoken.log").read_text().strip(), "new_token_12345678")
-        self.assertEqual((box / "subport.log").read_text().strip(), "18081")
+        self.assertFalse((self.root / "httpd-active").exists())
         self.assertFalse(old_dir.exists())
         self.assertTrue((self.root / "probe-passed").is_file())
 

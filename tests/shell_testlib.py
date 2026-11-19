@@ -5,6 +5,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -27,6 +28,12 @@ def section(start_function, end_function):
     helpers_end = re.search(r"^inssbjsonser\(\)\s*\{", source, re.M)
     if helpers_start and helpers_end and not (helpers_start.start() <= start.start() < helpers_end.start()):
         body = source[helpers_start.start():helpers_end.start()] + body
+    for first, after in (("valid_node_address", "config_jq"), ("sub_valid_domain", "sub_service"),
+                         ("ip_literal_valid", "public_ip")):
+        if first + "(){" not in body:
+            body = source[source.index(first + "(){"):source.index(after + "(){", source.index(first + "(){"))] + body
+    if ("singbox_unit_state" in body or "singbox_require_owned" in body) and "singbox_unit_state(){" not in body:
+        body = source[source.index("singbox_unit_state(){"):source.index("\nsbservice(){")] + "\n" + body
     return body
 
 
@@ -38,11 +45,29 @@ class ShellTestCase(unittest.TestCase):
 
     def run_shell(self, script, check=True, env=None):
         variables = os.environ.copy()
+        script = script.replace("/run/s-box-config.lock", (self.root / "config.lock").as_posix())
         if os.name == "nt":
             # Native jq.exe must receive Linux config values such as /test literally.
             variables["MSYS2_ARG_CONV_EXCL"] = "*"
             # Assign after Bash startup, which otherwise converts TMPDIR back to /tmp.
             script = "export TMPDIR=" + shlex.quote(self.root.as_posix()) + "\n" + script
+            # Git Bash lacks Linux flock. Exercise overlapping transactions with a
+            # directory mutex, and leave native flock untouched on Linux.
+            script = script.replace("flock -x 8 || exit 1", "test_config_flock || exit 1")
+            script = r"""
+test_config_flock(){
+    local i
+    for i in {1..600}; do
+        if mkdir "$TMPDIR/config-mutex" 2>/dev/null; then
+            trap 'rmdir "$TMPDIR/config-mutex"' EXIT
+            return 0
+        fi
+        sleep .03
+    done
+    return 1
+}
+""" + script
+            script = "python3(){ " + shlex.quote(Path(sys.executable).as_posix()) + ' "$@"; }\n' + script
         if env:
             variables.update(env)
         script_file = self.root / "run-test.sh"

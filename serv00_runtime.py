@@ -32,6 +32,10 @@ ASSETS = {
 }
 RELEASE_URL = "https://github.com/yonggekkk/Cloudflare-vless-trojan/releases/download/serv00/"
 PRODUCTS = ("v2sub.txt", "clashmeta.txt", "singbox.txt")
+RESTRICTED = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+              "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::/96",
+              "::ffff:0:0/96", "fc00::/7", "fe80::/10", "ff00::/8", "168.63.129.16/32"]
+ORIGIN_NAME = "argo-origin.invalid"
 SUB_DIRECTORY = "sing-box-sub"
 HOME = Path.home()
 ROOT = HOME / ".sing-box-serv00"
@@ -208,6 +212,9 @@ def allocate(kind):
 
 def choose_ports(config):
     listing = allocated_ports()
+    separate = os.getenv("SERV00_ARGO_PORT") or config.get("argo_dedicated_port")
+    if separate and port(separate) in listing["tcp"]:
+        listing["tcp"].remove(port(separate))
     for kind, keys in (("tcp", ("vless_port", "vmess_port")), ("udp", ("hy2_port",))):
         for key in keys:
             if config.get(key):
@@ -239,7 +246,30 @@ def identity(old, migrate=False):
     return user_id, path
 
 
-def import_old(path):
+def legacy_warp_policy(route, policy_backup):
+    if policy_backup is not None:
+        if (not policy_backup.is_absolute() or policy_backup.is_symlink() or not policy_backup.is_file()
+                or policy_backup.resolve().is_relative_to(LEGACY.resolve())
+                or policy_backup.stat().st_uid != os.getuid() or policy_backup.stat().st_mode & 0o077):
+            fail("请提供本账户私有且来源已核实的旧配置备份绝对路径（0600，位于旧目录以外）")
+        route = load(policy_backup).get("route", {})
+    rules = [r for r in route.get("rules", []) if r.get("outbound") == "wg"]
+    referenced = {tag for rule in rules for tag in rule.get("rule_set", [])}
+    sets = [r for r in route.get("rule_set", []) if r.get("tag") in referenced]
+    for item in sets:
+        if item.get("type") != "remote" or not item.get("url", "").startswith("https://"):
+            fail("旧 WARP 规则集需要人工迁移")
+    if any("override_address" in rule or rule.get("action", "route") != "route" for rule in rules):
+        fail("请手工复核旧 WARP 的目标地址改写或特殊动作，迁移已暂停")
+    if rules and policy_backup is None:
+        print("拟导入以下匹配条件和远程规则集。命中流量通过 wg，无独立密钥时拒绝。", file=sys.stderr)
+        print(json.dumps({"rules": rules, "rule_set": sets}, indent=2, ensure_ascii=True), file=sys.stderr)
+        if not sys.stdin.isatty() or input("核实策略来源后输入 IMPORT-WARP 继续迁移：") != "IMPORT-WARP":
+            fail("尚未批准旧策略。迁移已暂停，原节点及路由继续生效。可指定 SERV00_WARP_POLICY_BACKUP。")
+    return {"warp_rules": rules, "warp_sets": sets, "warp_policy_reviewed": True}
+
+
+def import_old(path, policy_backup=None):
     if path.is_symlink() or not path.is_file():
         fail("未找到旧配置")
     old = load(path)
@@ -247,12 +277,6 @@ def import_old(path):
     ws = inbounds["vmess-ws-in"]
     reality = inbounds["vless-reality-vesion"]
     hy = inbounds["hysteria-in1"]
-    rules = [r for r in old.get("route", {}).get("rules", []) if r.get("outbound") == "wg"]
-    referenced = {tag for rule in rules for tag in rule.get("rule_set", [])}
-    sets = [r for r in old.get("route", {}).get("rule_set", []) if r.get("tag") in referenced]
-    for item in sets:
-        if item.get("type") != "remote" or not item.get("url", "").startswith("https://"):
-            fail("旧 WARP 规则集需要人工迁移")
     return {
         "uuid": ws["users"][0]["uuid"], "path": ws["transport"]["path"],
         "vmess_port": ws["listen_port"], "vless_port": reality["listen_port"],
@@ -260,7 +284,7 @@ def import_old(path):
         "reality": valid_host(reality["tls"]["server_name"]),
         "addresses": [str(ipaddress.ip_address(i["listen"])) for i in inbounds.values()
                       if i["type"] == "hysteria2"],
-        "warp_rules": rules, "warp_sets": sets,
+        **legacy_warp_policy(old.get("route", {}), policy_backup),
     }
 
 
@@ -275,6 +299,15 @@ def acquire_state(old, migrate):
     if series not in ("modern", "1.10"):
         fail("SERV00_CLIENT_SERIES 支持 modern 或 1.10")
     state["client_series"] = series
+    revision = os.getenv("SERV00_CLIENT_RULES_REVISION") or state.get("rules_revision", "sing")
+    if revision != "sing" and not re.fullmatch(r"[a-f0-9]{40}", revision):
+        fail("地域规则需使用已审查的 40 位小写提交号或 sing")
+    state["rules_revision"] = revision
+    cidrs = ROOT / "restricted-cidrs.json"
+    values = load(cidrs) if cidrs.exists() else []
+    if not isinstance(values, list) or not all(isinstance(x, str) for x in values):
+        fail("restricted-cidrs.json 必须是 CIDR 字符串数组")
+    state["restricted_cidrs"] = [str(ipaddress.ip_network(value, strict=True)) for value in values]
     state.setdefault("sni", os.getenv("SERV00_TLS_NAME", SITE))
     valid_host(state["sni"])
     state["reality"] = valid_host(state.get("reality") or os.getenv("REALITY") or SITE)
@@ -292,10 +325,24 @@ def acquire_state(old, migrate):
         ip = ip or next(iter(addresses), None)
     state["ip"] = str(ipaddress.ip_address(ip))
     choose_ports(state)
-    if "backend" not in state:
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            state["backend"] = probe.getsockname()[1]
+    separate = os.getenv("SERV00_ARGO_PORT") or state.get("argo_dedicated_port")
+    if separate:
+        separate = port(separate)
+        if separate not in allocated_ports()["tcp"] or separate in (state["vmess_port"], state["vless_port"]):
+            fail("独立回环源站需要本账户已登记且未用于节点的 TCP 端口")
+        state["backend"] = state["argo_dedicated_port"] = separate
+    else:
+        for value in [state["ip"], *state.get("addresses", [])]:
+            addr = ipaddress.ip_address(value)
+            if addr.is_loopback or addr.is_unspecified or addr.is_multicast or addr.is_link_local:
+                fail("复用 VMess 端口时，对外监听必须使用具体单播地址")
+        verified = state.get("argo_port_host") == HOST or os.getenv("SERV00_LOOPBACK_PORT_CONFIRMED") == "1"
+        if not verified and sys.stdin.isatty():
+            verified = input("宿主已确认该账号端口的 UID 约束覆盖回环且支持公网、回环分别绑定？输入 YES：") == "YES"
+        if not verified:
+            fail("请核实宿主 UID 保护及双地址绑定后设置 SERV00_LOOPBACK_PORT_CONFIRMED=1，或指定独立 SERV00_ARGO_PORT")
+        state["argo_port_host"] = HOST
+        state["backend"] = state["vmess_port"]
     return state
 
 
@@ -322,7 +369,38 @@ def certificate(stage, previous, state):
     return hashlib.sha256(der).hexdigest()
 
 
-def server_config(s, private_key, warp):
+def prepare_origin(state, prior):
+    directory = ROOT / "origin-tls"
+    if not directory.exists():
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            pair = Path(tmp) / "pair"
+            pair.mkdir(mode=0o700)
+            run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                 "-nodes", "-days", "3650", "-keyout", str(pair / "private.key"), "-out", str(pair / "cert.pem"),
+                 "-subj", "/CN=" + ORIGIN_NAME, "-addext", "subjectAltName=DNS:" + ORIGIN_NAME])
+            os.replace(pair, directory)
+    cert = directory / "cert.pem"
+    run(["openssl", "verify", "-trusted", str(cert), "-verify_hostname", ORIGIN_NAME, str(cert)])
+    if state.get("argo_token") and (not prior.get("origin_https") or any(
+            state.get(k) != prior.get(k) for k in ("backend", "argo_token", "argo_domain"))):
+        url = f"https://127.0.0.1:{state['backend']}"
+        print(f"固定隧道控制台设置 Service={url}，Origin Server Name={ORIGIN_NAME}，CA Pool={cert}，关闭 No TLS Verify。",
+              file=sys.stderr)
+        if os.getenv("SERV00_FIXED_ORIGIN_CONFIRMED") != url and not (
+                sys.stdin.isatty() and input("保存控制台设置后，输入上述 HTTPS 地址：").strip() == url):
+            fail("固定隧道配置待确认。非交互操作请将 SERV00_FIXED_ORIGIN_CONFIRMED 设为已核对的完整 HTTPS 地址")
+    state["origin_https"] = True
+
+
+def server_series():
+    version = run([ROOT / "sb", "version"], text=True).stdout
+    match = re.search(r"(?m)^sing-box version (1\.(?:10|14)\.\d+)\s*$", version)
+    if not match:
+        fail("未识别服务端内核系列（支持已校验摘要的 1.10.x 或 1.14.x）")
+    return match[1]
+
+
+def server_config(s, private_key, warp, series="1.10.7"):
     auth = s["uuid"]
     listener = s["ip"]
     shared_tls = dict(enabled=True, certificate_path="cert.pem", key_path="private.key")
@@ -351,11 +429,44 @@ def server_config(s, private_key, warp):
     for i, addr in enumerate(s.get("addresses", [listener])[1:], 2):
         others.extend([{**reality, "tag": f"vless-in{i}", "listen": addr},
                        {**ws, "tag": f"vmess-wss-in{i}", "listen": addr, "tls": shared_tls}])
-    return {"log": {"disabled": True}, "inbounds": hy + others + [reality,
+    inbounds = hy + others + [reality,
         {**ws, "tag": "vmess-ws-in", "tls": shared_tls},
-        {**ws, "tag": "vmess-argo-in", "listen": "127.0.0.1", "listen_port": s["backend"]}],
-        "outbounds": [{"type": "direct", "tag": "direct"}, warp or {"type": "block", "tag": "wg"}],
-        "route": route}
+        {**ws, "tag": "vmess-argo-in", "listen": "127.0.0.1", "listen_port": s["backend"],
+         "tls": dict(enabled=True, certificate_path=str(ROOT / "origin-tls" / "cert.pem"),
+                     key_path=str(ROOT / "origin-tls" / "private.key"))}]
+    config = {"log": {"disabled": True}, "inbounds": inbounds,
+              "outbounds": [{"type": "direct", "tag": "direct"}], "route": route}
+    rules = list(route.get("rules", []))
+    restricted = RESTRICTED + s.get("restricted_cidrs", [])
+    no_address = {"ip_cidr": ["0.0.0.0/0", "::/0"], "invert": True}
+    if series.startswith("1.10."):
+        for inbound in inbounds:
+            inbound["domain_strategy"] = "prefer_ipv4"
+        config["outbounds"].extend([{"tag": "block", "type": "block"}, warp or {"type": "block", "tag": "wg"}])
+        route["rules"] = [{"ip_cidr": restricted, "outbound": "block"}, {**no_address, "outbound": "block"}, *rules]
+    elif series.startswith("1.14."):
+        if warp:
+            peer = {"address": warp["server"], "port": warp["server_port"], "public_key": warp["peer_public_key"],
+                    "allowed_ips": ["0.0.0.0/0", "::/0"]}
+            if "reserved" in warp:
+                peer["reserved"] = warp["reserved"]
+            addresses = warp["local_address"]
+            config["endpoints"] = [{"type": "wireguard", "tag": "wg", "private_key": warp["private_key"],
+                    "address": addresses if isinstance(addresses, list) else [addresses],
+                    "mtu": warp.get("mtu", 1280), "peers": [peer]}]
+        else:
+            rules = [{**{k:v for k,v in r.items() if k != "outbound"}, "action": "reject"} for r in rules]
+        detours = sorted({rs["download_detour"] for rs in route.get("rule_set", []) if "download_detour" in rs})
+        if detours:
+            config["http_clients"] = [{"tag": "rules-" + tag, "detour": tag} for tag in detours]
+        route["rule_set"] = [{**{k:v for k,v in rs.items() if k != "download_detour"},
+                              **({"http_client": "rules-" + rs["download_detour"]} if "download_detour" in rs else {})}
+                             for rs in route.get("rule_set", [])]
+        route["rules"] = [{"action": "resolve", "strategy": "prefer_ipv4"},
+                          {"ip_cidr": restricted, "action": "reject"}, {**no_address, "action": "reject"}, *rules]
+    else:
+        fail("未知服务端版本")
+    return config
 
 
 def emit_clients(dest, s, argo, cert, fingerprint):
@@ -415,7 +526,7 @@ def emit_clients(dest, s, argo, cert, fingerprint):
                           *outbound, dict(type="direct", tag="direct")],
             "route": {"auto_detect_interface": True, "final": "select",
                       "rule_set": [dict(type="remote", tag=tag, format="binary",
-                          url="https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/" + path + ".srs",
+                          url="https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@" + s.get("rules_revision", "sing") + "/geo/" + path + ".srs",
                           download_detour="select", update_interval="1d") for tag, path in sets],
                       "rules": [{"ip_is_private": True, "outbound": "direct"},
                                 {"rule_set": ["geoip-cn", "geosite-cn"], "outbound": "direct"},
@@ -424,8 +535,7 @@ def emit_clients(dest, s, argo, cert, fingerprint):
             {"clash_mode": "Global", "server": "dns-proxy"}, {"rule_set": ["geosite-cn"], "server": "dns-cn"},
             {"query_type": ["A", "AAAA"], "server": "fakeip"}]}
     ranges = {"inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18"}
-    full["experimental"] = {"clash_api": {"external_controller": "127.0.0.1:9090", "default_mode": "Rule"},
-                            "cache_file": {"enabled": True}}
+    full["experimental"] = {"cache_file": {"enabled": True}}
     full["dns"] = dns
     routes = full["route"]["rules"]
     routes[:0] = [{"clash_mode": "Direct", "outbound": "direct"}, {"clash_mode": "Global", "outbound": "select"}]
@@ -482,8 +592,19 @@ def temp_argo():
         text = (ROOT / "tunnel.log").read_text(encoding="utf-8", errors="replace")
     except FileNotFoundError:
         return ""
-    hosts = re.findall(r"https://([a-z0-9-]+\.trycloudflare\.com)\b", text)
+    hosts = re.findall(r"https://([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.trycloudflare\.com)(?=[\s/|]|$)", text)
     return hosts[-1] if hosts else ""
+
+
+def running_argo(state):
+    if state.get("argo_domain"):
+        return state["argo_domain"]
+    for _ in range(15):
+        domain = temp_argo()
+        if domain:
+            return domain
+        time.sleep(1)
+    fail("连接器尚未公布临时域名。请检查 tunnel.log 后通过 --keep 重试")
 
 
 def temporary_tunnel_healthy(domain):
@@ -513,7 +634,7 @@ def pid_of(name):
 
 def stop_legacy():
     # A random basename alone is insufficient on a shared FreeBSD host.
-    for marker in ("sb.txt", "ag.txt"):
+    for marker in ("ag.txt", "sb.txt"):
         file = LEGACY / marker
         if not file.is_file() or file.is_symlink():
             continue
@@ -571,8 +692,14 @@ def start(name, args, directory, env=None, log=None):
 
 def ensure_running(directory, state):
     # Import and scheduling credentials should not live in either daemon's environment.
-    env = {k:v for k,v in os.environ.items() if k not in
+    env = {k:v for k,v in os.environ.items() if not k.startswith("TUNNEL_") and k not in
            {"ARGO_AUTH", "TUNNEL_TOKEN", "SUUID", "SSH_PASS", "SSHPASS", "ACCOUNTS"}}
+    if not state.get("origin_https"):
+        stop("server")
+        fail("旧配置的 Argo 连接器已停止；请从受审发布目录执行 --update 完成 HTTPS 回源迁移")
+    if state.get("warp_rules") and not state.get("warp_policy_reviewed"):
+        stop("server")
+        fail("旧 WARP 策略尚未确认。请在 SSH 使用 --update 核实策略后再启动；仅有旧 recovery 时重新执行 --migrate")
     if not pid_of("sb"):
         start("sb", ["run", "-c", "config.json"], directory, env)
     if not pid_of("server"):
@@ -581,7 +708,8 @@ def ensure_running(directory, state):
             env["TUNNEL_TOKEN"] = state["argo_token"]
             args += ["run"]
         else:
-            args += ["--url", f"http://127.0.0.1:{state['backend']}"]
+            args += ["--no-tls-verify=false", "--url", f"https://127.0.0.1:{state['backend']}", "--origin-server-name", ORIGIN_NAME,
+                     "--origin-ca-pool", str(ROOT / "origin-tls" / "cert.pem")]
         start("server", args, directory, env, ROOT / "tunnel.log")
 
 
@@ -657,6 +785,8 @@ def publish(directory, state):
 
 def configure(operation, requested_ports=None):
     previous = ACTIVE.resolve() if ACTIVE.exists() else None
+    backup = os.getenv("SERV00_WARP_POLICY_BACKUP")
+    policy_backup = Path(backup) if backup else None
     if operation == "install" and (previous or (LEGACY / "config.json").exists()):
         fail("检测到已有安装。旧部署请显式使用 --migrate")
     if operation == "migrate":
@@ -665,9 +795,11 @@ def configure(operation, requested_ports=None):
         if LEGACY.is_symlink() or LEGACY.stat().st_uid != os.getuid():
             fail("请从核实过的本账号旧配置恢复")
         LEGACY.chmod(0o700)
-        old = import_old(LEGACY / "config.json")
+        old = import_old(LEGACY / "config.json", policy_backup)
     elif previous:
         old = load(previous / "state.json")
+        if "warp_rules" in old and not old.get("warp_policy_reviewed"):
+            old.update(legacy_warp_policy({"rules": old["warp_rules"], "rule_set": old.get("warp_sets", [])}, policy_backup))
     elif operation == "install":
         old = {"uuid": os.getenv("SUUID") or None}
         if sys.stdin.isatty():
@@ -709,6 +841,8 @@ def configure(operation, requested_ports=None):
     changed = False
     try:
         fingerprint = certificate(stage, previous, state)
+        series = server_series()
+        prepare_origin(state, old)
         if previous:
             private_key = (previous / "reality.key").read_text()
         else:
@@ -716,42 +850,39 @@ def configure(operation, requested_ports=None):
             private_key = re.search(r"PrivateKey:\s*(\S+)", pair).group(1)
             state["public_key"] = re.search(r"PublicKey:\s*(\S+)", pair).group(1)
         (stage / "reality.key").write_text(private_key)
-        write_json(stage / "config.json", server_config(state, private_key, warp))
+        write_json(stage / "config.json", server_config(state, private_key, warp, series))
         run([ROOT / "sb", "check", "-c", "config.json"], cwd=stage)
         write_json(stage / "state.json", state)
         if operation in ("install", "migrate", "update"):
             install_release()
-        previous_tunnel = bool(pid_of("server"))
         if operation == "migrate":
             # Keep the new, validated identity for repair if a live port bind fails
             # after stopping the former process. Reusing old exposed keys is unsafe.
             switch(ROOT / "recovery", stage.name)
             quarantine_legacy_launchers()
             stop_legacy()
-        stop("sb")
         changed = True
-        if operation in ("argo", "migrate"):
-            stop("server")
+        stop("server")
+        stop("sb")
         ensure_running(stage, state)
-        argo = state.get("argo_domain") or temp_argo()
-        if not argo and not state.get("argo_token"):
-            for _ in range(6):
-                time.sleep(1)
-                argo = temp_argo()
-                if argo:
-                    break
+        argo = running_argo(state)
         (stage / "argo-domain").write_text(argo)
         emit_clients(stage, state, argo, (stage / "cert.pem").read_text(), fingerprint)
         switch(ACTIVE, stage.name)
         publish(stage, state)
     except BaseException:
         if changed:
+            stop("server")
             stop("sb")
-            if not previous_tunnel or operation == "argo":
-                stop("server")
             if previous:
                 switch(ACTIVE, previous.name)
-                ensure_running(previous, load(previous / "state.json"))
+                try:
+                    previous_state = load(previous / "state.json")
+                    ensure_running(previous, previous_state)
+                    if not previous_state.get("argo_domain"):
+                        publish_tunnel_change(previous_state, running_argo(previous_state))
+                except SetupError as err:
+                    print(str(err), file=sys.stderr)
             elif ACTIVE.is_symlink():
                 ACTIVE.unlink()
         recovery = ROOT / "recovery"
@@ -767,7 +898,7 @@ def configure(operation, requested_ports=None):
         (ROOT / "recovery").unlink(missing_ok=True)
         print("节点身份已轮换。请替换客户端订阅，验证后执行 --retire-legacy")
     if state.get("argo_domain"):
-        print(f"固定隧道的 HTTP 回源须设为 127.0.0.1:{state['backend']}")
+        print(f"固定隧道 HTTPS 回源为 127.0.0.1:{state['backend']}，证书名称为 {ORIGIN_NAME}")
     if previous:
         old_backup = (ROOT / "previous").resolve() if (ROOT / "previous").is_symlink() else None
         switch(ROOT / "previous", previous.name)
@@ -808,6 +939,8 @@ def retire_legacy(state):
 
 def reset_ports():
     state = load(ACTIVE / "state.json")
+    if not state.get("origin_https") or (state.get("warp_rules") and not state.get("warp_policy_reviewed")):
+        fail("请先从受审版本执行 --update 后再更换端口")
     assigned = allocated_ports()
     ports = {}
     original = []
@@ -821,6 +954,8 @@ def reset_ports():
         ports[key] = port(value) if value else None
     if ports["vless_port"] and ports["vless_port"] == ports["vmess_port"]:
         fail("两个 TCP 入站需要不同的端口")
+    reconnect = bool(pid_of("server"))
+    stop("server")
     try:
         for kind, key in (("tcp", "vless_port"), ("tcp", "vmess_port"), ("udp", "hy2_port")):
             if ports[key] is not None:
@@ -841,7 +976,22 @@ def reset_ports():
                     failed = True
         if failed:
             fail("宿主未能恢复全部原端口，请在 SSH 对照 active/state.json 和 devil port list 恢复")
+        if reconnect:
+            ensure_running(ACTIVE.resolve(), state)
+            publish_tunnel_change(state, running_argo(state))
         raise
+
+
+def publish_tunnel_change(state, current):
+    if current and current != (ACTIVE / "argo-domain").read_text():
+        der = run(["openssl", "x509", "-in", str(ACTIVE / "cert.pem"), "-outform", "der"]).stdout
+        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+            stage = Path(tmp)
+            emit_clients(stage, state, current, (ACTIVE / "cert.pem").read_text(), hashlib.sha256(der).hexdigest())
+            publish(stage, state)
+            for name in PRODUCTS:
+                os.replace(stage / name, ACTIVE / name)
+        (ACTIVE / "argo-domain").write_text(current)
 
 
 def perform(op):
@@ -853,10 +1003,12 @@ def perform(op):
         if stage.parent != ROOT or not stage.name.startswith("generation-"):
             fail("待恢复配置目录无效")
         state = load(stage / "state.json")
+        if not state.get("origin_https") or (state.get("warp_rules") and not state.get("warp_policy_reviewed")):
+            fail("恢复快照早于回源和策略迁移。请从本受审发布目录重新执行 --migrate")
         run([ROOT / "sb", "check", "-c", "config.json"], cwd=stage)
         stop_legacy()
         ensure_running(stage, state)
-        argo = state.get("argo_domain") or temp_argo()
+        argo = running_argo(state)
         der = run(["openssl", "x509", "-in", str(stage / "cert.pem"), "-outform", "der"]).stdout
         emit_clients(stage, state, argo, (stage / "cert.pem").read_text(), hashlib.sha256(der).hexdigest())
         (stage / "argo-domain").write_text(argo)
@@ -882,21 +1034,14 @@ def perform(op):
     state = load(ACTIVE / "state.json")
     if op in ("keep", "restart"):
         if op == "restart":
+            stop("server")
             stop("sb")
+        elif not pid_of("sb"):
+            stop("server")
         elif not state.get("argo_token") and pid_of("server") and not temporary_tunnel_healthy(temp_argo()):
             stop("server")
         ensure_running(ACTIVE.resolve(), state)
-        current = state.get("argo_domain") or temp_argo()
-        if current and current != (ACTIVE / "argo-domain").read_text():
-            # Regenerate subscription artifacts without interrupting proxy connections.
-            der = run(["openssl", "x509", "-in", str(ACTIVE / "cert.pem"), "-outform", "der"]).stdout
-            with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
-                stage = Path(tmp)
-                emit_clients(stage, state, current, (ACTIVE / "cert.pem").read_text(), hashlib.sha256(der).hexdigest())
-                publish(stage, state)
-                for name in PRODUCTS:
-                    os.replace(stage / name, ACTIVE / name)
-            (ACTIVE / "argo-domain").write_text(current)
+        publish_tunnel_change(state, running_argo(state))
     elif op == "retire-legacy":
         retire_legacy(state)
     elif op == "show":
@@ -912,8 +1057,8 @@ def perform(op):
     elif op == "uninstall":
         if input("停止本项目进程并删除本项目私有目录及当前订阅？输入 DELETE：") != "DELETE":
             return
-        stop("sb")
         stop("server")
+        stop("sb")
         retire_token(state["token"])
         if (PANEL / "app.js").exists() and digest(PANEL / "app.js") == digest(SOURCE / "app.js"):
             (PANEL / "app.js").unlink()
@@ -937,7 +1082,8 @@ def main():
         if args.operation not in ("install", "update"):
             fail("--account-file 仅用于通过 SSH 部署受审版本")
         values = load(args.account_file)
-        for key in ("SUUID", "REALITY", "IP", "TCP1_PORT", "TCP2_PORT", "UDP_PORT", "ARGO_DOMAIN", "ARGO_AUTH"):
+        for key in ("SUUID", "REALITY", "IP", "TCP1_PORT", "TCP2_PORT", "UDP_PORT", "ARGO_DOMAIN", "ARGO_AUTH",
+                    "SERV00_ARGO_PORT", "SERV00_LOOPBACK_PORT_CONFIRMED", "SERV00_FIXED_ORIGIN_CONFIRMED", "SERV00_CLIENT_RULES_REVISION"):
             if values.get(key):
                 os.environ[key] = str(values[key])
     os.umask(0o077)

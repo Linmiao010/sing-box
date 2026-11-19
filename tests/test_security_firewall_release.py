@@ -6,11 +6,14 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tarfile
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
@@ -39,28 +42,232 @@ class FakeIptables:
     def __init__(self):
         self.tables = {}
         self.policy = {}
+        self.sockets = {4: "", 6: ""}
         for binary in ("iptables", "ip6tables"):
             self.policy[binary] = "DROP"
             self.tables[binary, "filter", "INPUT"] = [("-p", "tcp", "--dport", "2222", "-j", "ACCEPT")]
             self.tables[binary, "nat", "PREROUTING"] = [
                 ("-p", "udp", "--dport", "1235", "-j", "DNAT", "--to-destination", ":1234")]
 
-    def __call__(self, binary, wait, seconds, opt, table, action, chain, *args, check=True):
+    def __call__(self, binary, *params, check=True):
+        if binary == "ss":
+            return subprocess.CompletedProcess([], 0, self.sockets[int(params[0][1:])], "")
+        if binary == "nft":
+            return subprocess.CompletedProcess([], 0, '{"nftables":[]}', "")
+        wait, seconds, opt, table, action, *tail = params
         assert (wait, opt) == ("-w", "-t")
+        if not tail and action == "-S":
+            listing = [shlex.join(["-A", chain, *entry]) for (tool, tbl, chain), entries in self.tables.items()
+                       if tool == binary and tbl == table for entry in entries]
+            return subprocess.CompletedProcess([], 0, "\n".join(listing), "")
+        chain, *args = tail
+        args = tuple(args)
         rules = self.tables[binary, table, chain]
         result = 0
         if action == "-C":
             result = 0 if args in rules else 1
-        elif action == "-I":
-            rules.insert(0, args)
+        elif action == "-A":
+            rules.append(args)
         elif action == "-D":
             rules.remove(args)
-        elif action != "-S":
+        elif action == "-S":
+            text = "\n".join(shlex.join(["-A", chain, *entry]) for entry in rules)
+            return subprocess.CompletedProcess([], 0, text, "")
+        else:
             raise AssertionError(action)
         return subprocess.CompletedProcess([], result, "", "")
 
 
 class FirewallTests(unittest.TestCase):
+    def test_cli_upgrades_legacy_state_and_clears_only_selected_hops(self):
+        fw, fake = module(), FakeIptables()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(fw, "ROOT", Path(tmp)), \
+             patch.object(fw, "cmd", fake), patch.object(fw, "backend", return_value="iptables"):
+            nodes(fw.ROOT)
+            def cli(*args):
+                with patch.object(sys, "argv", ["firewall.py", *args]), patch.dict(sys.modules, {
+                        "fcntl": types.SimpleNamespace(LOCK_EX=1, flock=lambda *_: None)}):
+                    return fw.main()
+            cli("enable", "--input-position", "append")
+            cli("add", "hy2-sb", "4000:4005")
+            path = fw.ROOT / "firewall.json"
+            state = json.loads(path.read_text())
+            state.pop("append_backend")
+            path.write_text(json.dumps(state))
+            # Simulate a deployed old head rule. A legacy sync withdraws its allow,
+            # retains administrator rules & valid hops, and never inserts at the head.
+            chain = fake.tables["iptables", "filter", "INPUT"]
+            chain.reverse()
+            with patch("sys.stderr", new_callable=io.StringIO) as warning:
+                cli("sync")
+                self.assertIn("手动放行", warning.getvalue())
+            self.assertFalse(any(fw.MARK in r for r in chain))
+            with patch("sys.stdout", new_callable=io.StringIO) as output:
+                cli("list", "hy2-sb")
+                self.assertEqual(output.getvalue().strip(), "4000:4005")
+            cli("enable", "--input-position", "append")
+            self.assertTrue(all(fw.MARK in r for r in chain[1:]))
+            cli("clear", "hy2-sb")
+            self.assertNotIn("4000:4005", path.read_text())
+            cli("remove")
+            self.assertFalse(path.exists())
+            self.assertIn("2222", str(chain))
+
+    def test_ipv6_forwards_and_socket_inventory_errors_abort_before_writes(self):
+        fw, fake = module(), FakeIptables()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(fw, "ROOT", Path(tmp)), \
+             patch.object(fw, "backend", return_value="iptables"):
+            (fw.ROOT / "sb.json").write_text(json.dumps({"inbounds": [
+                {"tag": "hy2-sb", "listen": "2001:db8::8", "listen_port": 3000}]}))
+            table = fake.tables["ip6tables", "nat", "PREROUTING"]
+            table.append(("-p", "udp", "-d", "2001:db8::/64", "-m", "multiport", "--dports", "4000:4020,4050",
+                          "-j", "DNAT", "--to", "[2001:db8:1::2]:10000"))
+            with patch.object(fw, "cmd", fake):
+                fw.manage("add", "hy2-sb", "4021:4049")
+            path = fw.ROOT / "firewall.json"
+            old = path.read_bytes()
+            rules = copy.deepcopy(fake.tables)
+            with patch.object(fw, "cmd", fake), self.assertRaisesRegex(ValueError, "端口 4019:4020"):
+                fw.manage("add", "hy2-sb", "4019:4021")
+            for listing in (FileNotFoundError("ss"), subprocess.CompletedProcess([], 0, "", "incomplete")):
+                def unreadable(*args, **kwargs):
+                    if args[0] == "ss":
+                        if isinstance(listing, Exception):
+                            raise listing
+                        return listing
+                    return fake(*args, **kwargs)
+                with self.subTest(listing=listing), patch.object(fw, "cmd", unreadable), \
+                     self.assertRaises((OSError, ValueError)):
+                    fw.manage("sync")
+            self.assertEqual(old, path.read_bytes())
+            self.assertEqual(rules, fake.tables)
+
+    def test_nft_dnat_interval_map_keeps_distinct_destinations_and_ports(self):
+        fw = module()
+        fields = {"concat": [{"payload": {"protocol": "ip", "field": "daddr"}},
+                             {"payload": {"protocol": "udp", "field": "dport"}}]}
+        objects = [{"map": {"family": "inet", "table": "policy", "name": "services", "flags": ["interval"],
+                            "elem": [[{"concat": ["192.0.2.8", {"range": [4000, 4050]}]}, "192.0.2.20"],
+                                     [{"concat": ["192.0.2.9", 4100]}, "192.0.2.21"]]}},
+                   {"rule": {"family": "inet", "table": "policy", "chain": "prerouting", "expr": [
+                       {"dnat": {"family": "ip", "addr": {"map": {"key": fields, "data": "@services"}}}}]}}]
+        with patch.object(fw, "nft_objects", return_value=objects):
+            self.assertEqual([(str(net), span) for net, span, _ in fw.nft_forwards(set())],
+                             [("192.0.2.8/32", (4000, 4050)), ("192.0.2.9/32", (4100, 4100))])
+            objects[0]["map"]["name"] = "other"
+            self.assertEqual([(str(net), span) for net, span, _ in fw.nft_forwards(set())],
+                             [("0.0.0.0/0", (1, 65535))])
+
+    def test_failed_rollback_preserves_previous_intent_for_next_sync(self):
+        fw, fake = module(), FakeIptables()
+        original = copy.deepcopy(fake.tables)
+        def fail(*args, **kwargs):
+            if args[0] == "ip6tables" and "-A" in args:
+                raise OSError("new rule failed")
+            if args[0] == "iptables" and "-D" in args:
+                raise OSError("undo failed")
+            return fake(*args, **kwargs)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(fw, "ROOT", Path(tmp)), \
+             patch.object(fw, "backend", return_value="iptables"):
+            nodes(fw.ROOT)
+            with patch.object(fw, "cmd", fail), self.assertRaisesRegex(ValueError, "回滚未完成"):
+                fw.manage("enable", input_position="append")
+            journal = json.loads((fw.ROOT / "firewall.json").read_text())
+            self.assertFalse(journal["allow"])
+            self.assertTrue(journal["rules"])
+            with patch.object(fw, "cmd", fake):
+                fw.manage("sync")
+            self.assertEqual(fake.tables, original)
+
+    def test_admin_denies_and_later_policy_updates_precede_managed_allow(self):
+        for engine in ("iptables", "ufw"):
+            fw = module()
+            fake = FakeIptables()
+            with self.subTest(engine=engine), tempfile.TemporaryDirectory() as tmp, patch.object(fw, "ROOT", Path(tmp)), \
+                 patch.object(fw, "cmd", fake), patch.object(fw, "backend", return_value=engine):
+                nodes(fw.ROOT)
+                chains = []
+                for tool, source in (("iptables", "192.0.2.11"), ("ip6tables", "2001:db8::11")):
+                    chain = "INPUT" if engine == "iptables" else ("ufw-user-input" if tool == "iptables" else "ufw6-user-input")
+                    rules = fake.tables.setdefault((tool, "filter", chain), [])
+                    rules.append(("-s", source, "-p", "tcp", "--dport", "2443", "-j", "DROP"))
+                    chains.append((rules, source))
+                before = copy.deepcopy(fake.tables)
+                with self.assertRaisesRegex(ValueError, "append"):
+                    fw.manage("enable")
+                self.assertEqual(fake.tables, before)
+                self.assertFalse((fw.ROOT / "firewall.json").exists())
+                fw.manage("enable", input_position="append")
+                # Existing admin rules and rules added after the last sync must both win.
+                for rules, _ in chains:
+                    rules.append(("-i", "private0", "-p", "tcp", "--dport", "2443", "-j", "DROP"))
+                fw.manage("sync")
+                def verdict(rules, source, interface):
+                    for rule in rules:
+                        if "--dport" not in rule or rule[rule.index("--dport") + 1] != "2443":
+                            continue
+                        if "-s" in rule and rule[rule.index("-s") + 1] != source:
+                            continue
+                        if "-i" in rule and rule[rule.index("-i") + 1] != interface:
+                            continue
+                        return rule[rule.index("-j") + 1]
+                    return "DROP"
+                for rules, blocked in chains:
+                    self.assertEqual(verdict(rules, blocked, "public0"), "DROP")
+                    self.assertEqual(verdict(rules, "other", "private0"), "DROP")
+                    self.assertEqual(verdict(rules, "other", "public0"), "ACCEPT")
+
+    def test_overlaps_leave_disk_and_rules_untouched(self):
+        fw = module()
+        fake = FakeIptables()
+        with tempfile.TemporaryDirectory() as tmp, patch.object(fw, "ROOT", Path(tmp)), \
+             patch.object(fw, "cmd", fake), patch.object(fw, "backend", return_value="iptables"):
+            config = {"inbounds": [{"tag": "hy2-sb", "listen": "192.0.2.8", "listen_port": 3000},
+                                   {"tag": "tuic5-sb", "listen": "192.0.2.8", "listen_port": 3001}]}
+            (fw.ROOT / "sb.json").write_text(json.dumps(config))
+            fw.manage("add", "hy2-sb", "4000:4010")
+            saved = (fw.ROOT / "firewall.json").read_bytes()
+            fake.sockets[6] = "UNCONN 0 0 [::]:4500 [::]:* v6only:0\n"
+            fake.tables["iptables", "nat", "PREROUTING"].append(
+                ("-p", "udp", "-d", "192.0.2.0/24", "--dport", "4800:4900", "-j", "DNAT",
+                 "--to-destination", "192.0.2.20:5000"))
+            rules = copy.deepcopy(fake.tables)
+            for span, expected in [("3000", "3000"), ("2999:3002", "3000"), ("3990:4000", "4000"),
+                                   ("4005:4020", "4005:4010"), ("4490:4500", "4500"), ("4700:4820", "4800:4820")]:
+                with self.subTest(span=span), self.assertRaisesRegex(ValueError, "端口 " + expected + "（"):
+                    fw.manage("add", "tuic5-sb", span)
+                self.assertEqual(saved, (fw.ROOT / "firewall.json").read_bytes())
+                self.assertEqual(rules, fake.tables)
+            fw.manage("add", "tuic5-sb", "4011:4020")
+            fake.sockets[6] = "UNCONN 0 0 [::]:4500 [::]:* v6only:1\n"
+            fw.manage("add", "tuic5-sb", "4500")
+            # Same port range at a distinct public destination is independent.
+            config["inbounds"][1]["listen"] = "192.0.2.9"
+            (fw.ROOT / "sb.json").write_text(json.dumps(config))
+            fw.manage("add", "tuic5-sb", "4000:4010")
+
+    def test_nft_chain_tail_and_forward_intervals(self):
+        fw = module()
+        objects = [{"chain": {"family": "inet", "table": "policy", "name": "input", "type": "filter", "hook": "input"}},
+                   {"rule": {"family": "inet", "table": "policy", "chain": "input", "expr": [{"drop": None}]}},
+                   {"rule": {"family": "inet", "table": "policy", "chain": "forward_udp", "expr": [
+                       {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "daddr"}},
+                                  "right": {"prefix": {"addr": "2001:db8::", "len": 64}}}},
+                       {"match": {"op": "in", "left": {"payload": {"protocol": "udp", "field": "dport"}},
+                                  "right": {"set": [443, {"range": [4500, 4520]}]}}},
+                       {"redirect": {"port": 12443}}]}}]
+        with patch.object(fw, "nft_objects", return_value=objects), patch.object(fw, "cmd") as run:
+            for addr in ("192.0.2.1", "2001:db8::1"):
+                fw.nft_rule(("nft", "", addr, "tcp", "2443", ""), True)
+                self.assertEqual(run.call_args.args[:6], ("nft", "add", "rule", "inet", "policy", "input"))
+            objects.append({"chain": dict(objects[0]["chain"], name="other_input")})
+            run.reset_mock()
+            with self.assertRaisesRegex(ValueError, "手动放行"):
+                fw.nft_rule(("nft", "", "::", "tcp", "2443", ""), True)
+            run.assert_not_called()
+            self.assertEqual([(str(addr), pair) for addr, pair, _ in fw.nft_forwards(set())],
+                             [("2001:db8::/64", (443, 443)), ("2001:db8::/64", (4500, 4520))])
+
     def test_firewalld_levels_zones_and_existing_priority(self):
         fw = module()
         configs = {True: {"existing SSH service"}, False: {"existing SSH service"}}
@@ -108,7 +315,7 @@ class FirewallTests(unittest.TestCase):
             nodes(fw.ROOT)
             fw.manage("sync")
             self.assertEqual(fake.tables, original)
-            fw.manage("enable")
+            fw.manage("enable", input_position="append")
             fw.manage("add", "hy2-sb", "4000:4009")
             active = copy.deepcopy(fake.tables)
             fw.manage("enable")
@@ -130,14 +337,14 @@ class FirewallTests(unittest.TestCase):
         fake = FakeIptables()
         initial = copy.deepcopy(fake.tables)
         def fail(*args, **kwargs):
-            if args[0] == "iptables" and "-I" in args:
+            if args[0] == "iptables" and "-A" in args:
                 raise OSError("simulated per-family failure")
             return fake(*args, **kwargs)
         with tempfile.TemporaryDirectory() as tmp, patch.object(fw, "ROOT", Path(tmp)), \
              patch.object(fw, "cmd", fail), patch.object(fw, "backend", return_value="iptables"):
             nodes(fw.ROOT)
             with self.assertRaises(OSError):
-                fw.manage("enable")
+                fw.manage("enable", input_position="append")
             self.assertEqual(fake.tables, initial)
 
 
@@ -269,9 +476,16 @@ def namespace_scenario(parent, engine):
     fw = module()
     def system(tool, *args):
         return subprocess.check_output([tool, *args], text=True)
+    system("ip", "link", "set", "lo", "up")
+    for address in ("192.0.2.8/32", "192.0.2.9/32"):
+        system("ip", "addr", "add", address, "dev", "lo")
+    for address in ("2001:db8::8/128", "2001:db8::9/128"):
+        system("ip", "-6", "addr", "add", address, "dev", "lo", "nodad")
     if engine == "nft":
         system("nft", "add table inet fixture; add chain inet fixture input { type filter hook input priority 0; policy drop; }; "
                "add rule inet fixture input tcp dport 2222 accept; "
+               "add rule inet fixture input ip saddr 192.0.2.9 udp dport 3001 drop; "
+               "add rule inet fixture input ip6 saddr 2001:db8::9 udp dport 3001 drop; "
                "add chain inet fixture prerouting { type nat hook prerouting priority -100; }; "
                "add rule inet fixture prerouting udp dport 1235 redirect to :1234")
         def snapshot():
@@ -281,6 +495,8 @@ def namespace_scenario(parent, engine):
         for tool in caps:
             system(tool, "-P", "INPUT", "DROP")
             system(tool, "-A", "INPUT", "-p", "tcp", "--dport", "2222", "-j", "ACCEPT")
+            system(tool, "-A", "INPUT", "-s", "192.0.2.9" if tool == "iptables" else "2001:db8::9",
+                   "-p", "udp", "--dport", "3001", "-j", "DROP")
             system(tool, "-t", "nat", "-A", "PREROUTING", "-p", "udp", "--dport", "1235",
                    "-j", "REDIRECT", "--to-ports", "1234")
         def snapshot():
@@ -297,10 +513,20 @@ def namespace_scenario(parent, engine):
     with tempfile.TemporaryDirectory() as tmp, patch.object(fw, "ROOT", Path(tmp)), \
          patch.object(fw, "backend", return_value=engine):
         nodes(fw.ROOT)
-        fw.manage("enable")
+        fw.manage("enable", input_position="append")
         fw.manage("add", "hy2-sb", "4000:4010")
         once = snapshot()
         assert_retained(once)
+        for family, allowed, blocked in ((socket.AF_INET, "192.0.2.8", "192.0.2.9"),
+                                         (socket.AF_INET6, "2001:db8::8", "2001:db8::9")):
+            with socket.socket(family, socket.SOCK_DGRAM) as receiver:
+                receiver.bind((allowed, 3001))
+                receiver.settimeout(0.5)
+                for source in (blocked, allowed):
+                    with socket.socket(family, socket.SOCK_DGRAM) as sender:
+                        sender.bind((source, 0))
+                        sender.sendto(source.encode(), (allowed, 3001))
+                assert receiver.recvfrom(256)[0].decode() == allowed
         fw.manage("enable")
         assert snapshot() == once
         nodes(fw.ROOT, 3002)
@@ -314,8 +540,8 @@ def namespace_scenario(parent, engine):
 
 
 class NamespaceTest(unittest.TestCase):
-    @unittest.skipUnless(sys.platform == "linux" and all(shutil.which(x) for x in ("unshare", "iptables", "ip6tables")),
-                         "requires Linux network namespaces and both iptables families")
+    @unittest.skipUnless(sys.platform == "linux" and all(shutil.which(x) for x in ("unshare", "ip", "ss", "iptables", "ip6tables")),
+                         "requires Linux network namespaces, iproute2 and both iptables families")
     def test_kernel_rules(self):
         if subprocess.run(["unshare", "-n", "true"], capture_output=True).returncode:
             self.skipTest("network namespace creation is unavailable")

@@ -40,7 +40,7 @@ class SecurityIdentityTests(ShellTestCase):
         self.prologue = f"""
 uuid={OLD}; sbnh=1.14; hostname=test; ipv=prefer_ipv4
 port_vm_ws=18443; port_vl_re=18444; port_tu=18445; port_hy2=18446; port_an=18447
-tlsyn=true; ym_vm_ws=www.bing.com; ym_vl_re=localhost; short_id=abcd
+tlsyn=true; ym_vm_ws=www.bing.com; ym_vl_re=reality.example.test; short_id=abcd
 private_key=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8
 for proto in vmess_ws hy2 tuic an; do
     printf -v "certificatec_$proto" '%s' box/cert.pem
@@ -120,6 +120,61 @@ done
     def read_nodes(self):
         return json.loads(self.box.joinpath("sb.json").read_text())["inbounds"]
 
+    def test_refresh_and_push_keep_credentials_out_of_program_arguments(self):
+        self.generate()
+        profile = dict(enabled=True, server="192.0.2.5", port=2408, ip="172.16.0.4",
+                       private_key=base64.b64encode(b"W" * 32).decode(),
+                       public_key=base64.b64encode(b"P" * 32).decode())
+        (self.box / "client_warp.json").write_text(json.dumps(profile))
+        (self.box / "subdomain.log").write_bytes(b"sub.example.test\n")
+        (self.box / "subtoken.log").write_bytes(b"sample_path_token\n")
+        (self.box / "cfvmadd_local.txt").write_bytes(b"203.0.113.4\n")
+        (self.box / "cfymjx.txt").write_bytes(b"cdn.example.test\n")
+        cfg = json.loads((self.box / "sb.json").read_text())
+        next(n for n in cfg["inbounds"] if n["tag"] == "vmess-sb")["tls"]["certificate_path"] = "acme/cert.crt"
+        (self.box / "sb.json").write_text(json.dumps(cfg))
+        wrappers = r'''
+export ARG_LOG="$PWD/argv-fixture"
+export QR_IN="$PWD/qr-fixture"
+export PUSH_BODY="$PWD/push-fixture"
+for tool in jq sed awk cat openssl base64 grep tr cp mv install mktemp; do
+    eval "$tool"'(){ printf "%s\n" "$@" >> "$ARG_LOG"; command '"$tool"' "$@"; }'
+done
+qrencode(){ printf '%s\n' "$@" >> "$ARG_LOG"; command cat >> "$QR_IN"; }
+curl(){ printf '%s\n' "$@" >> "$ARG_LOG"; command cat >> "$PUSH_BODY"; command cat <&3 >/dev/null; echo '{"ok":true}'; }
+export -f curl jq
+flock(){ :; }
+config_locked(){ "$@"; }
+sub_publish_current(){ local dir=$1 file; shift; for file in "$@"; do cp "$dir/$file" "box/$file" || return 1; done; }
+'''
+        sources = [("extra_client_data", "extra_menu"), ("result_vl_vm_hy_tu", "cfargo_ym"),
+                   ("sbshare", "clash_sb_share"), ("tgsbshow", "changeserv"), ("sub_show_urls", "ipsub")]
+        for enabled in (True, False):
+            if enabled:
+                (self.box / "telegram.credentials").write_bytes(b"1234:example_bot\n@fixture_room\n")
+            else:
+                self.run_code(sources, "readp(){ menu=2; }; tgsbshow")
+            code = wrappers + "\nsbshare >/dev/null && sub_show_urls >/dev/null"
+            if enabled:
+                code += " && tgnotice >/dev/null"
+            self.run_code(sources, code)
+            arguments = self.root.joinpath("argv-fixture").read_text(encoding="utf8")
+            for value in (OLD, "vless://", "vmess://", "hysteria2://", "sample_path_token",
+                          profile["private_key"], "example_bot", "@fixture_room"):
+                self.assertNotIn(value, arguments)
+            qr = self.root.joinpath("qr-fixture").read_text()
+            self.assertIn("sample_path_token", qr)
+            self.assertIn("vless://", qr)
+            mh = yaml.safe_load((self.box / "clmi.yaml").read_text(encoding="utf8"))
+            vm = next(n for n in mh["proxies"] if n["type"] == "vmess")
+            self.assertEqual((vm["server"], vm["servername"]), ("203.0.113.4", "cdn.example.test"))
+            vm = next(n for n in json.loads((self.box / "sbox.json").read_text())["outbounds"] if n["type"] == "vmess")
+            self.assertEqual(vm["tls"]["server_name"], "cdn.example.test")
+            uri = self.box.joinpath("vm_ws_tls.txt").read_text().strip()
+            self.assertEqual(json.loads(base64.b64decode(uri.removeprefix("vmess://")))["host"], "cdn.example.test")
+        self.box.joinpath("cfymjx.txt").write_text("invalid value")
+        self.assertNotEqual(self.run_code(sources, wrappers + "\nsbshare >/dev/null", check=False).returncode, 0)
+
     def test_legacy_client_accepts_complete_export(self):
         cli = os.environ.get("SING_BOX_110_BIN") or next(
             REPO.glob(".test-tools/serv00-compat/sing-box-1.10.*/sing-box.exe"), None)
@@ -135,8 +190,18 @@ done
         pem = self.box.joinpath("cert.pem").read_text().strip()
         fingerprint = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
         for version in ("1.10", "1.14"):
+            revision = "sing"
+            if version == "1.14":
+                revision = "ab" * 20
+                (self.box / "client-rules-revision").write_text(revision + "\n")
             self.generate(version)
             sb, mh = self.render(version)
+            sets = sb["route"]["rule_set"]
+            self.assertEqual({item["tag"] for item in sets}, {"geosite-cn", "geoip-cn"})
+            for item in sets:
+                self.assertIn(f"meta-rules-dat@{revision}/geo/", item["url"])
+                self.assertEqual(item["update_interval"], "1d")
+            self.assertNotIn("clash_api", sb["experimental"])
             self.assertFalse(mh["allow-lan"])
             self.assertEqual(mh["dns"]["listen"], "127.0.0.1:1053")
             for kind in ("hysteria2", "tuic", "trojan") + (("anytls",) if version != "1.10" else ()):
