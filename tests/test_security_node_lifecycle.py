@@ -167,6 +167,61 @@ foreign
 '''
         self.run_shell(body + script)
 
+    def test_stop_closes_tunnels_before_releasing_origin(self):
+        body = section("restartsb", "cronsb").replace("/etc/s-box", "box").replace("/etc/local.d", "local")
+        self.run_shell(body + r'''
+singbox_require_owned(){ :; }
+argo_unit_owned(){ return 0; }
+crontab(){ return 0; }
+cronsb(){ echo "cron $*" >> events; }
+sub_service(){
+    case $1 in
+        enabled) [[ $2 == argo ]];;
+        status) return 1;;
+        *) echo "$1 $2" >> events;;
+    esac
+}
+project_process(){ echo "$1 $3" >> events; [[ $1 != temporary-all || ! -f simulate-failure ]]; }
+red(){ :; }
+singbox_stop || exit 1
+[[ -e box/admin-stopped ]] || exit 2
+echo "stop argo
+disable argo
+fixed stop
+temporary-all stop
+cron remove
+stop sing-box" > expected
+cmp expected events || exit 3
+touch simulate-failure
+: > events
+if singbox_stop; then exit 4; fi
+! grep -Fxq 'stop sing-box' events
+''')
+
+    def test_vmess_port_change_keeps_origin_until_tunnels_are_closed(self):
+        node = {"tag": "vmess-sb", "listen": "127.0.0.1", "listen_port": 9000, "tls": {"enabled": False}}
+        for name in CONFIGS:
+            (self.box / name).write_text(json.dumps({"inbounds": [node]}))
+        body = (section("config_jq", "inssbjsonser") + section("argo_stop_fixed", "singbox_finish_stop"))
+        self.run_shell(body.replace("/etc/s-box", "box") + r'''
+sbnh=1.14
+config_lock_held=1
+red(){ :; }; argo_unit_owned(){ return 1; }; crontab(){ return 0; }
+project_process(){
+    [[ $(jq -r '.inbounds[0].listen_port' box/sb.json) == 9000 ]] || return 2
+    [[ $1 != temporary-all || -e allow-stop ]]
+}
+ip_priority_restart(){ echo restarted >> events; }
+change_port(){ config_apply config_patch_inbound vmess-sb '{"listen_port":9001}'; }
+if change_port; then exit 1; fi
+[[ $(jq -r '.inbounds[0].listen_port' box/sb.json) == 9000 ]] || exit 2
+touch allow-stop
+change_port || exit 3
+for file in box/{sb,sb10,sb11}.json; do
+    [[ $(jq -r '.inbounds[0].listen_port' "$file") == 9001 ]] || exit 4
+done
+''')
+
     def test_stop_schedule_boot_and_explicit_enable(self):
         legacy = "0 1 * * * systemctl restart sing-box;rc-service sing-box restart"
         unrelated = "15 6 * * * /usr/local/bin/other-maintenance"
@@ -187,6 +242,7 @@ command(){
     builtin command "$@"
 }
 green(){ :; }; red(){ echo "$*" >&2; }
+pgrep(){ return 1; } # The isolated service-manager fixture has no cloudflared processes.
 readp(){ printf -v "$2" '%s' "$MENU"; }
 crontab(){ if [[ $1 == -l ]]; then cat cron; else cp "$1" cron; fi; }
 interrupt_at(){

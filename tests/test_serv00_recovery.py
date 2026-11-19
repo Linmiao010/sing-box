@@ -83,6 +83,33 @@ class Serv00RecoveryTests(unittest.TestCase):
                                  ["add","tcp","10001"], ["add","tcp","10002"]])
         config.assert_not_called()
 
+    def test_conflicts_leave_running_ports_untouched(self):
+        state = dict(vless_port=10001, vmess_port=10002, hy2_port=20001, argo_dedicated_port=13001, origin_https=True)
+        assigned = {"tcp":[10001,10002,13001], "udp":[20001,10002]}
+        for selected in (["", "13001", ""], ["", "10002", "10002"], ["10002", "", ""]):
+            with self.subTest(selected=selected), patch.object(runtime, "load", return_value=state), patch.object(
+                    runtime,"allocated_ports",return_value=assigned), patch("builtins.input", side_effect=selected), patch.object(
+                    runtime,"stop") as stop, patch.object(runtime,"run") as devil, self.assertRaises(runtime.SetupError):
+                runtime.reset_ports()
+            stop.assert_not_called()
+            devil.assert_not_called()
+
+    def test_stop_before_release_and_restore_before_restart(self):
+        state = dict(vless_port=10001, vmess_port=10002, hy2_port=20001, origin_https=True)
+        events = []
+        def devil(args, **kwargs):
+            events.append(args[2:])
+            return Mock(returncode=0)
+        with patch.object(runtime,"load",return_value=state), patch.object(runtime,"allocated_ports",return_value={
+                "tcp":[10001,10002], "udp":[20001]}), patch("builtins.input",side_effect=["","10002","20001"]), patch.object(
+                runtime,"pid_of",side_effect=lambda name: 1 if name == "sb" else None), patch.object(
+                runtime,"stop",side_effect=lambda name: events.append(name)), patch.object(runtime,"run",side_effect=devil), patch.object(
+                runtime,"allocate",side_effect=runtime.SetupError("quota")), patch.object(
+                runtime,"ensure_running",side_effect=lambda *args: events.append("restart")), patch.object(
+                runtime,"running_argo"), patch.object(runtime,"publish_tunnel_change"), self.assertRaises(runtime.SetupError):
+            runtime.reset_ports()
+        self.assertEqual(events, ["server","sb",["del","tcp","10001"],["add","tcp","10001"],"restart"])
+
     def test_ssh_keep_skips_fixed_tunnel_and_recovers_unhealthy_temporary_tunnel(self):
         for fixed, healthy in ((True, False), (False, True), (False, False)):
             with self.subTest(fixed=fixed, healthy=healthy), tempfile.TemporaryDirectory() as tmp:
@@ -100,11 +127,13 @@ class Serv00RecoveryTests(unittest.TestCase):
                 ensure.assert_called_once()
 
     def test_http_error_404_is_a_healthy_tunnel_without_reading_content(self):
-        for status, expected in ((404, True), (502, False)):
+        for status, expected in ((404, True), (302, False), (502, False)):
             lookup = Mock()
             lookup.open.side_effect = urllib.error.HTTPError("https://test.invalid", status, "", {}, io.BytesIO())
-            with patch.object(runtime.urllib.request, "build_opener", return_value=lookup):
+            with patch.object(runtime.urllib.request, "build_opener", return_value=lookup) as build:
                 self.assertEqual(runtime.temporary_tunnel_healthy("active.trycloudflare.com"), expected)
+                handler = build.call_args.args[0]()
+                self.assertIsNone(handler.redirect_request(None, None, 302, "", {}, "https://other.example"))
                 self.assertFalse(runtime.temporary_tunnel_healthy("example.com"))
 
 

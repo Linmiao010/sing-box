@@ -10,6 +10,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 import csv
 from datetime import datetime, timezone
+import ipaddress
 import json
 import math
 import os
@@ -66,7 +67,7 @@ def arguments(argv):
     route.add_argument("--proxy", help="公开的 HTTP/SOCKS 代理；带认证的地址使用 --private-stdin")
     parser.add_argument("--family", choices=("auto", "4", "6"), default="auto", help="curl 连接地址族")
     parser.add_argument("--connect-timeout", type=float, default=10, help="连接预算，秒")
-    parser.add_argument("--timeout", type=float, default=60, help="每次 curl 总预算，秒（含重定向）")
+    parser.add_argument("--timeout", type=float, default=60, help="每次 curl 总预算，秒。收到重定向即结束采样")
     parser.add_argument("--expected-bytes", type=int, help="可选：成功响应必须匹配的下载字节数")
     args = parser.parse_args(argv)
     try:
@@ -82,6 +83,13 @@ def arguments(argv):
             raise ValueError
         target = urlsplit(args.url)
         valid_url = target.scheme in ("http", "https") and bool(target.hostname)
+        if args.proxy is not None:
+            proxy = urlsplit(args.proxy)
+            valid_url = (valid_url and bool(proxy.hostname) and proxy.port != 0
+                         and proxy.scheme in ("http", "https", "socks4", "socks4a", "socks5", "socks5h"))
+            if proxy.username is not None and proxy.scheme != "https" and proxy.hostname != "localhost":
+                addr = ipaddress.ip_address(proxy.hostname or "")
+                valid_url = valid_url and (getattr(addr, "ipv4_mapped", None) or addr).is_loopback
     except ValueError:
         valid_url = False
     if (not valid_url or not args.label.strip() or args.count < 1 or args.concurrency < 1
@@ -135,9 +143,7 @@ def collect(args):
     curl = shutil.which("curl")
     if not curl:
         raise OSError("curl unavailable")
-    command = [curl, "--disable", "--silent", "--location", "--max-redirs", "10",
-               "--globoff", "--proto", "=http,https", "--proto-redir",
-               "=https" if urlsplit(args.url).scheme == "https" else "=http,https",
+    command = [curl, "--disable", "--silent", "--globoff", "--proto", "=http,https",
                "--connect-timeout", str(args.connect_timeout), "--max-time", str(args.timeout),
                "--output", os.devnull, "--write-out",
                "\t".join("%{" + field + "}" for field in METRICS)]

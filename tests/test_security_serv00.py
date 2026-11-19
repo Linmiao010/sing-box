@@ -2,6 +2,7 @@
 import base64
 import contextlib
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -71,13 +72,17 @@ class Serv00Security(unittest.TestCase):
                 if name == "wrong":
                     target.mkdir()
                     runtime.certificate(target, None, {"sni":runtime.ORIGIN_NAME})
+                else:
+                    properties = runtime.run(["openssl", "x509", "-in", target / "cert.pem", "-text", "-noout"], text=True).stdout
+                    for extension in ("CA:FALSE", "Digital Signature", "Key Encipherment", "TLS Web Server Authentication"):
+                        self.assertIn(extension, properties)
                 with socket.socket() as sock:
                     sock.bind(("127.0.0.1", 0))
                     sock.listen()
                     def serve():
                         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
                         ctx.load_cert_chain(target / "cert.pem", target / "private.key")
-                        with sock.accept()[0] as connection, contextlib.suppress(ssl.SSLError):
+                        with sock.accept()[0] as connection, contextlib.suppress(OSError):
                             ctx.wrap_socket(connection, server_side=True).close()
                     thread = threading.Thread(target=serve)
                     thread.start()
@@ -90,6 +95,44 @@ class Serv00Security(unittest.TestCase):
                             ctx.wrap_socket(plain, server_hostname=runtime.ORIGIN_NAME).close()
                     thread.join(4)
                     self.assertFalse(thread.is_alive())
+
+    def test_fixed_rotation_keeps_staged_anchor_and_requires_new_confirmation(self):
+        openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
+        url = "https://127.0.0.1:20001"
+        old = {"backend":20001, "argo_token":"fixed", "argo_domain":"fixed.example", "origin_https":True}
+        first, second = self.dir / "candidate", self.dir / "retry"
+        first.mkdir()
+        second.mkdir()
+        with patch.dict(os.environ, PATH=str(Path(openssl).parent) + os.pathsep + os.environ["PATH"],
+                        SERV00_FIXED_ORIGIN_CONFIRMED=url), patch.object(runtime,"ROOT",self.dir), patch.object(
+                        sys.stdin,"isatty",return_value=False):
+            # A legacy CA in active use must remain intact until the operator changes the dashboard.
+            legacy = self.dir / "origin-tls"
+            legacy.mkdir()
+            runtime.run(["openssl","req","-x509","-newkey","ec","-pkeyopt","ec_paramgen_curve:P-256","-nodes",
+                         "-keyout",legacy/"private.key","-out",legacy/"cert.pem","-subj","/CN="+runtime.ORIGIN_NAME,
+                         "-addext","subjectAltName=DNS:"+runtime.ORIGIN_NAME,"-addext","basicConstraints=critical,CA:TRUE"])
+            legacy_key = (legacy / "private.key").read_bytes()
+            candidate = dict(old)
+            with self.assertRaises(runtime.SetupError):
+                runtime.prepare_origin(candidate,old,first)
+            fp = candidate["origin_cert_sha256"]
+            anchor = self.dir / "origin-tls-v2" / (fp+".pem")
+            self.assertEqual(anchor.read_bytes(), (first / "origin-tls" / "cert.pem").read_bytes())
+            with patch.dict(os.environ,SERV00_FIXED_ORIGIN_CONFIRMED=url+"#sha256="+fp):
+                runtime.prepare_origin(dict(old),old,second)
+            self.assertEqual((second/"origin-tls"/"cert.pem").read_bytes(),anchor.read_bytes())
+            self.assertEqual((legacy/"private.key").read_bytes(),legacy_key)
+            # Missing active origin material also needs the replacement fingerprint.
+            previous = dict(candidate)
+            missing = self.dir / "missing"
+            missing.mkdir()
+            with patch.object(runtime,"ACTIVE",missing):
+                shutil.rmtree(self.dir/"pending-origin-tls")
+                retry = self.dir / "after-loss"
+                retry.mkdir()
+                with self.assertRaises(runtime.SetupError):
+                    runtime.prepare_origin(dict(previous),previous,retry)
 
     def test_legacy_warp_requires_provenance(self):
         route = {"rules": [{"domain_suffix": ["test.invalid"], "outbound": "wg"}]}
@@ -111,6 +154,23 @@ class Serv00Security(unittest.TestCase):
                     return result
                 stack.enter_context(patch.object(Path, "stat", posix_stat))
             self.assertEqual(runtime.legacy_warp_policy(route, backup)["warp_rules"], [])
+
+    def test_legacy_warp_validates_strings_and_lists_even_after_review(self):
+        rule = {"outbound": "wg", "rule_set": "gemini"}
+        source = {"tag": "gemini", "type": "remote", "url": "https://raw.githubusercontent.com/example/data/sha/rule.srs"}
+        for ref in ("gemini", ["gemini"]):
+            route = {"rules": [dict(rule, rule_set=ref)], "rule_set": [source]}
+            with patch.object(sys.stdin, "isatty", return_value=True), patch("builtins.input", return_value="IMPORT-WARP"):
+                self.assertEqual(runtime.legacy_warp_policy(route, None)["warp_sets"], [source])
+            for url in ("https://127.0.0.1/list", "https://[::1]/list", "https://example.com/list",
+                        "https://raw.githubusercontent.com@untrusted.invalid/list"):
+                with self.subTest(ref=ref,url=url), self.assertRaises(runtime.SetupError):
+                    runtime.legacy_warp_policy({**route,"rule_set":[dict(source,url=url)]}, None)
+        for override in ({"override_address":"target.invalid"}, {"type":"logical","rules":[{"domain":["nested.invalid"]}]}):
+            state = {"origin_https":True,"warp_policy_reviewed":True,"warp_rules":[dict(rule, **override)], "warp_sets":[source]}
+            with self.assertRaises(runtime.SetupError), patch.object(runtime,"start") as start:
+                runtime.ensure_running(self.dir, state)
+            start.assert_not_called()
 
     def test_unreviewed_or_plaintext_state_never_starts_a_daemon(self):
         for state in ({"origin_https": False}, {"origin_https": True, "warp_rules": [{"outbound":"wg"}]}):
@@ -138,8 +198,9 @@ class Serv00Security(unittest.TestCase):
                     stack.enter_context(patch.object(runtime, "stop", side_effect=lambda name: events.append(("stop",name))))
                     stack.enter_context(patch.object(runtime, "start", side_effect=lambda name,*args:events.append(("start",name))))
                     stack.enter_context(patch.object(runtime, "pid_of", return_value=None))
-                    for key in ("prepare_assets","install_release","run","emit_clients","publish","switch","retire_token","publish_tunnel_change","prepare_origin"):
+                    for key in ("prepare_assets","install_release","emit_clients","publish","switch","retire_token","publish_tunnel_change","prepare_origin"):
                         stack.enter_context(patch.object(runtime,key))
+                    stack.enter_context(patch.object(runtime, "run", return_value=Mock(stdout="PrivateKey: new-secret\nPublicKey: new-public\n")))
                     stack.enter_context(patch.object(runtime, "acquire_state", side_effect=lambda old,m:dict(old, backend=old["vmess_port"])))
                     stack.enter_context(patch.object(runtime, "server_config", return_value={}))
                     stack.enter_context(patch.object(runtime, "server_series", return_value="1.10.7"))
@@ -171,7 +232,7 @@ class Serv00Security(unittest.TestCase):
         openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
         wg_key = base64.b64encode(bytes(range(32))).decode()
         state = {"uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", "path":"/fixture", "ip":"192.0.2.9",
-                 "addresses":["192.0.2.9"], "backend":21001, "vmess_port":21001, "vless_port":21002,
+                 "addresses":["192.0.2.9","2001:db8::9"], "backend":21001, "vmess_port":21001, "vless_port":21002,
                  "hy2_port":21003, "sni":"host.example", "reality":"handshake.example", "rules_revision":"ab"*20}
         with patch.object(runtime, "ROOT", self.dir), patch.object(runtime,"HOST_ID","s14"), patch.dict(os.environ, PATH=str(Path(openssl).parent) + os.pathsep + os.environ["PATH"]):
             runtime.prepare_origin(state,{})
@@ -183,18 +244,32 @@ class Serv00Security(unittest.TestCase):
                 version = runtime.run([binary,"version"],text=True).stdout
                 with patch.object(runtime,"run",return_value=Mock(stdout=version)):
                     series = runtime.server_series()
-                state["client_series"] = "modern" if series.startswith("1.10.") else "1.10"
+                state["client_series"] = "1.10" if series.startswith("1.10.") else "modern"
                 keys = runtime.run([binary,"generate","reality-keypair"],text=True).stdout
                 private = re.search(r"PrivateKey:\s*(\S+)", keys)[1]
                 state["public_key"] = re.search(r"PublicKey:\s*(\S+)",keys)[1]
-                runtime.emit_clients(self.dir,state,"",(self.dir/"cert.pem").read_text(),fp)
+                runtime.emit_clients(self.dir,state,"test.example",(self.dir/"cert.pem").read_text(),fp)
                 profile = runtime.load(self.dir/"singbox.txt")
+                result = subprocess.run([binary, "check", "-c", "singbox.txt"], cwd=self.dir, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                resolver = next(r for r in profile["dns"]["servers"] if r["tag"] == "dns-cn")
+                self.assertTrue(resolver.get("type") == "https" or resolver.get("address", "").startswith("https://"))
                 self.assertTrue(all("@"+state["rules_revision"]+"/" in r["url"] for r in profile["route"]["rule_set"]))
                 self.assertNotIn("clash_api",profile["experimental"])
                 for warp in (None, {"type":"wireguard", "tag":"wg", "private_key":wg_key, "peer_public_key":wg_key,
-                                    "local_address":["172.16.0.2/32"],"server":"192.0.2.1","server_port":10000}):
+                                    "local_address":["172.16.0.2/32"],"server":"engage.cloudflareclient.com","server_port":10000}):
                     with self.subTest(series=series, warp=bool(warp)):
                         config = runtime.server_config(state,private,warp,series)
+                        self.assertIn(runtime.SERVER_RULES_REVISION, config["route"]["rule_set"][0]["url"])
+                        rules = config["route"]["rules"]
+                        offset = int(series.startswith("1.14."))
+                        denied = [ipaddress.ip_network(cidr) for cidr in rules[offset]["ip_cidr"]]
+                        for target in ("64:ff9b::a9fe:a9fe", "64:ff9b:1::c0a8:1", "2002:7f00:1::1", "192.0.2.9", "2001:db8::9"):
+                            self.assertTrue(any(ipaddress.ip_address(target) in network for network in denied))
+                        if offset:
+                            self.assertEqual(rules[3], {"network":"udp", "action":"route-options", "udp_connect":True})
+                        else:
+                            self.assertEqual(rules[2], {"network":"udp", "outbound":"block"})
                         runtime.write_json(self.dir/"server.json", config)
                         result = subprocess.run([binary,"check","-c","server.json"],cwd=self.dir,capture_output=True)
                         self.assertEqual(result.returncode,0,result.stderr.decode(errors="replace"))
@@ -236,7 +311,11 @@ class Serv00Security(unittest.TestCase):
             self.assertEqual(hy["tls"]["certificate"], "test PEM")
             mh = json.loads((self.dir / "clashmeta.txt").read_text())
             self.assertFalse(mh["allow-lan"])
-            self.assertEqual(mh["dns"], {"enable": False, "listen": "127.0.0.1:53"})
+            self.assertTrue(mh["dns"]["enable"])
+            self.assertTrue(mh["dns"]["listen"].startswith("127.0.0.1:"))
+            for key in ("nameserver","default-nameserver","proxy-server-nameserver"):
+                self.assertTrue(all(x.startswith("https://") for x in mh["dns"][key]))
+            self.assertTrue(all(x.endswith(",no-resolve") for x in mh["rules"] if x.startswith("GEOIP,")))
             uris = (self.dir / "v2sub.txt").read_text().splitlines()
             self.assertTrue(any("pinSHA256=c0ffee" in u for u in uris))
             for u in [u for u in uris if u.startswith("vmess://")]:
@@ -259,10 +338,18 @@ class Serv00Security(unittest.TestCase):
                 stack.enter_context(patch.object(os, "getuid", return_value=0, create=True))
                 stack.enter_context(patch.object(os, "chown", create=True))
             stage = runtime.new_public(inputs, {})
+            htaccess = public / runtime.SUB_DIRECTORY / ".htaccess"
+            for control in (htaccess, stage / ".htaccess"):
+                self.assertEqual(control.read_text(), runtime.HTTPS_ACCESS)
+                if os.name != "nt":
+                    self.assertEqual(control.stat().st_mode & 0o777, 0o640)
+            htaccess.write_text("Options -Indexes\n")
+            upgraded = runtime.new_public(inputs, {})
+            self.assertEqual((upgraded / ".htaccess").read_text(), runtime.HTTPS_ACCESS)
         self.assertNotIn(public, stage.parents)
         self.assertEqual({x.name for x in stage.iterdir()}, {*runtime.PRODUCTS, ".htaccess"})
         self.assertEqual((public / runtime.SUB_DIRECTORY / "index.html").read_text(), "")
-        self.assertEqual((public / runtime.SUB_DIRECTORY / ".htaccess").read_text(), "Options -Indexes\n")
+        self.assertEqual(htaccess.read_text(), runtime.HTTPS_ACCESS)
 
     def test_missing_warp_key_blocks_preserved_routes(self):
         state = dict(uuid="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", path="/custom", ip="127.0.0.1",
@@ -270,7 +357,7 @@ class Serv00Security(unittest.TestCase):
                      backend=24404, warp_rules=[{"domain":["test.invalid"],"outbound":"wg"}], warp_sets=[])
         with patch.object(runtime, "ROOT", self.dir):
             config = runtime.server_config(state, "dummy", runtime.warp_outbound())
-        self.assertEqual(config["route"]["rules"][2:], state["warp_rules"])
+        self.assertEqual(config["route"]["rules"][3:], state["warp_rules"])
         self.assertIn("100.64.0.0/10", config["route"]["rules"][0]["ip_cidr"])
         self.assertEqual(next(o for o in config["outbounds"] if o["tag"] == "wg")["type"], "block")
 
@@ -399,6 +486,173 @@ class Serv00Security(unittest.TestCase):
                             client.wrap_socket(conn, server_hostname="host.example")
                 thread.join(3)
 
+    def test_external_certificate_key_san_system_trust_and_rotation(self):
+        openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
+        source, first, next_gen = [self.dir / name for name in ("source", "first", "next")]
+        for directory in (source, first, next_gen):
+            directory.mkdir()
+        state = {"sni": "host.example", "ip": "192.0.2.1", "uuid": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                 "public_key":"fixture", "reality":"reality.example", "path":"/custom", "vmess_port":10001,
+                 "vless_port":10002, "hy2_port":10003}
+        with patch.dict(os.environ, PATH=str(Path(openssl).parent) + os.pathsep + os.environ["PATH"]):
+            runtime.issue_leaf(source, "host.example", 1)
+            with patch.dict(os.environ, SERV00_TLS_CERT=str(source/"cert.pem"), SERV00_TLS_KEY=str(source/"private.key")):
+                old_fp = runtime.certificate(first, None, state)
+                self.assertFalse(state["trusted_cert"])
+                pem = (first / "cert.pem").read_text().strip()
+                runtime.emit_clients(first,state,"",pem,old_fp)
+                self.assertIn("pinSHA256=" + old_fp,(first / "v2sub.txt").read_text())
+                self.assertIn(old_fp, (first/"clashmeta.txt").read_text())
+                self.assertTrue(any(o.get("tls",{}).get("certificate") == pem for o in runtime.load(first/"singbox.txt")["outbounds"]))
+                with self.assertRaises(runtime.SetupError):
+                    runtime.certificate(next_gen, first, state, True)
+                with self.assertRaises(runtime.SetupError):
+                    runtime.certificate(next_gen, None, dict(state,sni="wrong.example"))
+                for offset in (-172800, 172800):
+                    with patch.object(runtime.time,"time",return_value=time.time()+offset), self.assertRaises(runtime.SetupError):
+                        runtime.validate_leaf(source, "host.example")
+                runtime.issue_leaf(next_gen, "host.example", 1)
+                with patch.dict(os.environ, SERV00_TLS_KEY=str(next_gen/"private.key")), self.assertRaises(runtime.SetupError):
+                    runtime.certificate(first, None, state)
+            # Restore the pair used by the previous generation.
+            shutil.copyfile(source/"private.key", first/"private.key")
+            new_fp = runtime.certificate(next_gen, first, state, True)
+            self.assertNotEqual(old_fp, new_fp)
+            self.assertNotEqual((next_gen/"private.key").read_bytes(), (first/"private.key").read_bytes())
+            details = runtime.run(["openssl","x509","-in",next_gen/"cert.pem","-noout","-text"],text=True).stdout
+            for extension in ("CA:FALSE", "Digital Signature", "Key Encipherment", "TLS Web Server Authentication"):
+                self.assertIn(extension, details)
+            runtime.run(["openssl","req","-x509","-newkey","ec","-pkeyopt","ec_paramgen_curve:P-256","-nodes",
+                         "-subj","/CN=host.example","-keyout",source/"private.key","-out",source/"cert.pem",
+                         "-addext","subjectAltName=DNS:host.example","-addext","basicConstraints=critical,CA:TRUE"])
+            with patch.dict(os.environ, SERV00_TLS_CERT=str(source/"cert.pem"), SERV00_TLS_KEY=str(source/"private.key")), self.assertRaises(runtime.SetupError):
+                runtime.certificate(first,None,state)
+
+    def test_external_fullchain_requires_a_root_in_the_trust_store(self):
+        openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
+        dest = self.dir / "candidate"
+        dest.mkdir()
+        state = {"sni":"host.example"}
+        with patch.dict(os.environ,PATH=str(Path(openssl).parent)+os.pathsep+os.environ["PATH"]):
+            def generate(*args):
+                runtime.run(["openssl",*args],cwd=self.dir)
+            for name in ("root","intermediate","leaf"):
+                generate("req","-new","-nodes","-newkey","ec","-pkeyopt","ec_paramgen_curve:P-256","-keyout",
+                         name+".key","-out",name+".csr","-subj","/CN="+("host.example" if name=="leaf" else name))
+            (self.dir/"ca.ext").write_text("basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n")
+            (self.dir/"leaf.ext").write_text("basicConstraints=critical,CA:FALSE\nsubjectAltName=DNS:host.example\nextendedKeyUsage=serverAuth\n")
+            generate("x509","-req","-in","root.csr","-signkey","root.key","-extfile","ca.ext","-out","root.pem")
+            for child, parent, ext in (("intermediate","root","ca.ext"),("leaf","intermediate","leaf.ext")):
+                generate("x509","-req","-in",child+".csr","-CA",parent+".pem","-CAkey",parent+".key","-CAcreateserial",
+                         "-extfile",ext,"-out",child+".pem")
+            bundle = self.dir / "fullchain.pem"
+            bundle.write_bytes((self.dir/"leaf.pem").read_bytes() + (self.dir/"intermediate.pem").read_bytes())
+            with patch.dict(os.environ,SERV00_TLS_CERT=str(bundle),SERV00_TLS_KEY=str(self.dir/"leaf.key")):
+                runtime.certificate(dest,None,state)
+                self.assertFalse(state["trusted_cert"])
+                with patch.dict(os.environ,SSL_CERT_FILE=str(self.dir/"root.pem")):
+                    runtime.certificate(dest,None,state)
+                    self.assertTrue(state["trusted_cert"])
+                    bundle.write_bytes((self.dir/"leaf.pem").read_bytes())
+                    runtime.certificate(dest,None,state)
+                    self.assertFalse(state["trusted_cert"])
+
+    def test_temporary_origin_rotates_in_candidate_only(self):
+        openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
+        first, next_gen, rotated = (self.dir / name for name in ("first","next","rotated"))
+        for directory in (first,next_gen,rotated):
+            directory.mkdir()
+        with patch.object(runtime,"ROOT",self.dir), patch.object(runtime,"ACTIVE",first), patch.dict(
+                os.environ, PATH=str(Path(openssl).parent) + os.pathsep + os.environ["PATH"]):
+            state = {}
+            runtime.prepare_origin(state, {}, first)
+            old = (first / "origin-tls" / "private.key").read_bytes()
+            runtime.prepare_origin(dict(state), state, next_gen)
+            self.assertEqual((next_gen / "origin-tls" / "private.key").read_bytes(),old)
+            runtime.prepare_origin(dict(state), state, rotated, True)
+            self.assertNotEqual((rotated / "origin-tls" / "private.key").read_bytes(),old)
+            self.assertEqual((first / "origin-tls" / "private.key").read_bytes(),old)
+
+    def test_rotate_configuration_and_subscriptions_share_the_new_identity(self):
+        binary = os.getenv("SING_BOX_BIN")
+        if not binary:
+            self.skipTest("Set SING_BOX_BIN to exercise real key generation and candidate check")
+        openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
+        prev = self.dir / "active"
+        prev.mkdir()
+        old = {"ip":"192.0.2.1","addresses":["192.0.2.1"],"sni":"host.example","reality":"reality.example",
+               "uuid":"aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee","path":"/fixture","token":"f"*48,
+               "backend":20001,"vmess_port":20001,"hy2_port":20002,"vless_port":20003,"argo_domain":"","argo_token":""}
+        actual_run = runtime.run
+        def run(args, **kwargs):
+            return actual_run([binary, *args[1:]] if args[0] == self.dir/"sb" else args, **kwargs)
+        with contextlib.ExitStack() as stack:
+            for target, value in (("ACTIVE",prev),("ROOT",self.dir),("HOST_ID","fixture")):
+                stack.enter_context(patch.object(runtime,target,value))
+            stack.enter_context(patch.dict(os.environ,PATH=str(Path(openssl).parent)+os.pathsep+os.environ["PATH"]))
+            stack.enter_context(patch.object(runtime,"run",side_effect=run))
+            stack.enter_context(patch.object(runtime,"acquire_state",side_effect=lambda state,m:dict(state)))
+            stack.enter_context(patch.object(runtime,"running_argo",return_value="fixture.trycloudflare.com"))
+            for name in ("prepare_assets","stop","ensure_running","publish","switch"):
+                stack.enter_context(patch.object(runtime,name))
+            retire = stack.enter_context(patch.object(runtime,"retire_token"))
+            oldpair = actual_run([binary,"generate","reality-keypair"],text=True).stdout
+            old["public_key"] = re.search(r"PublicKey:\s*(\S+)",oldpair)[1]
+            (prev/"reality.key").write_text(re.search(r"PrivateKey:\s*(\S+)",oldpair)[1])
+            oldfp = runtime.certificate(prev,None,old)
+            runtime.prepare_origin(old,{},prev)
+            runtime.emit_clients(prev,old,"",(prev/"cert.pem").read_text(),oldfp)
+            runtime.write_json(prev/"state.json",old)
+            runtime.configure("rotate")
+        new = next(self.dir.glob("generation-*"))
+        state = runtime.load(new/"state.json")
+        retire.assert_called_once_with(old["token"])
+        for key in ("uuid","public_key","token","path","origin_cert_sha256"):
+            self.assertNotEqual(state[key],old[key])
+        for key in ("reality.key","private.key","origin-tls/private.key"):
+            self.assertNotEqual((new/key).read_bytes(),(prev/key).read_bytes())
+        profile = (new/"singbox.txt").read_text()
+        for key in ("uuid","public_key","path"):
+            self.assertIn(state[key],profile)
+            self.assertNotIn(old[key],profile)
+        self.assertNotIn(oldfp,(new/"v2sub.txt").read_text())
+        for inbound in runtime.load(new/"config.json")["inbounds"]:
+            self.assertEqual(inbound["users"][0].get("uuid",inbound["users"][0].get("password")),state["uuid"])
+
+    def test_account_file_consumed_before_waiting_for_operation(self):
+        account = self.dir / "input.json"
+        account.write_text('{"SUUID":"fixture"}')
+        operation = self.dir / "private"
+        entered, release = threading.Event(), threading.Event()
+        def wait_for_lock(*args):
+            entered.set()
+            release.wait(5)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(sys.modules,fcntl=Mock(flock=wait_for_lock)))
+            stack.enter_context(patch.dict(os.environ))
+            stack.enter_context(patch.object(sys,"argv",["sb","--install","--account-file",str(account)]))
+            stack.enter_context(patch.object(runtime,"ROOT",operation))
+            stack.enter_context(patch.object(os,"umask"))
+            if os.name == "nt":
+                stack.enter_context(patch.object(os,"getuid",return_value=0,create=True))
+                original = Path.stat
+                def stat(path, *args, **kwargs):
+                    result = original(path, *args, **kwargs)
+                    return os.stat_result([0o40700,*result[1:]]) if path == operation else result
+                stack.enter_context(patch.object(Path,"stat",stat))
+            perform = stack.enter_context(patch.object(runtime,"perform"))
+            worker = threading.Thread(target=runtime.main)
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(3))
+                self.assertFalse(account.exists())
+                self.assertEqual(os.environ["SUUID"],"fixture")
+                perform.assert_not_called()
+            finally:
+                release.set()
+                worker.join(5)
+            perform.assert_called_once_with("install")
+
     @unittest.skipUnless(os.name == "posix" and getattr(os, "geteuid", lambda: 1)() == 0,
                          "run as root in an isolated POSIX test container")
     def test_publisher_and_unrelated_account_permissions(self):
@@ -420,7 +674,7 @@ class Serv00Security(unittest.TestCase):
         token_dir = public / runtime.SUB_DIRECTORY / ("f"*48)
         self.assertNotEqual(token_dir.resolve().parent, public)
         self.assertEqual(list(public.iterdir()), [public / runtime.SUB_DIRECTORY])
-        self.assertEqual((token_dir.parent / ".htaccess").read_text(), "Options -Indexes\n")
+        self.assertEqual((token_dir.parent / ".htaccess").read_text(), runtime.HTTPS_ACCESS)
         for p, is_reader in ((reader, True), (stranger, False)):
             def drop():
                 os.setgroups([])
@@ -510,6 +764,12 @@ class Serv00Security(unittest.TestCase):
         runtime.emit_clients(self.dir, s, "argo.example.com", *certs[0])
         checked = subprocess.run([sb, "check", "-c", "singbox.txt"], cwd=self.dir, capture_output=True)
         self.assertEqual(checked.returncode, 0, checked.stderr)
+        data = Path(os.environ.get("MIHOMO_TEST_DATA", REPO / ".test-tools/protocol-validation/generated/mihomo-data"))
+        if all((data / name).is_file() for name in ("GeoSite.dat","geoip.metadb")):
+            for name in ("GeoSite.dat","geoip.metadb"):
+                shutil.copyfile(data/name,self.dir/name)
+            checked = subprocess.run([mh,"-d",str(self.dir),"-t","-f",str(self.dir/"clashmeta.txt")], capture_output=True)
+            self.assertEqual(checked.returncode,0,checked.stdout + checked.stderr)
         incoming = runtime.server_config(s, "unused", None, version.split()[2])["inbounds"]
         runtime.write_json(self.dir / "server.json", {"inbounds": [i for i in incoming if i["tag"] in
             ("vmess-ws-in", "hysteria-in1")], "outbounds": [{"type":"direct","tag":"direct"}]})
@@ -618,8 +878,14 @@ class Serv00Security(unittest.TestCase):
                             transport.start_server(server=Server())
                             chan = transport.accept(8)
                             if chan and exec_requested.wait(8):
+                                # ssh -T reads /dev/null. Its EOF lets the transport finish
+                                # acknowledging the exec request before this side sends status.
+                                chan.settimeout(8)
+                                chan.recv(1)
                                 chan.send_exit_status(0)
                                 chan.close()
+                                # Keep TCP alive until OpenSSH completes its disconnect handshake.
+                                transport.join(8)
                 t = threading.Thread(target=serve, daemon=True)
                 t.start()
                 env = dict(os.environ, ACCOUNTS='[{"SSH_USER":"fake-user","HOST":"127.0.0.1"}]',

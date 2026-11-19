@@ -74,7 +74,7 @@ hostname=$(hostname)
 # Called only by installation or an explicit repair, never menu display.
 ensure_dependencies(){
 local dependency missing=0 manager
-local -a required=(curl jq openssl ip ss crontab socat busybox tar xxd python3 qrencode git sysctl sha256sum flock)
+local -a required=(curl jq openssl ip ss crontab socat busybox tar xxd python3 qrencode git sysctl sha256sum flock pgrep)
 for dependency in "${required[@]}"; do
 command -v "$dependency" >/dev/null 2>&1 || missing=1
 done
@@ -164,6 +164,58 @@ for part in "${parts[@]}"; do
 done
 (( (compressed && ${#parts[@]} < 8) || (!compressed && ${#parts[@]} == 8) )) || return 1
 fi
+}
+
+read_node_addresses(){
+node_ipv4= node_ipv6=
+[[ -e /etc/s-box/node-addresses ]] || return 0
+if ! { IFS= read -r node_ipv4 && IFS= read -r node_ipv6; } < /etc/s-box/node-addresses ||
+   { [[ -n $node_ipv4 ]] && ! ip_literal_valid 4 "$node_ipv4"; } ||
+   { [[ -n $node_ipv6 ]] && ! ip_literal_valid 6 "$node_ipv6"; }; then
+    red "节点地址记录无效，已保留原配置"; return 1
+fi
+}
+
+# Called under the configuration lock, only with WARP-off, unbound node observations.
+save_node_addresses(){
+local node_ipv4 node_ipv6 candidate
+[[ -n $1 || -n $2 ]] || return 0
+read_node_addresses || return 1
+[[ ${1:-$node_ipv4} != "$node_ipv4" || ${2:-$node_ipv6} != "$node_ipv6" ]] || return 0
+candidate=$(mktemp /etc/s-box/.node-addresses.XXXXXX) || return 1
+if ! printf '%s\n' "${1:-$node_ipv4}" "${2:-$node_ipv6}" > "$candidate" ||
+   ! mv -f -- "$candidate" /etc/s-box/node-addresses; then
+    rm -f -- "$candidate"; return 1
+fi
+}
+
+# Admit a newly observed node address only after the running profile blocks it.
+sync_node_addresses(){
+local node_ipv4 node_ipv6
+[[ -n $1 || -n $2 ]] || return 0
+save_node_addresses "$@" || return 1
+[[ -s /etc/s-box/sb.json ]] || return 0
+read_node_addresses || return 1
+if python3 - /etc/s-box/sb.json "$node_ipv4" "$node_ipv6" <<'PY'
+import ipaddress, json, sys
+with open(sys.argv[1], encoding="utf-8") as source:
+    rules = json.load(source)["route"]["rules"]
+addresses = [ipaddress.ip_address(value) for value in sys.argv[2:] if value]
+for rule in rules:
+    cidrs = rule.get("ip_cidr", [])
+    if "100.64.0.0/10" in cidrs and "168.63.129.16/32" in cidrs and (
+        rule == {"ip_cidr": cidrs, "action": "reject"} or rule == {"ip_cidr": cidrs, "outbound": "block"}
+    ):
+        networks = [ipaddress.ip_network(cidr, strict=False) for cidr in cidrs]
+        if all(any(address in network for network in networks) for address in addresses):
+            sys.exit(0)
+        break
+    if rule.get("action") not in ("sniff", "resolve"):
+        break
+sys.exit(1)
+PY
+then return 0; fi
+config_apply secure_server_routes
 }
 
 public_ip(){
@@ -478,9 +530,9 @@ if [[ -n $detected_v6 ]]; then endip="2606:4700:d0::a29f:c001"; else endip="162.
 
 v6(){
 local addresses first second
-addresses=$(warp_unrouted_ips) || return 1
+addresses=$(warp_unrouted_ips node) || return 1
 first=${addresses%%$'\n'*}; second=${addresses#*$'\n'}
-v4orv6 "${first#-}" "${second#-}"
+v4orv6 "${first#-}" "${second#-}" && save_node_addresses "${first#-}" "${second#-}"
 }
 
 firewall_sync(){
@@ -527,15 +579,19 @@ done
 }
 
 openyn(){
-local action zone
+local action zone hopping
+local -a options=(--input-position append)
 firewall_legacy
-readp "防火墙：回车沿用主机策略；输入 1 按实际启用的节点放行。iptables、UFW 或原生 nftables 将在当前输入链尾追加，请先核实该位置保留来源、接口和限速规则：" action || return 1
+readp "回车沿用主机防火墙，输入 1 在现有过滤规则之后放行节点。请先核对来源、接口和限速规则：" action || return 1
 case "$action" in
 1) if command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
        firewall-cmd --get-active-zones
        readp "输入节点公网接口所属 zone（仅有一个时可回车）：" zone || return 1
+       [[ -z $zone ]] || options+=(--zone "$zone")
+       readp "firewalld 的 UDP 跳跃可能因 DNAT 先于来源封禁放行。已核对 StrictForwardPorts 和该 zone 的来源策略并接受此影响才输入 1，回车禁用跳跃：" hopping || return 1
+       case "$hopping" in 1) options+=(--confirm-forward-ports) ;; "") ;; *) return 1 ;; esac
    fi
-   if [[ -n "$zone" ]]; then firewall_enable --zone "$zone"; else firewall_enable --input-position append; fi ;;
+   firewall_enable "${options[@]}" ;;
 "") return 0 ;;
 *) red "选项无效"; return 1 ;;
 esac
@@ -799,6 +855,7 @@ local value
 value=$(cat /root/ygkkkca/ca.log) && sub_valid_domain "$value" || {
     red "ACME 记录缺少合法域名" >&2; return 1
 }
+client_tls_material /root/ygkkkca/cert.crt /root/ygkkkca/private.key "$value" >/dev/null || return 1
 printf '%s\n' "$value"
 }
 
@@ -815,15 +872,21 @@ host=$(awk '{
 }
 
 project_process(){
-local kind=$1 port=$2 action=$3 exe pid actual attempt found=1
+local kind=$1 port=$2 action=$3 exe pid actual attempt pids found=1
 local -a argv
 case $kind in
     temporary) sub_valid_port "$port" || return 1; exe=/etc/s-box/cloudflared ;;
+    temporary-all) [[ $action == stop ]] || return 1; exe=/etc/s-box/cloudflared ;;
     fixed) exe=/etc/s-box/cloudflared ;;
     socks) exe=/etc/s-box/sbwpph ;;
     *) return 1 ;;
 esac
+if pids=$(pgrep -x "${exe##*/}" 2>/dev/null); then :
+elif [[ $? != 1 ]]; then
+    red "无法核对项目进程，已停止操作" >&2; return 2
+fi
 while IFS= read -r pid; do
+    [[ -n $pid ]] || continue
     actual=$(readlink "/proc/$pid/exe") || continue
     [[ $actual == "$exe" || $actual == "$exe (deleted)" ]] || continue
     mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || continue
@@ -832,6 +895,8 @@ while IFS= read -r pid; do
         temporary)
             [[ ${argv[1]} == tunnel && ${argv[2]} == --url &&
                 ( ${argv[3]} == "http://127.0.0.1:$port" || ${argv[3]} == "http://localhost:$port" ) ]] || continue ;;
+        temporary-all)
+            [[ ${argv[1]} == tunnel && ${argv[2]} == --url && ${argv[3]} =~ ^http://(127\.0\.0\.1|localhost):[0-9]+$ ]] || continue ;;
         fixed)
             [[ ${argv[1]} == tunnel && " ${argv[*]} " == *" run "* ]] || continue ;;
     esac
@@ -844,7 +909,7 @@ while IFS= read -r pid; do
         done
         if kill -0 "$pid" 2>/dev/null && [[ $(readlink "/proc/$pid/exe") == "$actual" ]]; then return 1; fi
     fi
-done < <(pgrep -x "${exe##*/}" 2>/dev/null)
+done <<< "$pids"
 [[ $action == stop ]] || return "$found"
 }
 
@@ -868,7 +933,8 @@ local cert=$1 name=$2 pem digest
 pem=$(openssl x509 -in "$cert" -outform PEM) || return 1
 pem=${pem//$'\r'/}
 openssl x509 -in "$cert" -noout -ext subjectAltName 2>/dev/null | grep -q 'DNS:' &&
-    openssl verify -CAfile "$cert" -verify_hostname "$name" "$cert" >/dev/null || {
+    ! openssl x509 -in "$cert" -noout -ext basicConstraints 2>/dev/null | grep -q 'CA:TRUE' &&
+    openssl verify -partial_chain -CAfile "$cert" -purpose sslserver -verify_hostname "$name" "$cert" >/dev/null || {
     printf '%s\n' "自签证书与 $name 的 DNS SAN 不匹配，请重新签发并重新分发订阅" >&2
     return 1
 }
@@ -877,11 +943,66 @@ digest=$(set -o pipefail; openssl x509 -in "$cert" -outform DER | openssl dgst -
 jq -cn --arg pem "$pem" --arg fingerprint "$digest" '{certificate:$pem, fingerprint:$fingerprint}'
 }
 
+client_tls_material(){
+local cert=$1 key=$2 name=$3 cert_pub key_pub mode
+if [[ $key == /root/ygkkkca/private.key ]]; then
+    chmod 700 /root/ygkkkca || return 1
+    if [[ -L $key ]]; then
+        mode=$(stat -Lc '%a' "$key") && (( (8#$mode & 0037) == 0 )) || {
+            red "外部私钥权限须限于所有者或受信组只读" >&2; return 1
+        }
+    else chmod 600 "$key" || return 1; fi
+fi
+cert_pub=$(openssl x509 -in "$cert" -noout -pubkey) &&
+    key_pub=$(openssl pkey -passin pass: -in "$key" -pubout) && [[ -n $cert_pub && $cert_pub == "$key_pub" ]] || {
+    red "节点证书与私钥不匹配或无法读取" >&2; return 1
+}
+# The supplied bundle may provide intermediates. Only the system store supplies trust anchors.
+if [[ $cert != /etc/s-box/cert.pem ]] &&
+    openssl x509 -in "$cert" -noout -ext subjectAltName | grep -q 'DNS:' &&
+    openssl verify -purpose sslserver -verify_hostname "$name" -untrusted "$cert" "$cert" >/dev/null 2>&1; then
+    printf '{}\n'
+else
+    selfsigned_material "$cert" "$name"
+fi
+}
+
+load_node_trust(){
+local file=$1 rows tag cert key name prefix identity material
+local -A checked=()
+rows=$(jq -r '.inbounds[] | select(.tls.enabled and (.tls.certificate_path != null)) |
+    [.tag,.tls.certificate_path,.tls.key_path,.tls.server_name] | @tsv' "$file") || return 1
+while IFS=$'\t' read -r tag cert key name; do
+    case $tag in vmess-sb) prefix=vm ;; hy2-sb) prefix=hy2 ;; tuic5-sb) prefix=tu5 ;;
+        anytls-sb) prefix=an ;; trojan-sb) prefix=trojan ;; *) continue ;; esac
+    if [[ -z $name ]]; then
+        case $cert in
+            /etc/s-box/cert.pem) name=www.bing.com ;;
+            /root/ygkkkca/cert.crt) name=$(acme_hostname) || return 1 ;;
+            *) red "入站 $tag 缺少证书域名" >&2; return 1 ;;
+        esac
+    fi
+    identity="$cert/$key/$name"
+    if [[ ! -v 'checked[$identity]' ]]; then
+        checked[$identity]=$(client_tls_material "$cert" "$key" "$name") || return 1
+    fi
+    material=${checked[$identity]}
+    printf -v "${prefix}_material" '%s' "$material"
+    if [[ $material == '{}' ]]; then printf -v "${prefix}_self" false; else printf -v "${prefix}_self" true; fi
+    printf -v "${prefix}_name" '%s' "$name"
+done <<< "$rows"
+}
+
 config_patch_inbound(){
 if [[ $3 == 1.10 && $4 == anytls-sb ]]; then cp -p "$1" "$2"; return; fi
 config_jq 'inbound($tag) as $old |
   .inbounds |= map(if .tag == $tag then . * $patch else . end)' \
   --arg tag "$4" --argjson patch "$5" "$1" > "$2"
+}
+
+config_patch_acme(){
+jq -e --arg name "$3" --arg cert /root/ygkkkca/cert.crt '
+    (.inbounds[]? | select(.tls.certificate_path == $cert) | .tls.server_name) = $name' "$1" > "$2"
 }
 
 config_patch_identity(){
@@ -1033,6 +1154,14 @@ check_args=(-c "$work/sb.json")
 if ! /etc/s-box/sing-box check "${check_args[@]}"; then
 red "候选配置校验失败，已保留原配置"
 exit 1
+fi
+if [[ $patch == config_patch_inbound && $1 == vmess-sb ]] &&
+    jq -e --slurpfile candidate "$work/sb.json" '
+      def vm: .inbounds[] | select(.tag=="vmess-sb");
+      (vm) as $old | ($candidate[0] | vm) as $new |
+      $old.tls.enabled==false and ([$old.listen,$old.listen_port,$old.tls.enabled] !=
+                                   [$new.listen,$new.listen_port,$new.tls.enabled])' "$work/old-sb.json" >/dev/null; then
+    argo_stop_for_origin || exit 1
 fi
 restore=1
 for file in "${files[@]}"; do
@@ -1227,6 +1356,7 @@ cat > /etc/s-box/sb10.json <<EOF
             "alpn": [
                 "h3"
             ],
+            "server_name": "$ym_vm_ws",
             "certificate_path": "$certificatec_hy2",
             "key_path": "$certificatep_hy2"
         }
@@ -1250,6 +1380,7 @@ cat > /etc/s-box/sb10.json <<EOF
                 "alpn": [
                     "h3"
                 ],
+                "server_name": "$ym_vm_ws",
                 "certificate_path": "$certificatec_tuic",
                 "key_path": "$certificatep_tuic"
             }
@@ -1459,6 +1590,7 @@ cat > /etc/s-box/sb11.json <<EOF
             "alpn": [
                 "h3"
             ],
+            "server_name": "$ym_vm_ws",
             "certificate_path": "$certificatec_hy2",
             "key_path": "$certificatep_hy2"
         }
@@ -1482,6 +1614,7 @@ cat > /etc/s-box/sb11.json <<EOF
                 "alpn": [
                     "h3"
                 ],
+                "server_name": "$ym_vm_ws",
                 "certificate_path": "$certificatec_tuic",
                 "key_path": "$certificatep_tuic"
             }
@@ -1499,6 +1632,7 @@ cat > /etc/s-box/sb11.json <<EOF
             "padding_scheme":[],
             "tls":{
                 "enabled": true,
+                "server_name": "$ym_vm_ws",
                 "certificate_path": "$certificatec_an",
                 "key_path": "$certificatep_an"
             }
@@ -1589,20 +1723,37 @@ cp /etc/s-box/sb${num}.json /etc/s-box/sb.json
 
 # Shared by installation and the explicit migration of existing profiles.
 secure_server_routes(){
-local extra='[]'
+local extra='[]' interfaces local_cidrs advertised= ip node_ipv4 node_ipv6
+read_node_addresses || return 1
+interfaces=$(ip -o addr show scope global) || { red "无法枚举本机地址，已中止路由生成"; return 1; }
+[[ ! -s /etc/s-box/server_ipcl.log ]] || advertised=$(< /etc/s-box/server_ipcl.log)
+# Include all interface aliases, and the known public node addresses on NAT hosts.
+local_cidrs=$(
+    awk '$3=="inet" || $3=="inet6" {split($4, a, "/"); print a[1] ($3=="inet" ? "/32" : "/128")}' <<< "$interfaces"
+    for ip in "$node_ipv4" "$node_ipv6" "$advertised"; do
+        if ip_literal_valid 4 "$ip"; then printf '%s/32\n' "$ip"
+        elif ip_literal_valid 6 "$ip"; then printf '%s/128\n' "$ip"; fi
+    done
+)
 if [[ -e /etc/s-box/restricted-cidrs.json ]]; then
     extra=$(jq -ce 'if type=="array" and all(.[]; type=="string") then . else error("expected CIDR array") end' /etc/s-box/restricted-cidrs.json) || return 1
 fi
-jq -e --arg series "$3" --argjson extra "$extra" '
+jq -e --arg series "$3" --argjson extra "$extra" --arg local_cidrs "$local_cidrs" '
   (["0.0.0.0/8","10.0.0.0/8","100.64.0.0/10","127.0.0.0/8","169.254.0.0/16",
     "172.16.0.0/12","192.168.0.0/16","224.0.0.0/4","240.0.0.0/4","::/96",
-    "::ffff:0:0/96","fc00::/7","fe80::/10","ff00::/8","168.63.129.16/32"] + $extra | unique) as $restricted |
+    "::ffff:0:0/96","fc00::/7","fe80::/10","ff00::/8","168.63.129.16/32",
+    "64:ff9b::/96","64:ff9b:1::/48","::ffff:0:0:0/96","2002::/16","100::/64",
+    "192.0.0.0/24","198.18.0.0/15"] + $extra + ($local_cidrs | split("\n") - [""]) | unique) as $restricted |
   {ip_cidr:["0.0.0.0/0","::/0"],invert:true} as $missing |
   (if $series == "1.10" then {outbound:"block"} else {action:"reject"} end) as $deny |
-  .route.rules |= map(select((. == ($missing + $deny) or
+  (if $series == "1.10" then {network:"udp",outbound:"block"}
+   else {network:"udp",action:"route-options",udp_connect:true} end) as $udp |
+  .route.rules |= map(select((. == $udp or . == ($missing + $deny) or
       (((.ip_cidr // []) | index("100.64.0.0/10")) != null and
        ((.ip_cidr // []) | index("168.63.129.16/32")) != null and del(.ip_cidr) == $deny)) | not)) |
-  [{ip_cidr:$restricted} + $deny,$missing + $deny] as $guards |
+  # Reject unresolved destinations before any outbound, including SOCKS5. The core dials
+  # the resolved IPs for TCP and connected UDP. Legacy has no connected-UDP route option.
+  [{ip_cidr:$restricted} + $deny,$missing + $deny,$udp] as $guards |
   if any(.outbounds[]?; has("override_address")) or any(.route.rules[]?; has("override_address"))
   then error("请先人工复核目标地址改写规则") else . end |
   if $series == "1.10" then
@@ -1820,14 +1971,13 @@ return 1
 }
 
 extra_client_data(){
-local material='{}' name
-name=$(jq -r --arg path /etc/s-box/cert.pem '.inbounds[] | select(.tag=="trojan-sb" and .tls.certificate_path==$path).tls.server_name' /etc/s-box/sb_extra.json) || return 1
-[[ -z $name ]] || material=$(selfsigned_material /etc/s-box/cert.pem "$name") || return 1
-jq --argjson material "$material" --arg server "$server_ipcl" --arg host "$hostname" --arg selfcert /etc/s-box/cert.pem '
+local trojan_material='{}' trojan_self trojan_name
+load_node_trust /etc/s-box/sb_extra.json || return 1
+jq --argjson material "$trojan_material" --arg server "$server_ipcl" --arg host "$hostname" '
   [.inbounds[] | select(.type == "trojan" or .type == "snell") |
     . as $in | (.type + "-" + $host) as $name |
     if .type == "trojan" then
-      (.tls.certificate_path == $selfcert) as $self |
+      ($material.certificate != null) as $self |
       {singbox:{type:"trojan",tag:$name,server:$server,server_port:.listen_port,
         password:.users[0].password,tls:({enabled:true,server_name:.tls.server_name,insecure:false} +
           (if $self then {certificate:$material.certificate} else {} end))},
@@ -2048,6 +2198,9 @@ else
 yellow "仅确认一个地址族的公网IP，使用已探测到的地址生成配置"
 selected_ip=${v4:-$v6}
 fi
+if [[ ${1:-} == select ]]; then
+    config_locked sync_node_addresses "$v4" "$v6" || return 1
+fi
 server_ip=$selected_ip
 [[ $selected_ip != *:* ]] || server_ip="[$selected_ip]"
 server_ipcl=$selected_ip
@@ -2062,6 +2215,7 @@ wgcfgo(){
 local addresses v4 v6
 addresses=$(warp_unrouted_ips node) || return 1
 v4=${addresses%%$'\n'*}; v6=${addresses#*$'\n'}; v4=${v4#-}; v6=${v6#-}
+config_locked sync_node_addresses "$v4" "$v6" || return 1
 if [[ -s /etc/s-box/server_ipcl.log ]]; then
     local previous
     previous=$(< /etc/s-box/server_ipcl.log)
@@ -2091,12 +2245,12 @@ if [[ ${ws_path,,} == *"${uuid,,}"* ]]; then yellow "旧 WS 路径含凭据；�
 vm_port=$(config_get vmess-sb '.listen_port') || return 1
 tls=$(config_get vmess-sb '.tls.enabled') || return 1
 vm_name=$(config_get vmess-sb '.tls.server_name') && sub_valid_domain "$vm_name" || return 1
-local vm_cert
-vm_cert=$(config_get vmess-sb '.tls.certificate_path') || return 1
-vm_self=false
-if [[ $tls == true && $vm_cert == /etc/s-box/cert.pem ]]; then
-    selfsigned_material "$vm_cert" "$vm_name" >/dev/null || return 1
-    vm_self=true; vmadd_local=$server_ipcl; vmadd_are_local=$server_ip
+vm_self=false; vm_material=; hy2_self=; tu5_self=; an_self=false; an_name=
+load_node_trust /etc/s-box/sb.json || return 1
+[[ -n $hy2_self && -n $tu5_self ]] || return 1
+[[ $tls != true || -n $vm_material ]] || return 1
+if [[ $tls == true && $vm_self == true ]]; then
+    vmadd_local=$server_ipcl; vmadd_are_local=$server_ip
 elif [[ -e /etc/s-box/cfvmadd_local.txt ]]; then
     vmadd_local=$(cat /etc/s-box/cfvmadd_local.txt) || return 1
     valid_node_address "$vmadd_local" || return 1
@@ -2123,50 +2277,21 @@ sbhy2pt=$(echo "$hy2_ports" | grep -o '[0-9]\+:[0-9]\+' | sed 's/.*/"&"/' | past
 else
 hyps=
 fi
-hy2_sniname=$(config_get hy2-sb '.tls.key_path') || return 1
-if [[ "$hy2_sniname" = '/etc/s-box/private.key' ]]; then
-local material
-material=$(selfsigned_material /etc/s-box/cert.pem www.bing.com) || return 1
-SHA256=$(jq -er .fingerprint <<< "$material") || return 1
-[[ ${1:-} == client-only ]] || printf '%s\n' "$SHA256" > /etc/s-box/SHA256.txt
-hy2_name=www.bing.com
-sb_hy2_ip=$server_ip
-cl_hy2_ip=$server_ipcl
-hy2_self=true
+sb_hy2_ip=$server_ip; cl_hy2_ip=$server_ipcl; SHA256=
+if [[ $hy2_self == true ]]; then
+    SHA256=$(jq -er .fingerprint <<< "$hy2_material") || return 1
+    [[ ${1:-} == client-only ]] || printf '%s\n' "$SHA256" > /etc/s-box/SHA256.txt
 else
-ym=$(acme_hostname) || return 1
-hy2_name=$ym
-sb_hy2_ip=$ym
-cl_hy2_ip=$ym
-hy2_self=false; SHA256=
+    sb_hy2_ip=$hy2_name; cl_hy2_ip=$hy2_name
 fi
 tu5_port=$(config_get tuic5-sb '.listen_port') || return 1
-tu5_sniname=$(config_get tuic5-sb '.tls.key_path') || return 1
-if [[ "$tu5_sniname" = '/etc/s-box/private.key' ]]; then
-tu5_name=www.bing.com
-sb_tu5_ip=$server_ip
-cl_tu5_ip=$server_ipcl
-tu5_self=true
-else
-ym=$(acme_hostname) || return 1
-tu5_name=$ym
-sb_tu5_ip=$ym
-cl_tu5_ip=$ym
-tu5_self=false
-fi
-an_port=; [[ "$sbnh" == "1.10" ]] || an_port=$(config_get anytls-sb '.listen_port') || return 1
-an_sniname=; [[ "$sbnh" == "1.10" ]] || an_sniname=$(config_get anytls-sb '.tls.key_path') || return 1
-if [[ "$an_sniname" = '/etc/s-box/private.key' ]]; then
-an_name=www.bing.com
-sb_an_ip=$server_ip
-cl_an_ip=$server_ipcl
-an_self=true
-elif [[ "$sbnh" != 1.10 ]]; then
-ym=$(acme_hostname) || return 1
-an_name=$ym
-sb_an_ip=$ym
-cl_an_ip=$ym
-an_self=false
+sb_tu5_ip=$server_ip; cl_tu5_ip=$server_ipcl
+if [[ $tu5_self == false ]]; then sb_tu5_ip=$tu5_name; cl_tu5_ip=$tu5_name; fi
+an_port=
+if [[ $sbnh != 1.10 ]]; then
+    [[ -n $an_name ]] && an_port=$(config_get anytls-sb '.listen_port') || return 1
+    sb_an_ip=$server_ip; cl_an_ip=$server_ipcl
+    if [[ $an_self == false ]]; then sb_an_ip=$an_name; cl_an_ip=$an_name; fi
 fi
 }
 
@@ -2250,7 +2375,7 @@ echo
 reshy2(){
 echo
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-if [[ $hy2_self == true ]]; then blue "自签 Hysteria2 单节点需支持 pinSHA256；校验系统信任链的客户端还须先导入本实例公证书。完整订阅已携带信任信息。"; fi
+if [[ $hy2_self == true ]]; then blue "Hysteria2 单节点客户端须支持 pinSHA256；也可使用携带节点证书的完整订阅。"; fi
 hy2_link="hysteria2://$uuid@$sb_hy2_ip:$hy2_port?security=tls&alpn=h3&insecure=0$hyps&sni=$hy2_name${SHA256:+&pinSHA256=$SHA256}#hy2-$hostname"
 echo "$hy2_link" > /etc/s-box/hy2.txt || return 1
 red "🚀【 Hysteria-2 】节点信息如下：" && { [[ ! -t 1 ]] || sleep 2; }
@@ -2362,7 +2487,8 @@ if [[ $(jq -r '.enabled' <<< "$client_warp_json") == true ]]; then
     client_warp_node=$(jq -cr '
         {name:"WARP-前置",type:"wireguard",server:.server,port:.port,ip:.ip,
          "private-key":.private_key,"public-key":.public_key,reserved:.reserved,
-         mtu:.mtu,udp:true,"allowed-ips":["0.0.0.0/0","::/0"]}
+         mtu:.mtu,udp:true,"allowed-ips":["0.0.0.0/0","::/0"],
+         "remote-dns-resolve":true,dns:["1.1.1.1","8.8.8.8"]}
          + (if .ipv6 then {ipv6:.ipv6} else {} end) | "- " + tojson
     ' <<< "$client_warp_json") || return 1
     client_warp_node=$'# client-warp: enabled\n'"$client_warp_node"
@@ -2552,14 +2678,17 @@ if [[ -e /etc/s-box/client-rules-revision ]]; then
     rules_revision=$(cat /etc/s-box/client-rules-revision) || exit 1
     [[ $rules_revision =~ ^[0-9a-f]{40}$ ]] || { red "地域规则版本必须为已审查的 40 位小写提交号"; exit 1; }
 fi
-local cert_json fingerprint material hy2_sb_cert= tu5_sb_cert= an_sb_cert= hy2_cl_pin= tu5_cl_pin= an_cl_pin=
-if [[ $vm_self == true || $hy2_self == true || $tu5_self == true || $an_self == true ]]; then
-    material=$(selfsigned_material /etc/s-box/cert.pem www.bing.com) || exit 1
-    cert_json=$(jq -ce .certificate <<< "$material") || exit 1
-    fingerprint=$(jq -er .fingerprint <<< "$material") || exit 1
-    if [[ $hy2_self == true ]]; then hy2_sb_cert="\"certificate\":$cert_json,"; hy2_cl_pin="  fingerprint: \"$fingerprint\""; fi
-    if [[ $tu5_self == true ]]; then tu5_sb_cert="\"certificate\":$cert_json,"; tu5_cl_pin="  fingerprint: \"$fingerprint\""; fi
-    if [[ $an_self == true ]]; then an_sb_cert="\"certificate\":$cert_json,"; an_cl_pin="  fingerprint: \"$fingerprint\""; fi
+local cert_json fingerprint hy2_sb_cert= tu5_sb_cert= an_sb_cert= hy2_cl_pin= tu5_cl_pin= an_cl_pin=
+local proto material_var self_var pem pin
+for proto in hy2 tu5 an; do
+    self_var=${proto}_self; material_var=${proto}_material
+    [[ ${!self_var} == true ]] || continue
+    pem=$(jq -ce .certificate <<< "${!material_var}") && pin=$(jq -er .fingerprint <<< "${!material_var}") || exit 1
+    printf -v "${proto}_sb_cert" '"certificate":%s,' "$pem"
+    printf -v "${proto}_cl_pin" '  fingerprint: "%s"' "$pin"
+done
+if [[ $vm_self == true ]]; then
+    cert_json=$(jq -ce .certificate <<< "$vm_material") && fingerprint=$(jq -er .fingerprint <<< "$vm_material") || exit 1
 fi
 local client_warp_json client_warp_dialer client_warp_node
 client_warp_read || exit 1
@@ -2648,10 +2777,9 @@ cat <<EOF
         "inet6_range": "fc00::/18"
       },
       {
-        "type": "udp",
+        "type": "https",
         "tag": "dns-cn",
-        "server": "223.5.5.5",
-        "server_port": 53
+        "server": "223.5.5.5"
       },
       {
         "type": "https",
@@ -2722,6 +2850,8 @@ cat <<EOF
       }
     ],
     "rules": [
+      {"inbound": ["tun-in"], "action": "sniff"},
+      {"inbound": ["tun-in"], "port": 53, "action": "hijack-dns"},
       {
         "inbound": [
           "tun-in"
@@ -2874,7 +3004,7 @@ dns:
     - "time.*.gov"
     - "pool.ntp.org"
     - "localhost.work.weixin.qq.com"
-  default-nameserver: ["223.5.5.5", "119.29.29.29"]
+  default-nameserver: ["https://223.5.5.5/dns-query", "https://1.1.1.1/dns-query"]
   nameserver:
     - "https://1.1.1.1/dns-query"
     - "https://8.8.8.8/dns-query"
@@ -3081,12 +3211,12 @@ if [[ $sbnh == 1.10 ]]; then
       del(.http_clients,.route.default_http_client,.route.default_domain_resolver,.experimental.cache_file.store_dns) |
       .experimental.cache_file.store_fakeip=true |
       .dns |= (del(.optimistic,.timeout,.cache_capacity) |
-        .servers=[{tag:"fakeip",address:"fakeip"}, {tag:"dns-cn",address:"223.5.5.5",detour:"direct"},
+        .servers=[{tag:"fakeip",address:"fakeip"}, {tag:"dns-cn",address:"https://223.5.5.5/dns-query",detour:"direct"},
                   {tag:"dns-proxy",address:"https://dns.google/dns-query",address_resolver:"dns-cn",detour:"proxy"}] |
         .fakeip={enabled:true,inet4_range:"198.18.0.0/15",inet6_range:"fc00::/18"} |
-        .rules |= map(del(.action))) |
+        .rules |= [{outbound:"any",server:"dns-cn"}] + map(del(.action))) |
       .inbounds |= map(.sniff=true) |
-      .route.rules |= map(if .action=="hijack-dns" then .outbound="dns-out"
+      .route.rules |= map(select(.action!="sniff") | if .action=="hijack-dns" then .outbound="dns-out"
                           elif .action=="reject" then .outbound="block" else . end | del(.action)) |
       .outbounds |= (map(del(.server_ports)) + [{type:"dns",tag:"dns-out"},{type:"block",tag:"block"}])
     ' "$publish_dir/sbox.json" > "$publish_dir/legacy.json" &&
@@ -3109,9 +3239,9 @@ yellow "2：添加或者删除Argo固定隧道"
 yellow "0：返回上层"
 readp "请选择【0-2】：" menu
 if [ "$menu" = "1" ]; then
-cfargo
+config_locked cfargo
 elif [ "$menu" = "2" ]; then
-cfargoym
+config_locked cfargoym
 else
 changeserv
 fi
@@ -3140,6 +3270,20 @@ else
 fi
 }
 
+argo_origin_ready(){
+[[ ! -e /etc/s-box/admin-stopped ]] && sub_service status sing-box >/dev/null &&
+    [[ $(config_get vmess-sb '.listen') == 127.0.0.1 && $(config_get vmess-sb '.tls.enabled') == false ]] || {
+    red "请先启动项目 sing-box 并选择回环 VMess 源站"; return 1
+}
+}
+
+argo_start_temporary(){
+local port
+argo_origin_ready && port=$(config_get vmess-sb '.listen_port') && sub_valid_port "$port" &&
+    project_process temporary-all '' stop || return 1
+nohup /etc/s-box/cloudflared tunnel --url "http://127.0.0.1:$port" --edge-ip-version auto --no-autoupdate --protocol http2 8>&- 9>&- > /etc/s-box/argo.log 2>&1 &
+}
+
 cfargoym(){
 local fixed_host
 echo
@@ -3161,6 +3305,7 @@ printf '\n'
 readp "输入Argo固定隧道域名: " argoym || return 1
 sub_valid_domain "$argoym" && [[ -n $argotoken ]] || { red "固定隧道域名或 Token 无效"; return 1; }
 vm_port=$(config_get vmess-sb '.listen_port') || return 1
+argo_origin_ready || return 1
 echo
 yellow "Zero Trust 的固定隧道源站请填写 http://127.0.0.1:$vm_port"
 if [[ -e /etc/init.d/argo || -e /etc/systemd/system/argo.service || -n $(systemctl show -p FragmentPath --value argo 2>/dev/null) ]]; then
@@ -3177,7 +3322,10 @@ if pidof systemd >/dev/null 2>&1; then
 cat > /etc/systemd/system/argo.service <<EOF
 [Unit]
 Description=argo service
-After=network.target
+After=network.target sing-box.service
+BindsTo=sing-box.service
+PartOf=sing-box.service
+ConditionPathExists=!/etc/s-box/admin-stopped
 [Service]
 Type=simple
 NoNewPrivileges=yes
@@ -3200,12 +3348,13 @@ command_args="tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run
 pidfile="/run/argo.pid"
 command_background="yes"
 depend() {
-need net
+need net sing-box
 }
+start_pre(){ [ ! -e /etc/s-box/admin-stopped ]; }
 EOF
 chmod +x /etc/init.d/argo >/dev/null 2>&1
 rc-update add argo default >/dev/null 2>&1
-rc-service argo restart >/dev/null 2>&1 || return 1
+rc-service argo restart 8>&- 9>&- >/dev/null 2>&1 || return 1
 fi
 fi
 printf '%s\n' "$argoym" > /etc/s-box/sbargoym.log || return 1
@@ -3215,20 +3364,14 @@ sbshare > /dev/null 2>&1
 blue "Argo固定隧道设置完成，固定域名：$argosh"
 elif [ "$menu" = "2" ]; then
 argo_unit_owned || { red "未识别项目管理的 argo 服务"; return 1; }
-if pidof systemd >/dev/null 2>&1; then
-systemctl stop argo >/dev/null 2>&1
-systemctl disable argo >/dev/null 2>&1
-rm -rf /etc/systemd/system/argo.service
-elif command -v rc-service >/dev/null 2>&1; then
-rc-service argo stop >/dev/null 2>&1
-rc-update del argo default >/dev/null 2>&1
-rm -rf /etc/init.d/argo
-fi
+argo_stop_fixed || return 1
+if command -v rc-service >/dev/null 2>&1; then rm -f /etc/init.d/argo || return 1
+else rm -f /etc/systemd/system/argo.service && systemctl daemon-reload || return 1; fi
 rm -f -- /etc/s-box/vm_ws_argogd.txt /etc/s-box/sbargoym.log /etc/s-box/sbargotoken.log
 sbshare > /dev/null 2>&1
 green "Argo固定隧道已停止"
 else
-cfargo_ym
+return 0
 fi
 }
 
@@ -3241,8 +3384,7 @@ readp "请选择【0-2】：" menu
 if [ "$menu" = "1" ]; then
 green "请稍等……"
 cloudflaredargo || return 1
-vm_port=$(config_get vmess-sb '.listen_port') && sub_valid_port "$vm_port" && project_process temporary "$vm_port" stop || return 1
-nohup /etc/s-box/cloudflared tunnel --url "http://127.0.0.1:$vm_port" --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 &
+argo_start_temporary || return 1
 sleep 20
 argo=$(quick_tunnel_hostname)
 if [[ -n $argo ]] && status=$(curl -q -sIL --proto '=https' --proto-redir '=https' --max-time 8 -o /dev/null -w '%{http_code}' "https://$argo/") && [[ $status =~ ^(400|404|503)$ ]]; then
@@ -3252,10 +3394,7 @@ if command -v apk >/dev/null 2>&1; then
 cat > /etc/local.d/alpineargo.start <<'EOF'
 #!/bin/bash
 sleep 10
-port=$(jq -er '.inbounds[] | select(.tag == "vmess-sb") | .listen_port | numbers | select(. >= 1 and . <= 65535)' /etc/s-box/sb.json) || exit 1
-nohup /etc/s-box/cloudflared tunnel --url "http://127.0.0.1:$port" --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 &
-sleep 10
-printf "9\n1\n" | bash /usr/bin/sing_box > /dev/null 2>&1
+exec /usr/bin/sing_box --argo-boot
 EOF
 chmod +x /etc/local.d/alpineargo.start
 rc-update add local default >/dev/null 2>&1
@@ -3263,9 +3402,9 @@ else
 local cron_tmp
 cron_tmp=$(mktemp) || return 1
 crontab -l 2>/dev/null > "$cron_tmp"
-sed -i '/^@reboot .*\/etc\/s-box\/cloudflared tunnel --url /d' "$cron_tmp" || return 1
+sed -i -e '/^@reboot .*\/etc\/s-box\/cloudflared tunnel --url /d' -e '\|^@reboot sleep 10 && /usr/bin/sing_box --argo-boot$|d' "$cron_tmp" || return 1
 cat >> "$cron_tmp" <<'ARGO_CRON'
-@reboot sleep 10 && /bin/bash -c 'port=$(jq -er ".inbounds[] | select(.tag == \"vmess-sb\") | .listen_port" /etc/s-box/sb.json) || exit 1; nohup /etc/s-box/cloudflared tunnel --url "http://127.0.0.1:$port" --edge-ip-version auto --no-autoupdate --protocol http2 > /etc/s-box/argo.log 2>&1 & sleep 10; printf "9\n1\n" | /usr/bin/sing_box >/dev/null 2>&1'
+@reboot sleep 10 && /usr/bin/sing_box --argo-boot
 ARGO_CRON
 crontab "$cron_tmp" >/dev/null 2>&1
 rm "$cron_tmp"
@@ -3274,19 +3413,12 @@ else
 yellow "Argo临时域名验证暂不可用，请稍后再试"
 fi
 elif [ "$menu" = "2" ]; then
-vm_port=$(config_get vmess-sb '.listen_port') && project_process temporary "$vm_port" stop
-local cron_tmp
-cron_tmp=$(mktemp) || return 1
-crontab -l 2>/dev/null > "$cron_tmp"
-sed -i '/^@reboot .*\/etc\/s-box\/cloudflared tunnel --url /d' "$cron_tmp" || return 1
-crontab "$cron_tmp" >/dev/null 2>&1
-rm "$cron_tmp"
+argo_stop_temporary || return 1
 rm -f -- /etc/s-box/vm_ws_argols.txt /etc/s-box/argo.log
-rm -rf /etc/local.d/alpineargo.start
 sbshare > /dev/null 2>&1
 green "Argo临时隧道已停止"
 else
-cfargo_ym
+return 0
 fi
 }
 
@@ -3384,12 +3516,13 @@ esac
 current=$(config_get "$tag" '.tls') || return 1
 key=$(jq -r '.key_path' <<< "$current") || return 1
 if [[ "$key" == /etc/s-box/private.key ]]; then
-acme_hostname >/dev/null || return 1
+domain=$(acme_hostname) || return 1
 cert=/root/ygkkkca/cert.crt; key=/root/ygkkkca/private.key
 else
-cert=/etc/s-box/cert.pem; key=/etc/s-box/private.key
+cert=/etc/s-box/cert.pem; key=/etc/s-box/private.key; domain=www.bing.com
 fi
-patch=$(jq -cn --arg cert "$cert" --arg key "$key" '{tls:{certificate_path:$cert,key_path:$key}}') || return 1
+patch=$(jq -cn --arg cert "$cert" --arg key "$key" --arg name "$domain" \
+    '{tls:{certificate_path:$cert,key_path:$key,server_name:$name}}') || return 1
 
 ;;
 *) return 10 ;;
@@ -4874,7 +5007,7 @@ fi
 
 gitlab_settings_valid(){
 local project=$1 branch=$2 segment
-[[ "$project" == */* && "$project" != /* && "$project" != */ && "$project" != *//* ]] || return 1
+[[ "$project" == */* && "$project" != /* && "$project" != */ && "$project" != *//* && ${project,,} != *.git ]] || return 1
 local -a segments
 IFS=/ read -ra segments <<< "$project"
 for segment in "${segments[@]}"; do
@@ -4897,15 +5030,20 @@ gitlab_publish(){
 (
 set +x
 umask 077
-local settings=$1 verify_write=${2:-} project branch remote stage status name
-{ IFS= read -r project && IFS= read -r branch; } < "$settings" || exit 1
+local settings=$1 verify_write=${2:-} project branch remote stage status token metadata
+{ IFS= read -r project && IFS= read -r branch && IFS= read -r token; } < "$settings" || exit 1
 gitlab_settings_valid "$project" "$branch" || exit 1
-# An anonymously visible repository would publish every node password.
-local visibility
-visibility=$(curl -q -sS --connect-timeout 5 --max-time 15 --output /dev/null --write-out '%{http_code}' \
+[[ -n $token && $token != *[[:cntrl:]]* ]] || exit 1
+local -a probe=(-q --noproxy '*' --proto '=https' -sS --connect-timeout 5 --max-time 15)
+metadata=$(printf 'PRIVATE-TOKEN: %s\n' "$token" | curl "${probe[@]}" --fail --header @- \
     "https://gitlab.com/api/v4/projects/${project//\//%2F}") || exit 1
-[[ "$visibility" == 404 ]] || exit 1
+unset token
+jq -se --arg project "${project,,}" 'length==1 and (.[0] | .visibility=="private" and
+    (.path_with_namespace | ascii_downcase)==$project)' <<< "$metadata" >/dev/null || exit 1
 remote="https://gitlab.com/$project.git"
+status=$(curl "${probe[@]}" --output /dev/null --write-out '%{http_code}' \
+    "$remote/info/refs?service=git-upload-pack") || exit 1
+[[ $status == 401 || $status == 404 ]] || exit 1
 stage=$(mktemp -d /etc/s-box/.git-publish.XXXXXX) || exit 1
 trap 'rm -rf -- "$stage"' EXIT
 trap 'exit 1' HUP INT TERM
@@ -4970,7 +5108,7 @@ case "$menu" in
     readp "发布分支（回车使用 main）：" branch || exit 1
     branch=${branch:-main}
     gitlab_settings_valid "$project" "$branch" || { red "项目或分支名称无效"; exit 1; }
-    IFS= read -rs -p "输入独立的项目发布令牌（write_repository）：" secret || exit 1
+    IFS= read -rs -p "输入独立的项目发布令牌（read_api 和 write_repository）：" secret || exit 1
     printf '\n'
     [[ -n "$secret" && "$secret" != "$(cat /etc/s-box/subtoken.log 2>/dev/null)" &&
        "$secret" != "$(cat /etc/s-box/gitlabtoken.txt 2>/dev/null)" ]] ||
@@ -5134,13 +5272,46 @@ sub_service status sing-box >/dev/null 2>&1 || return 0
 restartsb
 }
 
+argo_stop_fixed(){
+local runlevel
+if argo_unit_owned 2>/dev/null; then
+    sub_service stop argo || return 1
+    if command -v rc-service >/dev/null 2>&1; then
+        for runlevel in /etc/runlevels/*; do
+            [[ ! -L $runlevel/argo ]] || rc-update del argo "${runlevel##*/}" || return 1
+        done
+    elif sub_service enabled argo; then sub_service disable argo || return 1; fi
+fi
+project_process fixed '' stop
+}
+
+argo_stop_temporary(){
+local jobs
+if [[ -f /etc/local.d/alpineargo.start ]] &&
+    grep -Eq '/etc/s-box/cloudflared tunnel --url |/usr/bin/sing_box --argo-boot' /etc/local.d/alpineargo.start; then
+    rm -f /etc/local.d/alpineargo.start || return 1
+fi
+if jobs=$(crontab -l 2>&1); then :
+elif [[ -z $jobs || $jobs == *"no crontab for"* || $jobs == *"No such file or directory"* ]]; then jobs=
+else red "无法读取项目隧道的开机任务" >&2; return 1; fi
+if grep -Eq '^@reboot .*(/etc/s-box/cloudflared tunnel --url |/usr/bin/sing_box --argo-boot$)' <<< "$jobs"; then
+    (set -o pipefail; printf '%s\n' "$jobs" |
+        sed -e '/^@reboot .*\/etc\/s-box\/cloudflared tunnel --url /d' -e '\|^@reboot sleep 10 && /usr/bin/sing_box --argo-boot$|d' |
+        crontab -) || return 1
+fi
+project_process temporary-all '' stop
+}
+
+argo_stop_for_origin(){
+argo_stop_fixed && argo_stop_temporary
+}
+
 singbox_finish_stop(){
 singbox_require_owned || return 1
-local failed=0
+local failed=0 runlevel
+argo_stop_for_origin && cronsb remove || return 1
 sub_service stop sing-box || failed=1
-cronsb remove || failed=1
 if command -v rc-service >/dev/null 2>&1; then
-    local runlevel
     for runlevel in /etc/runlevels/*; do
         if [[ -L $runlevel/sing-box ]]; then
             rc-update del sing-box "${runlevel##*/}" && [[ ! -L $runlevel/sing-box ]] || failed=1
@@ -5206,6 +5377,9 @@ crontab -l > "$cron_tmp" 2>/dev/null
 sed -i -e '/^0 1 [*] [*] [*] systemctl restart sing-box;rc-service sing-box restart$/d' \
        -e '\|^0 1 [*] [*] [*] /usr/bin/sing_box --maintenance$|d' "$cron_tmp" || exit 1
 if [[ ${1:-} != remove && ! -e /etc/s-box/admin-stopped ]]; then printf '%s\n' "$line" >> "$cron_tmp" || exit 1; fi
+if [[ ${1:-} == remove ]]; then
+    sed -i -e '/^@reboot .*\/etc\/s-box\/cloudflared tunnel --url /d' -e '\|^@reboot sleep 10 && /usr/bin/sing_box --argo-boot$|d' "$cron_tmp" || exit 1
+fi
 crontab "$cron_tmp"
 )
 }
@@ -5564,6 +5738,89 @@ sing_box
 fi
 }
 
+acme_activate_locked(){
+(
+local domain=$1 path=$2 dir=/root/ygkkkca work configs= file status restore=0 active=0 restarting=0
+local -a files=(cert.crt private.key ca.log) changed=() check_args=()
+sub_valid_domain "$domain" && [[ $path == "/etc/letsencrypt/live/$domain" ]] || exit 1
+mkdir -p -m 700 "$dir" && chmod 700 "$dir" || exit 1
+work=$(mktemp -d "$dir/.deploy.XXXXXX") || exit 1
+acme_finish(){
+    status=$?
+    trap - EXIT
+    trap '' HUP INT TERM
+    if (( restore )); then
+        for file in "${files[@]}"; do
+            if [[ -e $work/old-$file || -L $work/old-$file ]]; then
+                mv -fT -- "$work/old-$file" "$dir/$file" || { red "旧证书材料保留在 $work" >&2; return 1; }
+            else rm -f -- "$dir/$file" || return 1; fi
+        done
+        for file in "${changed[@]}"; do
+            mv -fT -- "$configs/old-$file" "/etc/s-box/$file" || { red "旧配置保留在 $configs" >&2; return 1; }
+        done
+        if (( restarting )); then
+            ip_priority_restart && config_refresh || red "已恢复证书和配置，请检查服务和订阅" >&2
+        fi
+    fi
+    rm -rf -- "$work"
+    [[ -z $configs ]] || rm -rf -- "$configs"
+    return "$status"
+}
+trap acme_finish EXIT
+trap 'exit 1' HUP INT TERM
+install -m 600 "$path/privkey.pem" "$work/private.key" &&
+    install -m 600 "$path/fullchain.pem" "$work/cert.crt" &&
+    client_tls_material "$work/cert.crt" "$work/private.key" "$domain" >/dev/null &&
+    printf '%s\n' "$domain" > "$work/ca.log" || exit 1
+for file in "${files[@]}"; do
+    if [[ -e $dir/$file || -L $dir/$file ]]; then cp -a -- "$dir/$file" "$work/old-$file" || exit 1; fi
+done
+for file in sb.json sb_extra.json sb10.json sb11.json; do
+    [[ -f /etc/s-box/$file ]] || continue
+    if jq -e --arg cert "$dir/cert.crt" 'any(.inbounds[]?; .tls.certificate_path==$cert)' "/etc/s-box/$file" >/dev/null; then
+        [[ -n $configs ]] || configs=$(mktemp -d /etc/s-box/.acme.XXXXXX) || exit 1
+        cp -p -- "/etc/s-box/$file" "$configs/old-$file" &&
+            config_patch_acme "/etc/s-box/$file" "$configs/$file" "$domain" || exit 1
+        changed+=("$file")
+        if [[ $file == sb.json || $file == sb_extra.json ]]; then active=1; check_args+=(-c "$configs/$file"); fi
+    else
+        [[ $? == 1 ]] || exit 1
+        if [[ $file == sb.json || $file == sb_extra.json ]]; then check_args+=(-c "/etc/s-box/$file"); fi
+    fi
+done
+restore=1
+for file in "${files[@]}"; do mv -fT -- "$work/$file" "$dir/$file" || exit 1; done
+if (( active )); then /etc/s-box/sing-box check "${check_args[@]}" || exit 1; fi
+for file in "${changed[@]}"; do mv -fT -- "$configs/$file" "/etc/s-box/$file" || exit 1; done
+if (( active )); then
+    restarting=1
+    ip_priority_restart checked && config_refresh || exit 1
+fi
+restore=0
+)
+}
+
+acme_renew_locked(){
+local name
+[[ -f /root/ygkkkca/ca.log ]] || return 0
+IFS= read -r name < /root/ygkkkca/ca.log && sub_valid_domain "$name" || return 1
+[[ $1 == "/etc/letsencrypt/live/$name" ]] || return 0
+acme_activate_locked "$name" "$1"
+}
+
+acme_detach_legacy(){
+(
+local dir=/root/ygkkkca file stage
+[[ -L $dir/cert.crt || -L $dir/private.key ]] || exit 0
+chmod 700 "$dir" && stage=$(mktemp -d "$dir/.previous.XXXXXX") || exit 1
+trap 'rm -rf -- "$stage"' EXIT
+trap 'exit 1' HUP INT TERM
+# Capture the live material before Certbot can move its lineage symlinks.
+for file in cert.crt private.key; do install -m 600 "$dir/$file" "$stage/$file" || exit 1; done
+for file in cert.crt private.key; do mv -fT -- "$stage/$file" "$dir/$file" || exit 1; done
+)
+}
+
 acme(){
 local domain path method
 if ! command -v certbot >/dev/null; then
@@ -5575,17 +5832,23 @@ fi
 readp "输入证书域名：" domain || return 1
 sub_valid_domain "$domain" || return 1
 readp "回车使用 HTTP-01 独立监听 TCP 80；输入 2 使用 Certbot 已安装的认证插件：" method || return 1
+case "$method" in ""|1|2) ;; *) return 1 ;; esac
+local hooks=/etc/letsencrypt/renewal-hooks/deploy hook
+mkdir -p "$hooks" && hook=$(mktemp "$hooks/.sing-box.XXXXXX") || return 1
+cat > "$hook" <<'HOOK' && chmod 700 "$hook" && mv -fT -- "$hook" "$hooks/51-sing-box-certificate" || return 1
+#!/bin/sh
+[ "${SBOX_ACME_INTERACTIVE:-}" != 1 ] && [ -x /usr/bin/sing_box ] && [ -s /etc/s-box/sb.json ] || exit 0
+exec /usr/bin/sing_box --acme-renew "$RENEWED_LINEAGE"
+HOOK
+config_locked acme_detach_legacy || return 1
 case "$method" in
-""|1) certbot certonly --standalone --cert-name "$domain" -d "$domain" || return 1 ;;
-2) certbot certonly --cert-name "$domain" -d "$domain" || return 1 ;;
+""|1) SBOX_ACME_INTERACTIVE=1 certbot certonly --standalone --cert-name "$domain" -d "$domain" || return 1 ;;
+2) SBOX_ACME_INTERACTIVE=1 certbot certonly --cert-name "$domain" -d "$domain" || return 1 ;;
 *) return 1 ;;
 esac
 path="/etc/letsencrypt/live/$domain"
 [[ -s "$path/fullchain.pem" && -s "$path/privkey.pem" ]] || return 1
-mkdir -p -m 700 /root/ygkkkca &&
-ln -sfn "$path/fullchain.pem" /root/ygkkkca/cert.crt &&
-ln -sfn "$path/privkey.pem" /root/ygkkkca/private.key &&
-printf '%s\n' "$domain" > /root/ygkkkca/ca.log
+config_locked acme_activate_locked "$domain" "$path"
 }
 cfwarp(){
 local action
@@ -5827,6 +6090,11 @@ if [[ "${1:-}" == --secure-routes ]]; then
     config_apply secure_server_routes
     exit $?
 fi
+if [[ "${1:-}" == --acme-renew ]]; then config_locked acme_renew_locked "${2:-}"; exit $?; fi
+if [[ "${1:-}" == --argo-boot ]]; then
+    config_locked argo_start_temporary && { sleep 10; sbshare >/dev/null; }
+    exit $?
+fi
 if [[ "${1:-}" == --maintenance ]]; then config_locked singbox_maintenance; exit $?; fi
 if [[ "${1:-}" == --firewall-enable ]]; then
 shift
@@ -5930,7 +6198,7 @@ case "$Input" in
 12 ) acme;;
 13 ) cfwarp;;
 14 ) inssbwpph;;
-15 ) ipuuid select && sbshare;;
+15 ) config_locked ipuuid select && sbshare;;
 16 ) sbsm;;
 17 ) if ensure_dependencies && setup_tun; then green "依赖检查/修复完成"; else red "依赖修复失败，请检查软件源和缺失命令"; fi ;;
  * ) exit 

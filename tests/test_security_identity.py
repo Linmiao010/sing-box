@@ -80,6 +80,8 @@ done
 
     def test_new_and_legacy_identity_transaction(self):
         self.generate()
+        shutil.copyfile(self.box / "cert.pem", self.root / "trusted-public-chain.pem")
+        self.env["SSL_CERT_FILE"] = str(self.root / "trusted-public-chain.pem")
         path = next(x for x in self.read_nodes() if x["type"] == "vmess")["transport"]["path"]
         self.assertRegex(path, r"^/[0-9a-f]{48}$")
         self.generate()
@@ -120,6 +122,94 @@ done
     def read_nodes(self):
         return json.loads(self.box.joinpath("sb.json").read_text())["inbounds"]
 
+    def test_external_leaf_is_pinned_for_each_protocol_and_mismatched_key_fails(self):
+        self.generate()
+        external = self.root / "absent-acme"
+        external.mkdir()
+        shutil.copyfile(self.box / "other.pem", external / "cert.crt")
+        shutil.copyfile(self.box / "other.key", external / "private.key")
+        (external / "private.key").chmod(0o600)
+        (external / "ca.log").write_text("www.bing.com\n")
+        for file in ("sb.json", "sb_extra.json"):
+            cfg = json.loads((self.box / file).read_text())
+            for node in cfg["inbounds"]:
+                if node["type"] in ("trojan", "hysteria2", "vmess"):
+                    node["tls"].update(certificate_path="absent-acme/cert.crt", key_path="absent-acme/private.key")
+            (self.box / file).write_text(json.dumps(cfg))
+        sb, mh = self.render()
+        for kind in ("trojan", "hysteria2", "vmess", "tuic", "anytls"):
+            pem = (external / "cert.crt" if kind in ("trojan", "hysteria2", "vmess")
+                   else self.box / "cert.pem").read_text().strip()
+            node = next(n for n in sb["outbounds"] if n["type"] == kind)
+            self.assertEqual(node["tls"]["certificate"].strip(), pem)
+            pin = hashlib.sha256(ssl.PEM_cert_to_DER_cert(pem)).hexdigest()
+            self.assertEqual(next(n for n in mh["proxies"] if n["type"] == kind)["fingerprint"], pin)
+        shutil.copyfile(self.box / "private.key", external / "private.key")
+        result = self.run_code([("result_vl_vm_hy_tu", "cfargo_ym")], "result_vl_vm_hy_tu", check=False)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_acme_domain_and_subscription_commit_or_restore_together(self):
+        self.generate()
+        domain = "renewed.example.test"
+        old_store = self.root / "absent-acme"
+        old_store.mkdir()
+        shutil.copyfile(self.box / "cert.pem", old_store / "cert.crt")
+        shutil.copyfile(self.box / "private.key", old_store / "private.key")
+        (old_store / "ca.log").write_text("www.bing.com\n")
+        for name in ("sb.json", "sb10.json", "sb11.json", "sb_extra.json"):
+            cfg = json.loads((self.box / name).read_text())
+            for node in cfg["inbounds"]:
+                if "certificate_path" in node.get("tls", {}):
+                    node["tls"].update(certificate_path="absent-acme/cert.crt", key_path="absent-acme/private.key")
+            (self.box / name).write_text(json.dumps(cfg))
+        self.run_code([], f"""
+mkdir -p lineage/{domain}
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -x509 -nodes -days 2 \\
+    -keyout lineage/{domain}/privkey.pem -out lineage/{domain}/fullchain.pem \\
+    -subj /CN={domain} -addext subjectAltName=DNS:{domain} -addext basicConstraints=CA:FALSE
+printf '#!/bin/bash\\nexit 0\\n' > box/sing-box && chmod +x box/sing-box
+""")
+        functions = section("acme_activate_locked", "cfwarp").replace("/etc/letsencrypt/live", "lineage")
+        functions = functions.replace("/etc/letsencrypt/renewal-hooks/deploy", "renewal-hooks/deploy")
+        functions = functions.replace("/etc/s-box", "box").replace("/root/ygkkkca", "absent-acme")
+        sections = [("extra_client_data", "extra_menu"), ("result_vl_vm_hy_tu", "cfargo_ym")]
+        runtime = """
+config_lock_held=1
+certbot(){ [[ $1 == certonly && $SBOX_ACME_INTERACTIVE == 1 ]]; }
+readp(){ case $2 in domain) domain=renewed.example.test ;; method) method=1 ;; *) return 1 ;; esac; }
+ip_priority_restart(){ printf 'restart\\n' >> restarted; }
+config_refresh(){ result_vl_vm_hy_tu && sb_client; }
+"""
+        start = "acme"
+        files = [self.box / name for name in ("sb.json", "sb10.json", "sb11.json", "sb_extra.json")]
+        certs = [old_store / name for name in ("ca.log", "cert.crt", "private.key")]
+        original = {p: p.read_bytes() for p in files + certs}
+        failed = self.run_code(sections, functions + runtime + "\nconfig_refresh(){ return 1; }\n" + start, check=False)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertTrue(all(p.read_bytes() == data for p, data in original.items()))
+        interrupted = self.run_code(sections, functions + runtime + """
+config_refresh(){
+    result_vl_vm_hy_tu && sb_client || return 1
+    if [[ ! -e signal-sent ]]; then touch signal-sent; kill -TERM "$BASHPID"; fi
+}
+acme
+""", check=False)
+        self.assertNotEqual(interrupted.returncode, 0)
+        self.assertTrue((self.root / "signal-sent").exists())
+        self.assertTrue(all(p.read_bytes() == data for p, data in original.items()))
+        old = json.loads((self.box / "sbox.json").read_text())
+        self.assertEqual(next(n["tls"]["server_name"] for n in old["outbounds"] if n["type"] == "trojan"), "www.bing.com")
+        self.run_code(sections, functions + runtime + start)
+        for path in files:
+            for node in json.loads(path.read_text())["inbounds"]:
+                if node.get("tls", {}).get("certificate_path") == "absent-acme/cert.crt":
+                    self.assertEqual(node["tls"]["server_name"], domain)
+        tls = next(n for n in json.loads((self.box / "sbox.json").read_text())["outbounds"] if n["type"] == "trojan")["tls"]
+        self.assertEqual((tls["server_name"], tls["certificate"].strip()), (domain, certs[1].read_text().strip()))
+        self.assertEqual(certs[0].read_text().strip(), domain)
+        self.assertTrue((self.root / "restarted").is_file())
+        self.assertIn('--acme-renew "$RENEWED_LINEAGE"', (self.root / "renewal-hooks/deploy/51-sing-box-certificate").read_text())
+
     def test_refresh_and_push_keep_credentials_out_of_program_arguments(self):
         self.generate()
         profile = dict(enabled=True, server="192.0.2.5", port=2408, ip="172.16.0.4",
@@ -131,6 +221,9 @@ done
         (self.box / "cfvmadd_local.txt").write_bytes(b"203.0.113.4\n")
         (self.box / "cfymjx.txt").write_bytes(b"cdn.example.test\n")
         cfg = json.loads((self.box / "sb.json").read_text())
+        (self.root / "acme").mkdir()
+        shutil.copyfile(self.box / "cert.pem", self.root / "acme/cert.crt")
+        self.env["SSL_CERT_FILE"] = str(self.root / "acme/cert.crt")
         next(n for n in cfg["inbounds"] if n["tag"] == "vmess-sb")["tls"]["certificate_path"] = "acme/cert.crt"
         (self.box / "sb.json").write_text(json.dumps(cfg))
         wrappers = r'''
@@ -149,6 +242,8 @@ sub_publish_current(){ local dir=$1 file; shift; for file in "$@"; do cp "$dir/$
 '''
         sources = [("extra_client_data", "extra_menu"), ("result_vl_vm_hy_tu", "cfargo_ym"),
                    ("sbshare", "clash_sb_share"), ("tgsbshow", "changeserv"), ("sub_show_urls", "ipsub")]
+        if os.name == "nt":
+            wrappers += '\njq(){ printf "%s\\n" "$@" >> "$ARG_LOG"; command jq -b "$@"; }\nexport -f jq\n'
         for enabled in (True, False):
             if enabled:
                 (self.box / "telegram.credentials").write_bytes(b"1234:example_bot\n@fixture_room\n")

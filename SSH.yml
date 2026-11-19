@@ -31,6 +31,7 @@ jobs:
           if [[ -n "$SSH_PRIVATE_KEY" ]]; then
             eval "$(ssh-agent -s)" >/dev/null
             trap 'ssh-agent -k >/dev/null' EXIT
+            trap 'exit 1' HUP INT TERM
             ssh-add - <<< "$SSH_PRIVATE_KEY" >/dev/null 2>&1
           fi
           bash kp.sh --login

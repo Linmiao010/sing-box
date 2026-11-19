@@ -84,7 +84,11 @@ for entry in '11 8000' '12 80001' '13 8000'; do
 done
 kill(){ [[ $1 != -0 ]] && printf '%s\n' "$2" >> selected; }
 project_process temporary '' stop && exit 1
-project_process temporary 8000 stop && [[ $(cat selected) == 11 ]]
+project_process temporary 8000 stop && [[ $(cat selected) == 11 ]] || exit 1
+pgrep(){ return 2; }
+if project_process temporary-all '' stop; then exit 1; fi
+pgrep(){ return 1; }
+project_process temporary-all '' stop
 ''')
 
     def test_socks_tls_probe_checks_status_and_ip(self):
@@ -223,7 +227,7 @@ cmp expected recorded
             def do_GET(self):
                 received.append(self.path)
                 self.send_response(302)
-                self.send_header("Location", f"http://127.0.0.1:{self.server.plain_port}/other")
+                self.send_header("Location", f"https://127.0.0.1:{self.server.plain_port}/other")
                 self.end_headers()
 
             def log_message(self, *args):
@@ -238,10 +242,11 @@ cmp expected recorded
         with (ThreadingHTTPServer(("127.0.0.1", 0), Redirect) as server,
               ThreadingHTTPServer(("127.0.0.1", 0), Plain) as plain):
             server.plain_port = plain.server_port
-            threading.Thread(target=plain.serve_forever, daemon=True).start()
             ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             ctx.load_cert_chain(self.root / "ca.pem", self.root / "key.pem")
             server.socket = ctx.wrap_socket(server.socket, server_side=True)
+            plain.socket = ctx.wrap_socket(plain.socket, server_side=True)
+            threading.Thread(target=plain.serve_forever, daemon=True).start()
             threading.Thread(target=server.serve_forever, daemon=True).start()
             secret = "fixture-subscription-path"
             target = f"https://127.0.0.1:{server.server_port}/{secret}"
@@ -267,3 +272,38 @@ cmp expected recorded
             finally:
                 server.shutdown()
                 plain.shutdown()
+
+    def test_probe_refuses_invalid_proxy_on_both_inputs(self):
+        spec = importlib.util.spec_from_file_location("proxy_schemes", REPO / "tools/network_probe.py")
+        probe = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(probe)
+        url = "https://example.test"
+        common = ["--label", "fixture", "--output", str(self.root / "probe.csv")]
+        for proxy in ("file:///local", "gopher://proxy.invalid", "http://", "host:1080",
+                      "http://fixture:pw@proxy.example", "socks5h://fixture:pw@192.0.2.2"):
+            with self.subTest(proxy=proxy), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    probe.arguments(common + ["--url", url, "--proxy", proxy])
+                with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(dict(url=url, proxy=proxy)))):
+                    with self.assertRaises(SystemExit):
+                        probe.arguments(common + ["--private-stdin"])
+
+    def test_health_worker_bounds_stream_and_cancels_oversize(self):
+        script = """
+import worker from './workers_keep.js';
+const env = {HEALTH_URLS:'https://example.test/health'};
+for (const chunks of [['o','k\\n'], ['ok\\n','excess'], ['x'.repeat(8192)]]) {
+    let reads = 0, cancelled = false, failed = false;
+    globalThis.fetch = async () => ({status:200, body:{getReader:() => ({
+        read:async () => {
+            if (reads >= chunks.length) return {done:true};
+            return {value:new TextEncoder().encode(chunks[reads++])};
+        },
+        cancel:async () => {cancelled = true;}
+    })}});
+    try { await worker.scheduled({}, env); } catch { failed = true; }
+    if (failed !== (chunks[0] !== 'o') || (chunks[0].length > 16 && !cancelled)) process.exit(1);
+}
+"""
+        result = subprocess.run(["node", "--input-type=module", "-e", script], cwd=REPO, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)

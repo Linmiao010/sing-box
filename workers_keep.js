@@ -10,7 +10,24 @@ export default {
                 if (url.protocol !== 'https:' || url.username || url.password ||
                     url.pathname !== '/health' || url.search || url.hash) throw new Error();
                 const res = await fetch(url, {redirect: 'error', signal: AbortSignal.timeout(15000)});
-                if (res.status !== 200 || await res.text() !== 'ok\n') throw new Error();
+                if (res.status !== 200) {
+                    await res.body?.cancel();
+                    throw new Error();
+                }
+                const reader = res.body.getReader();
+                const expected = [111, 107, 10]; // "ok\n"
+                let offset = 0;
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+                    if (value.length > expected.length - offset ||
+                        value.some((byte, i) => byte !== expected[offset + i])) {
+                        await reader.cancel();
+                        throw new Error();
+                    }
+                    offset += value.length;
+                }
+                if (offset !== expected.length) throw new Error();
                 console.log('health', i + 1, 'ok');
             } catch {
                 console.log('health', i + 1, 'failed');

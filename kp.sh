@@ -44,7 +44,8 @@ while IFS= read -r account; do
     password=$(jq -r '.SSH_PASS // ""' <<< "$account")
     options=(-F /dev/null -o StrictHostKeyChecking=yes -o UpdateHostKeys=no
         -o "UserKnownHostsFile=$SSH_KNOWN_HOSTS_FILE" -o GlobalKnownHostsFile=/dev/null
-        -o ConnectTimeout=10 -o ForwardAgent=no -o ClearAllForwardings=yes -T)
+        -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2
+        -o ForwardAgent=no -o ClearAllForwardings=yes -T)
     command=(ssh)
     if [[ -n $password ]]; then
         command=(sshpass -e ssh)

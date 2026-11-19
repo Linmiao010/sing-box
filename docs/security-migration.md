@@ -1,6 +1,47 @@
 # 旧部署安全迁移与验收
 
-适用于从审计基线 `b0a8951` 或旧版 `4a8e812` 布局升级。先取得受信提交号和独立 SSH 或控制台访问。备份含私钥的配置时使用 root 或账户专用的 `0700` 目录，并将备份存放在订阅站点之外。
+适用于从审计基线 `b4b7a3c`、`b0a8951` 或旧版 `4a8e812` 布局升级。先取得受信提交号和独立 SSH 或控制台访问。备份含私钥的配置时使用 root 或账户专用的 `0700` 目录，并将备份存放在订阅站点之外。
+
+## 从 b4b7a3c 升级
+
+1. 记录内核版本、服务运行状态、隧道类型、活动防火墙和区域。备份 `/etc/s-box` 中的配置、证书、订阅和 `firewall.json`，另存 `/root/ygkkkca` 及其符号链接实际指向的证书和私钥。Serv00 备份账户私有目录、原 CA Pool 路径和端口分配。更早版本按下文相应基线的步骤一并迁移。
+2. 在 VPS 用菜单 **7** 切换到包含本次修改的受审发布目录。保持一个独立 SSH 会话。若 firewalld 原先交由本项目管理，先核对区域、来源封禁和尾部拒绝策略。确认放行位置后运行 `sing_box --firewall-enable --input-position append --zone <区域>`，替换已登记的旧 `-17461` 规则。采用手动放行时运行 `sing_box --firewall-sync`，撤下未确认的旧项目放行。仅在确认通配监听、`StrictForwardPorts` 与该区域的 DNAT 入站效果后才加 `--confirm-forward-ports`。跳跃范围在 PREROUTING 被改写，按原跳跃端口封禁需匹配连接的原目的端口。两族分别复核 SSH、受限来源和允许来源。
+3. 运行 `sing_box --secure-routes`。活动节点将短暂重启。1.14 的直连 UDP 固定到通过检查的首个目的端点。1.10.7 阻断代理请求的 UDP 出站，Hysteria2/TUIC 自身的 QUIC 入站传输仍可承载 TCP。依赖 UDP 转发的部署先切换受支持的 1.14 内核。安装时按地址族保存已核实的公网地址。菜单 **15** 在广告新节点地址前先确保生效配置覆盖该地址，已有规则覆盖时不会因此重启。变更其他网卡地址后重新运行这条迁移命令。未出现在接口上的云 NAT 公网地址可加入 `/etc/s-box/restricted-cidrs.json`。
+4. VPS 使用 Certbot 时，从菜单 **12** 重新应用现有证书。这一步安装续期部署钩子，将证书保存在权限受限的本地目录，更新使用该证书的入站 SNI，并刷新订阅。服务正在运行时会重启。外部证书须提供匹配的私钥、有效的 DNS SAN 和完整中间链。无法连到系统受信根的合格叶证书会随节点下发。回滚时同时恢复证书、匹配私钥、域名记录、服务端 JSON 和对应订阅。[Certbot 续期与部署钩子](https://eff-certbot.readthedocs.io/en/stable/using.html#renewing-certificates)
+5. Serv00 从完整新发布目录执行 `bash serv00.sh --update`。若仍是早期共享目录布局，先按下文执行 `--migrate`。固定隧道按脚本打印的**实际绝对路径**更新 Cloudflare 的 CA Pool，源站名称使用 `argo-origin.invalid`，关闭 No TLS Verify。已有固定隧道更换源站密钥时，按提示核对新叶证书摘要并提供完整确认值，再次执行原命令。保留旧控制台设置至新配置验证成功；若恢复旧 generation，控制台也须恢复原 CA Pool。
+6. 在维护窗口执行 `~/bin/sb --rotate`，重新取得 `~/bin/sb --show` 显示的地址。旧 UUID、路径、订阅令牌和 REALITY 密钥会更换，自签 TLS 密钥也会重签。使用外部公共证书时由证书所有者管理私钥。此步会中断旧客户端。尽快在每个客户端重新拉取完整订阅，复核证书、TCP、所需 UDP 功能及旧令牌失效。旧自签 CA 曾导入系统或浏览器根证书库的用户应移除该信任。
+7. VPS 运行 **9 → 2** 重新生成订阅。使用 GitLab 的发布端需具备项目 `read_api` 和目标分支的 `write_repository` 权限。若远端发布失败，本地 HTTPS 订阅可单独刷新。已暂停的 UDP 跳跃需要重新下发订阅才能从客户端移除。[GitLab 项目 API](https://docs.gitlab.com/api/projects/#retrieve-a-project)
+
+VPS 已有旧 Argo 开机项的部署，应在维护窗口用新版 **6 → 2** 按顺序停止连接器与源站，再用 **6 → 1** 启用节点，从隧道菜单重新建立所需隧道及开机项。临时隧道的公网域名可能变化。改回环源站端口也会停止相关连接器，需相应更新固定隧道控制台并重新启用。VPS 的回环源站使用 HTTP，多租户机器上突发进程退出或手动绕过管理菜单重启仍有端口抢占窗口。此类机器应选用已有的公网 WSS 直连模式，或使用能验证 TLS 源站且隔离端口的独立部署。
+
+配置检查失败时保留原配置。若新版启动或发布失败，先核对实际运行进程、两族过滤规则、旧订阅快照与回环源站。需要手工回退时，从备份恢复同一代配置、证书和防火墙登记，保持管理员原先的停服状态。凭据已泄露时应以新密钥重建恢复配置。
+
+### b4b7a3c 审计修复与验证
+
+最终发布副本串行运行 `python -m unittest discover -s tests -v`，18 个模块共 176 项，172 项通过，4 项因平台条件跳过，耗时 450.541 秒。四项分别需要 Linux 网络命名空间中的真实防火墙、原生 `flock`、VPS 跨 UID 文件权限、Serv00 跨 UID 文件权限。另已通过四个 Shell 入口的 `bash -n`、两个 JavaScript 文件的 `node --check`、Python 文件的 `py_compile`、两个 SSH 工作流的 YAML 解析及 `git diff --check`。原生 HTTPS 用例使用 Caddy 2.11.7。未部署到 Linux VPS 或 FreeBSD Serv00。
+
+本机工作目录还保留被 Git 忽略的历史测试。直接在该目录发现的 396 项中有失败。对照原始 `b4b7a3c` 逐个复跑，13 个历史模块中报错的 55 个不同用例在原始基线上也失败，其中包括期望从可变分支下载、使用早期模板和缺少证书材料的夹具。本轮将与改动直接相关的网络探测、IP 发现、菜单调度测试纳入发布副本，并更新了重定向预期和受管理节点的测试夹具。并发跑两套测试时，曾有一次地址刷新用例测到 3.087 秒；保留 3 秒门槛后，单模块和最终串行全套复测均通过。
+
+下表保留本轮审计编号。测试文件位于 `tests/`。例如，第 1 项可用 `python -m unittest discover -s tests -p test_security_server_routes.py -v` 复测，其余项将 `-p` 后的值换成对应文件名。原生回环检查使用 sing-box 1.10.7、1.14.3 和 Mihomo 1.19.33。本地测试中的 IP、域名、端口和证书均为测试专用。
+
+完整复测命令为 `python -m unittest discover -s tests -v`。将 `SING_BOX_110_BIN`、`SING_BOX_BIN`、`MIHOMO_BIN` 分别指向上述三个程序；Serv00 用例还读取 `SERV00_TEST_SB`、`SERV00_TEST_MH`。离线校验 Mihomo 完整配置时，将 `MIHOMO_DATA_DIR` 和 `MIHOMO_TEST_DATA` 都指向已有 `GeoSite.dat`、`geoip.metadb` 的目录。真实 SSH 主机密钥用例需 OpenSSH 和 Paramiko，Caddy 需在 PATH 中。Windows 下使用独立、无空格的临时测试路径，以满足 Unix 管理套接字的路径约束。
+
+1.14.3 的 `udp_connect` 让直连出站先连接到获准目的端点。随后数据报的地址字段不能改变这个套接字的对端，载荷仍可能发往首个目的端，发送方也可能得不到错误。验收应检查受限目标是否收到了报文。[sing-box 1.14.3 连接管理](https://github.com/SagerNet/sing-box/blob/v1.14.3/route/conn.go#L158-L192) · [对应版本的数据报写入实现](https://github.com/SagerNet/sing/blob/0ad23b637bd4/common/bufio/bind.go#L69-L104)
+
+| 编号 | 修改文件与生效入口 | 本地验证内容及边界 |
+| --- | --- | --- |
+| 1 | `sb.sh`、`serv00_runtime.py` 的新装与路由迁移在地址拒绝规则后固定 1.14 UDP 目的端，1.10 阻断代理 UDP | `test_security_server_routes.py` 用原生内核验证允许目的收包、非对端回包隔离、独立受限请求无报文、旧版命中 block。同一 PacketConn 连续改写目的地址的客户端场景只核对了内核实现。 |
+| 2 | `sb.sh` 的 1.14 客户端在私网直连前执行 TUN sniff、53 端口和 DNS 协议劫持。1.10 转换到入站 sniff 与 dns-out | `test_security_server_routes.py` 校验两版生成物，回环保留导出的路由规则，模拟发往私网网关的查询并收到内部 FakeIP。真实 TUN 网卡未改动。 |
+| 3 | `tools/firewall.py`、`sb.sh` 为 firewalld 使用正优先级，按登记逐条替换旧规则，另行确认区域 UDP 转发 | `test_security_firewall_release.py` 对比允许和禁止来源、未确认路径、旧条目迁移，以及运行态和持久态部分失败后的恢复。真实 zone 重载与云安全组需在部署机核对。 |
+| 4 | `serv00_runtime.py` 签发非 CA 叶证书并轮换节点、REALITY 和回源密钥。`sb.sh` 与 Serv00 均按实际密钥、SAN、有效期及系统信任链生成各节点信任信息 | `test_security_serv00.py`、`test_security_identity.py` 用 OpenSSL、隔离根库和回环客户端验证私有叶证书、缺失信任根、密钥不匹配、证书轮换与旧身份。固定隧道控制台由部署者更新。 |
+| 5 | `sb.sh`、`serv00_runtime.py` 扩充转换地址、保留网段及本机地址。VPS SOCKS 出站使用前置受控解析结果 | `test_security_server_routes.py` 记录内核向 SOCKS 发送的实际 IP，验证四种选族策略、DNS64、6to4、本机地址和重复迁移。 |
+| 6 | `sb.sh` 的 GitLab 发布先认证查询精确项目和 private 可见性，再匿名探测 Git refs。凭据经标准输入供 API 使用 | `test_security_distribution.py` 的回环 Git 服务接受私有仓库真实推送，拒绝公开、internal、路径不一致、后缀歧义及只读身份，并检查 curl 参数。真实 GitLab 受保护分支权限需由项目管理员核对。 |
+| 7 | `sb.sh`、`serv00_runtime.py` 生成加密引导 DNS。VPS Mihomo 的 WARP 内解析开启，Serv00 Mihomo 使用回环 FakeIP 与 no-resolve 地域规则 | `test_security_server_routes.py`、`test_security_serv00.py` 校验两代配置及 Mihomo，使用本地 DNS 记录器确认域名节点的解析路径。公网 DoH 服务和客户端网络需另测。 |
+| 8 | `tools/firewall.py` 归一化 IPv4 映射地址，iptables/UFW/nft 对单播 UDP 只改变端口，以原地址 DNAT。firewalld 暂停单播自动跳跃 | `test_security_firewall_release.py` 验证映射回环忽略、副 IP 精确匹配、同端口多 IP 共存和仅清理自有规则。 |
+| 9 | `sb.sh` 在停服及改回环 VMess 端口前处理隧道与开机任务。`serv00_runtime.py` 在操作宿主端口前检查冲突，先停连接器和节点，确认新的固定回源证书 | `test_security_node_lifecycle.py`、`test_serv00_recovery.py`、`test_security_serv00.py` 验证先停隧道再释放源站、冲突零删除、失败恢复次序及重试确认。 |
+| 10 | `serv00_runtime.py` 在公开入口与快照目录都写入 HTTPS 拒绝明文规则，支持替换项目旧控制文件 | `test_security_serv00.py` 覆盖全新目录和原 `Options -Indexes` 文件升级。上线时用无凭据测试路径通过 HTTP 验证拒绝结果，不要以明文发送订阅令牌。 |
+| 11 | `serv00_runtime.py` 固定 s14/s15 的 Gemini 规则集，复核旧 WARP 规则及下载主机，隧道探测禁重定向，1.14 配置受控解析器 | `test_security_serv00.py`、`test_serv00_recovery.py` 覆盖字符串／列表引用、嵌套规则和非受信 URL、域名型 WARP 对端及探测器响应处理。 |
+| 12 | `sb.sh` 使用同一配置锁切换 ACME 证书、入站 SNI 和订阅。`tools/network_probe.py` 禁止跟随跳转并检查代理。`serv00_runtime.py` 在等待操作锁前清除账户文件。`kp.sh`、`SSH.yml`、`serv00.yml` 和 `workers_keep.js` 收紧保活、清理和读取上限 | `test_security_identity.py`、`test_security_shell.py`、`test_security_serv00.py` 覆盖换域和发布失败回滚、HTTPS 回环重定向、非法代理、阻塞时删除凭据和 Worker 分块响应。真实 Certbot 签发及续期任务需在部署机运行。 |
 
 ## 修复范围与验证入口
 
@@ -12,7 +53,7 @@
 | Serv00 管理入口 | `app.js` 仅提供只读健康页。安装与保活使用同一份 `serv00_runtime.py` 和受审面板 | 从部署函数生成应用，启动后检查健康页、旧 GET 和未授权 POST，模拟重启及改端口调用数为零 |
 | 客户端 TLS | `sb.sh`、`serv00_runtime.py` 为完整订阅生成公证书或叶证书指纹。缺少可靠自签信任字段的单节点格式使用完整订阅 | sing-box 1.10.7、1.14.3 与 Mihomo 1.19.33 原生回环。检验正确证书、同名替代证书和旧凭据；1.10 系列不生成 AnyTLS。[Mihomo TLS 字段](https://wiki.metacubex.one/en/config/proxies/tls/) |
 | 公网订阅 | `sb.sh` 由 Caddy 读取三个白名单订阅文件，验证三份内容后才停旧 HTTP 入口 | 真实 Caddy + 私有 CA 核对 HTTPS 内容、拒绝旧令牌、拒绝非白名单文件。故障注入验证第三份损坏及切换中断 |
-| Mihomo 局域网共享 | 两套生成器默认 `allow-lan: false`。VPS DNS 监听回环，Serv00 DNS 默认关闭 | Mihomo 1.19.33 实测代理和 DNS 监听。显式共享时，指定源地址需认证，其他来源即使密码正确也被拒。[Mihomo 入站访问控制](https://wiki.metacubex.one/en/config/general/) |
+| Mihomo 局域网共享 | 两套生成器默认 `allow-lan: false`。VPS 与 Serv00 的客户端 DNS 均监听回环 | Mihomo 1.19.33 实测代理和 DNS 监听。显式共享时，指定源地址需认证，其他来源即使密码正确也被拒。[Mihomo 入站访问控制](https://wiki.metacubex.one/en/config/general/) |
 | 安装与更新 | `README.md`、`sb.sh`、`tools/releases.sha256` 和 Serv00 安装器校验受审提交或固定 SHA-256。系统辅助工具优先用发行版签名软件源 | 离线发布物覆盖成功、篡改、缺摘要。失败候选未执行，旧版仍可用。内核不兼容、重启失败及终止信号均有回归 |
 | SSH 自动化与日志 | `kp.sh`、`SSH.yml`、`serv00.yml` 使用预核实的 known_hosts；`workers_keep.js` 与健康工作流只检查 HTTPS | 真实 OpenSSH 对两把测试主机密钥进行匹配、未知和变更验证，操作日志仅含账户序号与状态 |
 | 本地权限与 WARP | VPS 私有目录仅 root 可访问。域名站点由 Caddy 读取只读快照，本机 HTTP 使用独立账户。Serv00 使用账户专用工作目录与单独的 Web 读取组。WARP 注册或导入独立配置，保留依赖它的分流 | 注册失败、原配置保留、停用时拒绝匹配路由、重新启用以及权限隔离均有回归入口 |
@@ -40,11 +81,11 @@
 
 优先使用本账户已登记、空闲的额外 TCP 端口并设置 `SERV00_ARGO_PORT`。只能复用 VMess 端口时，先向宿主确认 UID 限制覆盖 IPv4 回环，并在该账户验证具体公网单播地址和 `127.0.0.1` 能分别绑定同一端口，再设置 `SERV00_LOOPBACK_PORT_CONFIRMED=1`。两项前提需要在目标机验收。部署额外受限地址用 `~/.sing-box-serv00/restricted-cidrs.json`。
 
-临时隧道由脚本向连接器传入 HTTPS 回源地址、证书名称和信任根。固定隧道先准备源站证书，根据脚本提示到 Cloudflare 的隧道发布路由，将 Service 设为 `https://127.0.0.1:<已分配端口>`，Origin Server Name 设为 `argo-origin.invalid`，CA Pool 填连接器可读的 `~/.sing-box-serv00/origin-tls/cert.pem` **绝对路径**，关闭 No TLS Verify。保存控制台配置后，交互确认完整回源 URL；非交互方式使用 `SERV00_FIXED_ORIGIN_CONFIRMED` 传入同一 URL。安排维护窗口，旧版明文源站与新连接器配置的切换会造成短时中断。对新装用 `--install`，旧目录用 `--migrate`，已有活动目录用 `--update`。[Cloudflare 回源参数](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/origin-parameters/)
+临时隧道由脚本向连接器传入 HTTPS 回源地址、证书名称和信任根。固定隧道先准备源站证书，根据脚本提示到 Cloudflare 的隧道发布路由，将 Service 设为 `https://127.0.0.1:<已分配端口>`，Origin Server Name 设为 `argo-origin.invalid`，CA Pool 填连接器可读、由当前命令打印的证书绝对路径，关闭 No TLS Verify。保存控制台配置后，按提示输入确认值。非交互方式通过 `SERV00_FIXED_ORIGIN_CONFIRMED` 提供同一值，已有固定隧道换证时包含新证书摘要。安排维护窗口，旧版明文源站与新连接器配置的切换会造成短时中断。对新装用 `--install`，旧目录用 `--migrate`，已有活动目录用 `--update`。[Cloudflare 回源参数](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/configure-tunnels/origin-parameters/)
 
 从曾可被其他账号写入的旧目录迁移时，优先指定 `SERV00_WARP_POLICY_BACKUP` 为该账户私有、位于旧目录外的可信备份绝对路径。人工迁移时阅读完整的拟继承匹配条件、WARP 出站和远程规则集 URL；确认来源后再输入 `IMPORT-WARP`。来源不明时暂停，原规则涉及的域名仍按原部署处理。UUID 轮换与策略审批独立。对两种隧道分别检查正确源站证书可用、错误证书被拒，实测重启、更新、改端口及轮换。临时域名可能随重连改变，重新获取订阅；固定隧道改端口后重新核对控制台。失败恢复使用当前有效身份并保留 TLS 验证。
 
-## 本次修复的回归入口
+## b0a8951 审计修复的历史回归入口
 
 2026-11-19 在 Windows 的干净交付副本上验证了 15 个模块、114 项测试，110 项通过，4 项因平台条件跳过。跳过项是 Linux 网络命名空间内的防火墙收发、原生 flock 发布并发、VPS 与 Serv00 的跨 UID 文件权限。另已通过四个入口脚本的 Bash 语法检查、Python 编译及 Git 差异检查。此次未部署到真实 VPS 或 Serv00。
 
@@ -70,7 +111,7 @@
 ## 单机 VPS
 
 1. **保住管理通道。** 保留当前 SSH 会话，并确认云控制台能够登录。记录 SSH 实际监听地址和端口、云安全组、`ss -lntup` 结果，以及当前使用的防火墙后端。分别用 `iptables-save`、`ip6tables-save` 或 `nft list ruleset` 留存与本机对应的规则，同时备份 firewalld / UFW 的持久配置。若旧安装已经清空策略，须从此前的可信备份恢复。没有备份时，先按实际端口和管理员来源放行 SSH，另开会话验证 IPv4、IPv6，再按需恢复节点、其他应用和默认策略。云厂商救援控制台应在收紧策略前可用。
-2. **备份并切换程序。** 保存 `/etc/s-box`、Caddy 配置和证书数据、自定义 service、root crontab 及现有程序版本。旧主机菜单会读取已安装内核的版本。先从可信安装记录确定旧内核版本和架构，核对相应官方归档的签名或受审 SHA-256，再提取归档中的 sing-box，用 `cmp` 与 `/etc/s-box/sing-box` 比较。来源不明或内容不符时，先从已验证归档恢复程序；共享的系统 Caddy 由发行版软件包或现有管理员的受信来源核对。按仓库 README 将受审提交提取到 `/etc/s-box/releases/<提交号>`，从该目录运行 `bash sb.sh`，选择 **7**。已安装的机器不必重新安装。默认由原防火墙管理方维护规则。需要项目自动放行时，先检查链顺序。iptables、UFW、原生 nftables 仅在可安全追加时运行 `sing_box --firewall-enable --input-position append`。firewalld 用 `sing_box --firewall-enable`，多 zone 主机用 `sing_box --firewall-enable --zone <公网接口所属区域>`。手动重载主机防火墙后，用 `sing_box --firewall-sync` 对账。受审目录中的 `python3 tools/firewall.py remove` 可撤销本项目条目。核对脚本列出的旧 DNAT 规则或两族 `-t nat -S PREROUTING` 输出，只按明确归属逐条处理。请勿清空链。
+2. **备份并切换程序。** 保存 `/etc/s-box`、Caddy 配置和证书数据、自定义 service、root crontab 及现有程序版本。旧主机菜单会读取已安装内核的版本。先从可信安装记录确定旧内核版本和架构，核对相应官方归档的签名或受审 SHA-256，再提取归档中的 sing-box，用 `cmp` 与 `/etc/s-box/sing-box` 比较。来源不明或内容不符时，先从已验证归档恢复程序；共享的系统 Caddy 由发行版软件包或现有管理员的受信来源核对。按仓库 README 将受审提交提取到 `/etc/s-box/releases/<提交号>`，从该目录运行 `bash sb.sh`，选择 **7**。已安装的机器不必重新安装。默认由原防火墙管理方维护规则。需要项目自动放行时，先检查链顺序。iptables、UFW、原生 nftables 仅在可安全追加时运行 `sing_box --firewall-enable --input-position append`。firewalld 用 `sing_box --firewall-enable --input-position append`，多 zone 主机同时指定 `--zone <公网接口所属区域>`。手动重载主机防火墙后，用 `sing_box --firewall-sync` 对账。受审目录中的 `python3 tools/firewall.py remove` 可撤销本项目条目。核对脚本列出的旧 DNAT 规则或两族 `-t nat -S PREROUTING` 输出，只按明确归属逐条处理。请勿清空链。
 3. **先迁移订阅入口。** 对外域名设置正确的 A/AAAA 和 TCP 80/443。旧公网 HTTP 运行期间，直接用 **3 → 10** 输入域名和新随机路径令牌。此时新文件目录与旧 Web 根独立。Caddy 通过可信 HTTPS 读取 `sbox.json`、`clmi.yaml`、`jhsub.txt` 并逐一比对本机文件后，脚本提交配置、停旧监听并移除已知旧令牌目录。失败时保留旧入口，按报错排查。仅需本机 HTTP 的新部署可用 **3 → 8 → 1**。 共用已有 Caddy 时，站点片段对实际服务组只读。无法自动识别该组时，核实服务身份后用 `SBOX_CADDY_GROUP=<组名> sing_box` 设置。
 4. **准备证书。** 可信域名证书需包含客户端 SNI 对应的 DNS SAN。已有自签证书可用 `openssl x509 -in /etc/s-box/cert.pem -noout -ext subjectAltName` 核对。若旧证书仅有 CN，应安排维护窗口，备份证书和密钥。使用原密钥重新签发 `www.bing.com` 的自签公证书可运行下列命令。自定义 SNI 或怀疑私钥泄露时，应使用相应名称及新的独立私钥，并同步更新客户端信任。
 
@@ -95,7 +136,7 @@
 
 ## GitLab 订阅发布
 
-1. 盘点所有使用旧令牌的 VPS、分支、定时任务、通知和客户端。准备专用私有项目，为每个发布端创建独立、限期有效的项目令牌，授予向指定分支推送所需的角色和 `write_repository` 范围。受保护分支还需允许对应身份推送。客户端使用上一节的新 Caddy 令牌。[GitLab 项目访问令牌](https://docs.gitlab.com/user/project/settings/project_access_tokens/)
+1. 盘点所有使用旧令牌的 VPS、分支、定时任务、通知和客户端。准备专用私有项目，为每个发布端创建独立、限期有效的项目令牌，授予向指定分支推送所需的角色，以及 `read_api`、`write_repository` 两项范围。受保护分支还需允许对应身份推送。客户端使用上一节的新 Caddy 令牌。[GitLab 项目访问令牌](https://docs.gitlab.com/user/project/settings/project_access_tokens/)
 2. 每台 VPS 依次运行 **3 → 7 → 1**，填写项目路径和分支，在隐藏输入框中输入新令牌；不要把令牌写进 shell 历史。首次设置要成功发布三份文件，随后才替换本机仅 root 可读的 `gitlab-publisher`。再次发布用 **3 → 7 → 2** 或 **9 → 2**。发生并发推送冲突时重试，以远端最新提交为基础。脚本只更新三个订阅文件。
 3. 检查远程分支内容与本地相符，通知和二维码显示 Caddy URL。成功设置会删除旧脚本、分享文件和旧仓库的 GitLab origin。不再使用 GitLab 的机器运行 **3 → 7 → 3** 清理旧版痕迹。检查自建定时任务、其他凭据管理器、旧日志和备份是否保存旧值；处置时避免将令牌打印到工单或日志中。
 4. **先替换全部发布端，再撤销旧令牌。** 在令牌所属的 GitLab 项目、群组或个人设置中撤销相应令牌，验证旧身份拉取、推送均被拒绝。通知客户端重新导入 HTTPS 地址。历史 Git 提交、聊天或截图中的节点密码仍可能已泄露，需按 VPS 步骤轮换节点身份。[GitLab 令牌管理](https://docs.gitlab.com/security/tokens/)

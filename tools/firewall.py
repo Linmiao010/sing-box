@@ -16,6 +16,11 @@ MARK = "sing-box:managed"
 TAGS = {"vless-sb": "tcp", "vmess-sb": "tcp", "anytls-sb": "tcp", "trojan-sb": "tcp",
         "snell-sb": "tcp", "hy2-sb": "udp", "tuic5-sb": "udp"}
 UDP_TAGS = ("hy2-sb", "tuic5-sb")
+FORWARD_CONFIRMATION = ("firewalld UDP 端口跳跃可能因 DNAT 提前放行并跳过区域来源封禁。请核实 "
+                        "StrictForwardPorts 及该 zone 的实际策略，再用 enable --input-position append "
+                        "--confirm-forward-ports 明确授权，或由管理员手动配置")
+FIREWALLD_UNICAST = ("firewalld 具体地址的端口跳跃已暂停。请手动配置保留该目的 IP 的本机端口转换；"
+                      "firewalld 的 to-addr 会启用主机 IP 转发")
 
 
 def cmd(*args, check=True):
@@ -65,6 +70,8 @@ def listeners(include_loopback=False):
             if tag not in TAGS:
                 continue
             addr = ipaddress.ip_address(node.get("listen", "127.0.0.1"))
+            if addr.version == 6 and addr.ipv4_mapped:
+                addr = addr.ipv4_mapped
             if addr.is_loopback and not include_loopback:
                 continue
             destinations = [str(addr)]
@@ -74,22 +81,29 @@ def listeners(include_loopback=False):
     return nodes
 
 
+def firewalld_zone(state):
+    if state.get("zone"):
+        return state["zone"]
+    zones = [line for line in cmd("firewall-cmd", "--get-active-zones").stdout.splitlines()
+             if line and not line[0].isspace()]
+    if len(zones) > 1:
+        raise ValueError("存在多个活动 zone，请用 enable --zone <公网接口所属 zone> 选择范围")
+    return zones[0] if zones else cmd("firewall-cmd", "--get-default-zone").stdout.strip()
+
+
 def desired(state, active):
     rules = set()
-    zone = ""
-    if active == "firewalld":
-        zone = state.get("zone", "")
-        if not zone:
-            zones = [line for line in cmd("firewall-cmd", "--get-active-zones").stdout.splitlines()
-                     if line and not line[0].isspace()]
-            if len(zones) > 1:
-                raise ValueError("存在多个活动 zone，请用 enable --zone <公网接口所属 zone> 选择范围")
-            zone = zones[0] if zones else cmd("firewall-cmd", "--get-default-zone").stdout.strip()
-            state["zone"] = zone
+    zone = state["zone"] if active == "firewalld" else ""
+    allow = state["allow"] and state.get("append_backend") == active
     for tag, (addresses, port) in listeners().items():
         for address in addresses:
-            if state["allow"] and (active == "firewalld" or state.get("append_backend") == active):
+            if allow:
                 rules.add((active, zone, address, TAGS[tag], port, ""))
+            if active == "firewalld" and not (allow and state.get("forward_zone") == zone):
+                continue
+            if active == "firewalld" and state["hops"].get(tag) and not ipaddress.ip_address(address).is_unspecified:
+                print(FIREWALLD_UNICAST, file=sys.stderr)
+                continue
             for ports in state["hops"].get(tag, []):
                 rules.add((active, zone, address, "udp", valid_range(ports), port))
     return rules
@@ -131,6 +145,14 @@ def udp_sockets():
 
 def iptables_forwards(binary, version, old):
     any_addr = "::" if version == 6 else "0.0.0.0"
+    owned = []
+    for r in old:
+        if not r[5] or (":" in r[2]) != (version == 6):
+            continue
+        if r[0] in ("firewalld", "firewalld-legacy"):
+            owned.append((firewalld_nat_chain(r), normalized_iptables_spec(iptables_spec(r))))
+        elif r[0].split("-")[0] in ("iptables", "ufw"):
+            owned.append(("PREROUTING", normalized_iptables_spec(iptables_spec(r))))
     for line in cmd(binary, "-w", "5", "-t", "nat", "-S").stdout.splitlines():
         words = shlex.split(line)
         def option(*names):
@@ -144,30 +166,20 @@ def iptables_forwards(binary, version, old):
             continue
         addr = option("-d", "--destination") or any_addr
         ports = option("--dport", "--dports", "--destination-port", "--destination-ports") or "1:65535"
-        target = option("--to-ports")
-        # Exclude only a journaled redirect with its managed match, address, port and target.
-        if (option("--comment") == MARK and option("-j") == "REDIRECT" and
-                option("-A") == "PREROUTING" and option("--dst-type") == "LOCAL" and
-                any(r[0] in ("iptables", "ufw") and destination(r[2]) == destination(addr)
-                    and r[3:] == ("udp", ports, target) for r in old)):
+        signature = (option("-A"), normalized_iptables_spec(words[2:]))
+        if signature in owned:
+            owned.remove(signature)
             continue
         for part in ports.split(","):
             # xtables accepts open ranges and port zero. The project reserves only 1..65535.
             lo, sep, hi = part.partition(":")
             first = int(lo or 0)
             last = int(hi or 65535) if sep else first
-            to = option("--to-destination", "--to")
-            if firewalld_owns(old, option("-A"), destination(addr), (first, last),
-                              target or (to[1:] if re.fullmatch(r":[0-9]+", to) else "")):
-                continue
             yield destination(addr), (first, last), binary + " " + (option("-A") or "NAT")
 
 
-def firewalld_owns(old, chain, addr, pair, target):
-    # firewalld compiles our rich rule into its zone-specific pre chain, without a comment.
-    return any(r[0] == "firewalld" and r[-1] and str(target) == r[-1] and
-               chain in (f"nat_PRE_{r[1]}_pre", f"PRE_{r[1]}_pre") and
-               destination(r[2]) == addr and interval(r[4]) == pair for r in old)
+def firewalld_nat_chain(rule):
+    return f"PRE_{rule[1]}_" + ("pre" if rule[0] == "firewalld-legacy" else "post")
 
 
 def nft_port_intervals(value):
@@ -235,6 +247,7 @@ def nft_map_keys(nat, rule, named):
 
 def nft_forwards(old):
     objects = nft_objects()
+    journal = {r for r in old if r[5]}
     named = {}
     for obj in objects:
         for key in ("set", "map", "element"):
@@ -249,19 +262,20 @@ def nft_forwards(old):
         if not any("dnat" in e or "redirect" in e or e.get("xt", {}).get("name") in
                    ("DNAT", "REDIRECT", "NETMAP") for e in expr):
             continue
+        owned = next((r for r in journal if nft_nat_location(r, rule) and nft_matches(r, rule)), None)
+        if owned:
+            journal.remove(owned)
+            continue
         families = {"ip": {4}, "ip6": {6}, "inet": {4, 6}}.get(rule["family"], {4, 6})
         ports = [(1, 65535)]
         keys = [(None, (1, 65535))]
         addrs = {}
-        target = None
         for e in expr:
             nat = e.get("redirect") or e.get("dnat")
             if isinstance(nat, dict):
                 keys = nft_map_keys(nat, rule, named)
                 if nat.get("family") in ("ip", "ip6"):
                     families &= {4 if nat["family"] == "ip" else 6}
-                if "addr" not in nat:
-                    target = nat.get("port")
             match = e.get("match", {})
             left, right = match.get("left", {}), match.get("right")
             if match.get("op") not in ("==", "in") or not isinstance(left, dict):
@@ -292,18 +306,8 @@ def nft_forwards(old):
                 matched = addr if addr and addr.prefixlen > net.prefixlen else net
                 for first, last in ports:
                     pair = max(lo, first), min(hi, last)
-                    if pair[0] > pair[1] or (rule.get("table") == "firewalld" and
-                            firewalld_owns(old, rule["chain"], matched, pair, target)):
-                        continue
-                    # A shared comment alone cannot establish ownership of a redirect.
-                    if any(r[-1] and str(target) == r[-1] and interval(r[4]) == pair and
-                           destination(r[2]) == matched and (
-                               (r[0] == "nft" and rule["table"] == "sbox_hopping" and rule["chain"] == "prerouting"
-                                and rule.get("comment") == f"{MARK} {r[2]} udp {r[4]} {r[5]}") or
-                               (r[0] in ("iptables", "ufw") and rule["table"] == "nat" and
-                                rule["chain"] == "PREROUTING" and rule.get("comment") == MARK)) for r in old):
-                        continue
-                    yield matched, pair, f"nft {rule['table']}/{rule['chain']}"
+                    if pair[0] <= pair[1]:
+                        yield matched, pair, f"nft {rule['table']}/{rule['chain']}"
 
 
 def forwarding_ranges(active, old, versions):
@@ -327,14 +331,14 @@ def forwarding_ranges(active, old, versions):
         raise ValueError("无法读取该地址族的现有 NAT 转发，请手动核对并配置端口跳跃")
 
 
-def check_hops(state, old, active):
+def check_hops(needed, old, active):
     occupied = []
     hops = []
     for tag, (addresses, port) in listeners(include_loopback=True).items():
         if tag in UDP_TAGS:
             occupied.extend((destination(a), interval(port), tag) for a in addresses)
-            hops.extend((destination(a), interval(span), tag) for a in addresses
-                        if not ipaddress.ip_address(a).is_loopback for span in state["hops"].get(tag, []))
+            hops.extend((destination(r[2]), interval(r[4]), tag) for r in sorted(needed)
+                        if r[5] == port and r[2] in addresses)
     occupied.extend(udp_sockets())
     occupied.extend(forwarding_ranges(active, old, {net.version for net, _, _ in hops}))
     for net, (first, last), tag in hops:
@@ -346,8 +350,9 @@ def check_hops(state, old, active):
         occupied.append((net, (first, last), tag + " 已配置跳跃"))
 
 
-def filter_needs_reposition(rule):
+def filter_needs_reposition(rule, recorded):
     engine, _, addr, _, _, _ = rule
+    managed = [r for r in recorded if r[0] == engine and not r[5] and (":" in r[2]) == (":" in addr)]
     if engine == "nft":
         objects = nft_objects()
         family = "ip6" if ":" in addr else "ip"
@@ -358,19 +363,57 @@ def filter_needs_reposition(rule):
         if len(chains) != 1:
             raise ValueError(f"无法唯一确定 {family} input 基础链，请在主机防火墙手动放行")
         chain = chains[0]
-        flags = [r["rule"].get("comment", "").startswith(MARK + " ") for r in objects if "rule" in r
+        flags = [any(nft_matches(m, r["rule"]) for m in managed) for r in objects if "rule" in r
                  and (r["rule"]["family"], r["rule"]["table"], r["rule"]["chain"]) ==
                      (chain["family"], chain["table"], chain["name"])]
     else:
         v6 = ":" in addr
         chain = ("ufw6-user-input" if v6 else "ufw-user-input") if engine == "ufw" else "INPUT"
         lines = cmd("ip6tables" if v6 else "iptables", "-w", "5", "-t", "filter", "-S", chain).stdout.splitlines()
-        flags = [MARK in shlex.split(line) for line in lines if line.startswith("-A ")]
+        signatures = [normalized_iptables_spec(iptables_spec(r)) for r in managed]
+        flags = [normalized_iptables_spec(shlex.split(line)[2:]) in signatures for line in lines if line.startswith("-A ")]
     return any(flags) and not all(flags[flags.index(True):])
 
 
-def iptables_rule(rule, want):
-    engine, _, addr, proto, ports, target = rule
+def specific_dnat(rule):
+    return bool(rule[5] and not rule[0].endswith("-legacy") and not ipaddress.ip_address(rule[2]).is_unspecified)
+
+
+def nat_endpoint(addr, port):
+    return f"[{addr}]:{port}" if ":" in addr else f"{addr}:{port}"
+
+
+def iptables_spec(rule):
+    _, _, addr, proto, ports, target = rule
+    spec = ["-p", proto, "--dport", ports]
+    if not ipaddress.ip_address(addr).is_unspecified:
+        spec += ["-d", addr]
+    if rule[0].startswith("firewalld"):
+        return spec + ["-j", "DNAT", "--to-destination", ":" + target]
+    if target:
+        spec += ["-m", "addrtype", "--dst-type", "LOCAL"]
+    spec += ["-m", "comment", "--comment", MARK]
+    if specific_dnat(rule):
+        return spec + ["-j", "DNAT", "--to-destination", nat_endpoint(addr, target)]
+    return spec + (["-j", "REDIRECT", "--to-ports", target] if target else ["-j", "ACCEPT"])
+
+
+def normalized_iptables_spec(words):
+    # iptables -S may reorder matches, print host prefixes and add the implicit UDP module.
+    if len(words) % 2 or "!" in words:
+        return None
+    pairs = []
+    for opt, value in zip(words[::2], words[1::2]):
+        if opt == "-m" and value in ("tcp", "udp") and ("-p", value) in zip(words[::2], words[1::2]):
+            continue
+        if opt == "-d":
+            value = str(ipaddress.ip_network(value, strict=False))
+        pairs.append(("--to-destination" if opt == "--to" else opt, value))
+    return sorted(pairs)
+
+
+def iptables_rule(rule, want, fresh=False, check_only=False):
+    engine, _, addr, _, _, target = rule
     v6 = ":" in addr
     binary = "ip6tables" if v6 else "iptables"
     table = "nat" if target else "filter"
@@ -379,17 +422,13 @@ def iptables_rule(rule, want):
         chain = "ufw6-user-input" if v6 else "ufw-user-input"
     prefix = [binary, "-w", "5", "-t", table]
     cmd(*prefix, "-S", chain)   # Distinguish inaccessible table from an absent rule.
-    spec = ["-p", proto, "--dport", ports]
-    if not ipaddress.ip_address(addr).is_unspecified:
-        spec += ["-d", addr]
-    if target:
-        spec += ["-m", "addrtype", "--dst-type", "LOCAL"]
-    spec += ["-m", "comment", "--comment", MARK]
-    spec += ["-j", "REDIRECT", "--to-ports", target] if target else ["-j", "ACCEPT"]
+    spec = iptables_spec(rule)
     exists = cmd(*prefix, "-C", chain, *spec, check=False)
     if exists.returncode not in (0, 1):
         raise ValueError("防火墙规则查询失败")
-    if (exists.returncode == 0) == want:
+    if fresh and exists.returncode == 0:
+        raise ValueError("已有相同的防火墙规则；请管理员核对归属")
+    if check_only or (exists.returncode == 0) == want:
         return False
     cmd(*prefix, "-A" if want else "-D", chain, *spec)
     return True
@@ -399,11 +438,12 @@ class IncompleteChange(ValueError):
     """A single backend operation changed only part of its runtime/persistent state."""
 
 
-def firewalld_rule(rule, want, fresh=False, check_only=False):
+def firewalld_rule(rule, want, fresh=False, check_only=False, levels=(True, False)):
     _, zone, addr, proto, ports, target = rule
     family = "ipv6" if ":" in addr else "ipv4"
     # Reserve this priority for managed rules. No zone port or unrelated forwarding rule is removed.
-    rich = f'rule family="{family}" priority="-17461" '
+    priority = -17461 if rule[0] == "firewalld-legacy" else 32767
+    rich = f'rule family="{family}" priority="{priority}" '
     if not ipaddress.ip_address(addr).is_unspecified:
         rich += f'destination address="{addr}" '
     ports = ports.replace(":", "-")
@@ -412,7 +452,8 @@ def firewalld_rule(rule, want, fresh=False, check_only=False):
     changed = []
     probes = []
     try:
-        for options in (["--permanent"], []):
+        for permanent in levels:
+            options = ["--permanent"] if permanent else []
             prefix = ["firewall-cmd", *options, "--zone=" + zone]
             query = cmd(*prefix, "--query-rich-rule=" + rich, check=False)
             if query.returncode not in (0, 1):
@@ -437,15 +478,114 @@ def firewalld_rule(rule, want, fresh=False, check_only=False):
         if failures:
             raise IncompleteChange("firewalld 运行或持久规则回滚失败：" + "；".join(failures)) from original
         raise
-    return bool(changed)
+    return tuple("--permanent" in prefix for prefix in changed)
 
 
-def nft_rule(rule, want):
+def nft_nat_location(rule, entry):
+    where = entry["table"], entry["chain"]
+    if rule[0].startswith("firewalld"):
+        chain = firewalld_nat_chain(rule)
+        return where in (("firewalld", "nat_" + chain), ("nat", chain))
+    if rule[0] in ("nft", "nft-legacy"):
+        return where == ("sbox_hopping", "prerouting")
+    return where == ("nat", "PREROUTING")
+
+
+def nft_matches(rule, entry):
+    """Match the journaled rule's family, marker, matches and verdict before touching its handle."""
+    _, _, addr, proto, ports, target = rule
+    family = "ip6" if ":" in addr else "ip"
+    firewalld = rule[0].startswith("firewalld")
+    xtables = rule[0].split("-")[0] in ("iptables", "ufw") or (firewalld and entry["table"] == "nat")
+    marker = "" if firewalld else MARK if xtables else f"{MARK} {addr} {proto} {ports} {target or 'accept'}"
+    if entry.get("comment", "") != marker or entry["family"] not in (family, "inet"):
+        return False
+    if target and not firewalld and entry["family"] != family:
+        return False
+    expected = []
+    if entry["family"] == "inet":
+        expected.append(("family", family))
+    if not ipaddress.ip_address(addr).is_unspecified:
+        expected.append(("address", str(ipaddress.ip_address(addr))))
+    if target and not firewalld:
+        expected.append(("local", True))
+    expected.extend([("ports", interval(ports)), ("dnat" if specific_dnat(rule) else "redirect" if target else "accept",
+                     nat_endpoint(addr, target) if specific_dnat(rule) else target)])
+    observed = []
+    opaque = False
+    for item in entry.get("expr", []):
+        if "match" in item:
+            m = item["match"]
+            left, right = m.get("left"), m.get("right")
+            if m.get("op") not in ("==", "in") or not isinstance(left, dict):
+                return False
+            if left == {"meta": {"key": "nfproto"}} and right in ("ipv4", "ipv6", 2, 10):
+                observed.append(("family", "ip" if right in ("ipv4", 2) else "ip6"))
+            elif left == {"payload": {"protocol": family, "field": "daddr"}} and isinstance(right, str):
+                observed.append(("address", str(ipaddress.ip_address(right))))
+            elif left.get("fib") in ({"result": "type", "flags": ["daddr"]}, {"result": "type", "flags": "daddr"}) and right in ("local", 2):
+                observed.append(("local", True))
+            elif left == {"payload": {"protocol": proto, "field": "dport"}}:
+                if isinstance(right, int):
+                    observed.append(("ports", (right, right)))
+                elif isinstance(right, dict) and isinstance(right.get("range"), list):
+                    observed.append(("ports", tuple(right["range"])))
+                else:
+                    return False
+            elif xtables and left == {"meta": {"key": "l4proto"}} and right in ("udp", 17):
+                continue
+            else:
+                return False
+        elif "dnat" in item or "redirect" in item:
+            kind = "dnat" if "dnat" in item else "redirect"
+            nat = dict(item[kind])
+            if nat.pop("family", family) != family:
+                return False
+            if kind == "dnat" and set(nat) == {"addr", "port"}:
+                observed.append((kind, nat_endpoint(nat["addr"], nat["port"])))
+            elif (kind == "redirect" or (firewalld and xtables)) and set(nat) == {"port"}:
+                observed.append(("redirect", str(nat["port"])))
+            else:
+                return False
+        elif item == {"accept": None}:
+            observed.append(("accept", ""))
+        elif xtables and item.get("xt") == {"type": "match", "name": "addrtype"} and target and not firewalld:
+            # libnftables may omit the extension's match arguments. Query the nft-backed
+            # xtables API below before treating this possible LOCAL match as ours.
+            observed.append(("local", True))
+            opaque = True
+        elif not (xtables and "counter" in item):
+            return False
+    # nft may elide an inet nfproto check already implied by a typed IP destination.
+    if entry["family"] == "inet" and ("address", str(ipaddress.ip_address(addr))) in observed and ("family", family) not in observed:
+        observed.append(("family", family))
+    if sorted(expected) != sorted(observed):
+        return False
+    if opaque:
+        binary = "ip6tables" if family == "ip6" else "iptables"
+        if shutil.which(binary + "-nft"):
+            binary += "-nft"
+        elif not shutil.which(binary) or "nf_tables" not in cmd(binary, "--version").stdout:
+            return False
+        return cmd(binary, "-w", "5", "-t", "nat", "-C", entry["chain"],
+                   *iptables_spec(rule), check=False).returncode == 0
+    return True
+
+
+def nft_rule(rule, want, fresh=False, check_only=False):
     _, _, addr, proto, ports, target = rule
     family = "ip6" if ":" in addr else "ip"
     objects = nft_objects()
     marker = f"{MARK} {addr} {proto} {ports} {target or 'accept'}"
-    existing = [x["rule"] for x in objects if x.get("rule", {}).get("comment") == marker]
+    locations = {(family, "sbox_hopping", "prerouting")} if target else {
+        (c["family"], c["table"], c["name"]) for item in objects if "chain" in item for c in [item["chain"]]
+        if c.get("type") == "filter" and c.get("hook") == "input"}
+    existing = [r for item in objects if "rule" in item for r in [item["rule"]]
+                if (r["family"], r["table"], r["chain"]) in locations and nft_matches(rule, r)]
+    if len(existing) > 1 or (fresh and existing):
+        raise ValueError("已有相同的 nft 防火墙规则；请管理员核对归属")
+    if check_only:
+        return False
     if not want:
         for r in existing:
             cmd("nft", "delete", "rule", r["family"], r["table"], r["chain"], "handle", str(r["handle"]))
@@ -490,7 +630,10 @@ def nft_rule(rule, want):
     if target:
         terms += ["fib", "daddr", "type", "local"]
     terms += [proto, "dport", ports.replace(":", "-")]
-    terms += ["redirect", "to", ":" + target] if target else ["accept"]
+    if specific_dnat(rule):
+        terms += ["dnat", "to", nat_endpoint(addr, target)]
+    else:
+        terms += ["redirect", "to", ":" + target] if target else ["accept"]
     terms += ["comment", json.dumps(marker)]
     if setup:
         cmd("nft", setup + f"add rule {family} sbox_hopping prerouting " + " ".join(terms))
@@ -499,12 +642,12 @@ def nft_rule(rule, want):
     return True
 
 
-def change(rule, want, fresh=False):
-    if rule[0] == "firewalld":
-        return firewalld_rule(rule, want, fresh)
-    if rule[0] == "nft":
-        return nft_rule(rule, want)
-    return iptables_rule(rule, want)
+def change(rule, want, fresh=False, levels=(True, False), check_only=False):
+    if rule[0] in ("firewalld", "firewalld-legacy"):
+        return firewalld_rule(rule, want, fresh, check_only, levels)
+    if rule[0] in ("nft", "nft-legacy"):
+        return nft_rule(rule, want, fresh, check_only)
+    return iptables_rule(rule, want, fresh, check_only)
 
 
 def save(state):
@@ -513,24 +656,36 @@ def save(state):
     os.replace(f.name, ROOT / "firewall.json")
 
 
-def manage(action, tag=None, ports=None, zone=None, input_position=None):
+def manage(action, tag=None, ports=None, zone=None, input_position=None, confirm_forward_ports=False):
     path = ROOT / "firewall.json"
     if action in ("list", "sync", "remove", "clear") and not path.exists():
         return
     existed = path.exists()
     state = json.loads(path.read_text()) if existed else {"allow": False, "hops": {}, "rules": []}
     if action == "list":
-        print(",".join(state["hops"].get(tag, [])))
+        # Subscriptions consume this output. Retain paused intent on disk without advertising it.
+        spans = state["hops"].get(tag, [])
+        addresses, port = listeners().get(tag, ([], "")) if spans else ([], "")
+        applied = {r[4] for r in state["rules"] if r[2] in addresses and r[3] == "udp" and r[5] == port}
+        print(",".join(span for span in spans if span in applied))
         return
-    old = {tuple(r) for r in state["rules"]}
     before = json.loads(json.dumps(state))
+    old = set()
+    for r in state["rules"]:
+        engine, zone_name, addr, proto, span, target = r
+        # The old six-field entry described REDIRECT or a negative-priority rich rule.
+        # Keep both exact signatures in the in-flight journal while exchanging them.
+        if state.get("rules_version", 1) == 1 and (engine == "firewalld" or specific_dnat(r)):
+            engine += "-legacy"
+        old.add((engine, zone_name, addr, proto, span, target))
     active = backend() if action != "remove" else None
+    if confirm_forward_ports and (action != "enable" or active != "firewalld"):
+        raise ValueError("--confirm-forward-ports 仅用于 firewalld 的 enable 操作")
     if action == "enable":
-        if active != "firewalld":
-            if input_position == "append":
-                state["append_backend"] = active
-            if state.get("append_backend") != active:
-                raise ValueError("请核对既有限制、拒绝规则及默认策略；确认链尾位置后传 --input-position append，或手动放行")
+        if input_position == "append":
+            state["append_backend"] = active
+        if state.get("append_backend") != active:
+            raise ValueError("请核对既有限制、拒绝规则及默认策略；确认追加位置后传 --input-position append，或手动放行")
         state["allow"] = True
         if zone:
             state["zone"] = zone
@@ -538,24 +693,43 @@ def manage(action, tag=None, ports=None, zone=None, input_position=None):
         if tag not in UDP_TAGS:
             raise ValueError("端口跳跃仅支持 Hysteria2 和 TUIC")
         if action == "add":
-            if tag not in listeners():
+            if active == "firewalld" and not (state["allow"] and state.get("append_backend") == active
+                    and state.get("zone") and state.get("forward_zone") == state["zone"]):
+                raise ValueError(FORWARD_CONFIRMATION)
+            addresses, _ = listeners().get(tag, ([], ""))
+            if not addresses:
                 raise ValueError("目标 UDP 入站未启用")
+            if active == "firewalld" and any(not ipaddress.ip_address(a).is_unspecified for a in addresses):
+                raise ValueError(FIREWALLD_UNICAST)
             hops = state["hops"].setdefault(tag, [])
             if valid_range(ports) not in hops:
                 hops.append(ports)
         else:
             state["hops"].pop(tag, None)
+    if active == "firewalld":
+        state["zone"] = firewalld_zone(state)
+        if confirm_forward_ports:
+            state["forward_zone"] = state["zone"]
+        elif action == "enable" or state.get("forward_zone") != state["zone"]:
+            state.pop("forward_zone", None)
+        if state["hops"] and state.get("forward_zone") != state["zone"]:
+            print(FORWARD_CONFIRMATION, file=sys.stderr)
+    else:
+        state.pop("forward_zone", None)
     needed = desired(state, active) if active else set()
-    if active and active != "firewalld" and state["allow"] and state.get("append_backend") != active:
+    if active and state["allow"] and state.get("append_backend") != active:
         print("尚未确认新后端的放行位置，已登记的旧放行条目将撤下；请核实链尾或手动放行", file=sys.stderr)
     if any(rule[-1] for rule in needed):
-        check_hops(state, old, active)
-    if active == "firewalld":
-        for rule in needed - old:
-            firewalld_rule(rule, True, fresh=True, check_only=True)
+        check_hops(needed, old, active)
+    # UFW and iptables share the NAT chain and exact rule format.
+    shared_nat = {r for r in old - needed if active in ("iptables", "ufw") and r[0] in ("iptables", "ufw")
+                  and r[5] and (active, *r[1:]) in needed}
+    fresh = needed - old - {(active, *r[1:]) for r in shared_nat}
+    for rule in fresh:
+        change(rule, True, fresh=True, check_only=True)
     # A journal contains every rule possibly in flight. After interruption, sync converges by exact rule.
-    state["rules"] = sorted(needed | old)
-    save(dict(state, append_backend=before.get("append_backend")))
+    state["rules_version"] = 2
+    save(dict(before, rules_version=2, rules=sorted(needed | old)))
     changed = []
     try:
         # A first explicit confirmation upgrades legacy head-inserted allows.
@@ -563,17 +737,14 @@ def manage(action, tag=None, ports=None, zone=None, input_position=None):
         if active in ("iptables", "ufw", "nft"):
             for rule in sorted(old & needed):
                 if (rule[0] == active and not rule[-1] and (before.get("append_backend") != active
-                        or filter_needs_reposition(rule)) and change(rule, False)):
-                    changed.append((rule, False))
-        stale = old - needed
-        # UFW and iptables program the same NAT chain, with the same rule signature.
-        if active in ("iptables", "ufw"):
-            stale = {r for r in stale if not (r[0] in ("iptables", "ufw") and r[-1]
-                     and (active, *r[1:]) in needed)}
+                        or filter_needs_reposition(rule, old)) and change(rule, False)):
+                    changed.append((rule, False, True))
+        stale = old - needed - shared_nat
         for want, rules in [(True, needed), (False, stale)]:
             for rule in sorted(rules):
-                if change(rule, want, fresh=want and rule not in old):
-                    changed.append((rule, want))
+                affected = change(rule, want, fresh=want and rule in fresh)
+                if affected:
+                    changed.append((rule, want, affected))
         state["rules"] = sorted(needed)
         if action == "remove":
             path.unlink()
@@ -582,15 +753,15 @@ def manage(action, tag=None, ports=None, zone=None, input_position=None):
     except Exception as original:
         failures = [str(original)] if isinstance(original, IncompleteChange) else []
         uncertain = {rule} if failures else set()
-        for rule, want in reversed(changed):
+        for rule, want, affected in reversed(changed):
             try:
-                change(rule, not want)
+                change(rule, not want, levels=affected)
             except Exception as exc:
                 failures.append(str(exc))
                 uncertain.add(rule)
         if failures:
             # A failed ownership check cannot make an administrator's rule ours.
-            save(dict(before, rules=sorted(old | uncertain)))
+            save(dict(before, rules_version=2, rules=sorted(old | uncertain)))
             raise ValueError("防火墙回滚未完成，已记录原策略，请修复后运行 sync：" + "；".join(failures)) from original
         if existed:
             save(before)
@@ -608,12 +779,13 @@ def main():
     parser.add_argument("ports", nargs="?")
     parser.add_argument("--zone", help="firewalld zone for enable")
     parser.add_argument("--input-position", choices=("append",), help="管理员确认在现有过滤规则后追加放行")
+    parser.add_argument("--confirm-forward-ports", action="store_true", help=FORWARD_CONFIRMATION)
     args = parser.parse_args()
     if not (ROOT / "firewall.json").exists() and args.action in ("list", "sync", "remove", "clear"):
         return
     with (ROOT / ".firewall.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        manage(args.action, args.tag, args.ports, args.zone, args.input_position)
+        manage(args.action, args.tag, args.ports, args.zone, args.input_position, args.confirm_forward_ports)
 
 
 if __name__ == "__main__":

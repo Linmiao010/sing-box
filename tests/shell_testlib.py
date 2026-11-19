@@ -46,9 +46,14 @@ class ShellTestCase(unittest.TestCase):
     def run_shell(self, script, check=True, env=None):
         variables = os.environ.copy()
         script = script.replace("/run/s-box-config.lock", (self.root / "config.lock").as_posix())
+        if "secure_server_routes(){" in script:
+            # Isolate the generator from the test host's interface list (including hosts without iproute2).
+            script = 'ip(){ [[ $* != "-o addr show scope global" ]] || return 0; command ip "$@"; }\n' + script
         if os.name == "nt":
             # Native jq.exe must receive Linux config values such as /test literally.
             variables["MSYS2_ARG_CONV_EXCL"] = "*"
+            # Match Linux jq line endings, including the final field of @tsv rows.
+            script = 'jq(){ command jq -b "$@"; }\n' + script
             # Assign after Bash startup, which otherwise converts TMPDIR back to /tmp.
             script = "export TMPDIR=" + shlex.quote(self.root.as_posix()) + "\n" + script
             # Git Bash lacks Linux flock. Exercise overlapping transactions with a

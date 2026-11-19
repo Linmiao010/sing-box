@@ -4,7 +4,13 @@
 
 ## 日常管理
 
-在 VPS 上以 root 身份运行 `sing_box` 打开管理菜单。下表中的箭头表示依次输入菜单编号。
+在 VPS 上以 root 身份运行 `sing_box` 打开管理菜单。**9 → 2** 表示先选 9，再选 2。
+
+从 `b4b7a3c` 更新时，在菜单 **7** 切换到受审发布后运行 `sing_box --secure-routes`，再用 **9 → 2** 刷新客户端订阅。1.10.7 阻断代理 UDP 出站。需要转发 UDP 的节点应先校验并切换 1.14 内核。两版客户端均使用加密 DNS，1.14 的 TUN 会优先接管 DNS 请求。[升级顺序、回滚与平台验收](security-migration.md#从-b4b7a3c-升级)
+
+firewalld 放行命令为 `sing_box --firewall-enable --input-position append --zone <区域>`。默认情况下 UDP 跳跃暂停。即使启用 `StrictForwardPorts`，也要核对该区域显式配置的 forward-port 会允许哪些来源，然后再决定是否为通配监听增加 `--confirm-forward-ports`。具体单播地址上的 firewalld 跳跃由防火墙管理员配置。其他受支持后端会为具体监听地址保留原目的 IP。[firewalld 的 StrictForwardPorts 说明](https://firewalld.org/2024/11/strict-forward-ports)
+
+菜单 **6 → 2** 先停项目 Argo 并清理其开机任务，然后停节点。**6 → 1** 恢复节点后，需要 Argo 的用户重新启用隧道。菜单 **12** 应用证书后会同步已有入站 SNI、运行服务和订阅。GitLab 发布端的令牌需同时具备 `read_api` 与 `write_repository`，并有目标分支写权限。
 
 | 菜单 | 操作 |
 | --- | --- |
@@ -92,7 +98,7 @@ Clash Verge Rev 使用现有的 **`clmi.yaml` Mihomo 订阅**。启用后刷新�
 
 Trojan 默认沿用安装时选用的证书，也可在 **3 → 11** 选择已有域名证书。完整订阅会校验证书，sing-box 自签模式内嵌公证书，Mihomo 使用证书指纹。自有域名的 SNI 应与证书 SAN 一致。Trojan 和 Snell 均需放行对应的 TCP 端口。
 
-使用受信域名证书时，Trojan 分享链接会加入 `jhsub.txt`。自签 Trojan、TUIC、AnyTLS 通过完整订阅分发，Snell 也使用完整配置。自签 Hysteria2 URI 带证书 SHA-256，导入后仍要求系统信任的客户端需要安装本实例公证书。 [Hysteria 2 的 TLS 配置](https://v2.hysteria.network/docs/advanced/Full-Client-Config/#tls)
+使用受信域名证书时，Trojan 分享链接会加入 `jhsub.txt`。自签 Trojan、TUIC、AnyTLS 通过完整订阅分发，Snell 也使用完整配置。自签 Hysteria2 URI 带证书 SHA-256，客户端应在节点配置内核对指纹或导入带信任信息的完整订阅。 [Hysteria 2 的 TLS 配置](https://v2.hysteria.network/docs/advanced/Full-Client-Config/#tls)
 
 额外入站保存在 `/etc/s-box/sb_extra.json`，服务与原有 `sb.json` 一起加载。设置新协议前会校验合并配置，失败时保留原配置；内核切换也会先用候选内核检查配置，不兼容时保留当前内核。原有五类协议仍使用原管理菜单。
 

@@ -43,7 +43,7 @@
 
 每次更新先按同样方式安装已核实的新提交，菜单 **7** 原子切换 `/usr/bin/sing_box`。切换前保留旧发布目录，回滚时可重新选择其提交号。运行用户提供的未提交补丁时，应先审查并生成自己的提交，从可信仓库地址获取。订阅迁移和凭据轮换见 [操作手册](docs/README.md)。
 
-安装时防火墙默认沿用原策略。使用 iptables、UFW 或原生 nftables 时，先核对两族输入链的来源封禁、接口、限速和最终拒绝位置。确认可以在既有规则之后追加时，运行 `sing_box --firewall-enable --input-position append`。若已有末尾拒绝规则或多个同族 nftables input 基础链，请在主机防火墙中手动放行。firewalld 使用 `sing_box --firewall-enable`，多个活动 zone 需指定公网入口所属的 `--zone <zone>`。管理员重新加载规则后，可运行 `sing_box --firewall-sync` 对账。添加 UDP 跳跃前，工具会核对已配置的节点、跳跃范围、宿主 UDP socket 和活动 NAT 转发。历史无标记的 DNAT 需对照原配置人工辨认。
+安装时防火墙默认沿用原策略。使用 iptables、UFW 或原生 nftables 时，先核对两族输入链的来源封禁、接口、限速和最终拒绝位置。确认可以在既有规则之后追加时，运行 `sing_box --firewall-enable --input-position append`。若已有末尾拒绝规则或多个同族 nftables input 基础链，请在主机防火墙中手动放行。firewalld 同样需要 `--input-position append`，多个活动 zone 需指定公网入口所属的 `--zone <zone>`。该区域启用通配监听的 UDP 跳跃还需核对 DNAT 对来源封禁的影响，再显式传入 `--confirm-forward-ports`。管理员重新加载规则后，可运行 `sing_box --firewall-sync` 对账。添加 UDP 跳跃前，工具会核对已配置的节点、跳跃范围、宿主 UDP socket 和活动 NAT 转发。历史无标记的 DNAT 需对照原配置人工辨认。
 
 `tools/releases.sha256` 与脚本一起由该提交固定，覆盖内核、Caddy、cloudflared、旧版地理数据库和随库的 sbwpph。内核支持清单中的 1.10.7 和 1.14.3。Caddy 采用清单中的官方发布归档。维护者更新清单时，从上游对应版本的 GitHub Releases 资产核实 SHA-256 或发布签名；1.10.7 发布页未提供资产摘要，本清单使用该官方固定标签对应三个归档的实测 SHA-256。仓库内的 sbwpph 直接核对同一受审树中的文件。新版本号、URL 与摘要一并审查提交，菜单中查询到更新版本后仍需等待清单覆盖。
 

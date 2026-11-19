@@ -13,6 +13,7 @@ import secrets
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -34,7 +35,13 @@ RELEASE_URL = "https://github.com/yonggekkk/Cloudflare-vless-trojan/releases/dow
 PRODUCTS = ("v2sub.txt", "clashmeta.txt", "singbox.txt")
 RESTRICTED = ["0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
               "172.16.0.0/12", "192.168.0.0/16", "224.0.0.0/4", "240.0.0.0/4", "::/96",
-              "::ffff:0:0/96", "fc00::/7", "fe80::/10", "ff00::/8", "168.63.129.16/32"]
+              "::ffff:0:0/96", "fc00::/7", "fe80::/10", "ff00::/8", "168.63.129.16/32",
+              "64:ff9b::/96", "64:ff9b:1::/48", "::ffff:0:0:0/96", "2002::/16", "100::/64",
+              "192.0.0.0/24", "198.18.0.0/15"]
+# Reviewed google-gemini.srs contains domain and domain_suffix matchers only.
+SERVER_RULES_REVISION = "4629f7680fca20b31396769bee282d7c1a9f3fb6"
+GEMINI_URL = "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/{}/geo/geosite/google-gemini.srs"
+HTTPS_ACCESS = "Options -Indexes\nRewriteEngine On\nRewriteCond %{HTTPS} !=on\nRewriteRule ^ - [F,L]\n"
 ORIGIN_NAME = "argo-origin.invalid"
 SUB_DIRECTORY = "sing-box-sub"
 HOME = Path.home()
@@ -106,6 +113,11 @@ class HTTPSRedirect(urllib.request.HTTPRedirectHandler):
         if urllib.parse.urlsplit(newurl).scheme != "https":
             fail("下载重定向未使用 HTTPS")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+class RejectRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args):
+        return None
 
 
 def fetch(url, path):
@@ -198,9 +210,11 @@ def allocated_ports():
     return result
 
 
-def allocate(kind):
+def allocate(kind, excluded=()):
     for _ in range(5):
         n = secrets.randbelow(55536) + 10000
+        if n in excluded:
+            continue
         r = subprocess.run(["devil", "port", "add", kind, str(n)], stdout=subprocess.PIPE,
                            stderr=subprocess.STDOUT, text=True)
         if r.returncode == 0:
@@ -246,6 +260,28 @@ def identity(old, migrate=False):
     return user_id, path
 
 
+def checked_warp_policy(route):
+    rules = [r for r in route.get("rules", []) if r.get("outbound") == "wg"]
+    referenced = set()
+    for rule in rules:
+        if rule.get("type", "default") != "default" or "rules" in rule or "override_address" in rule or rule.get("action", "route") != "route":
+            fail("请手工复核旧 WARP 的嵌套规则、目标地址改写或特殊动作，迁移已暂停")
+        tags = rule.get("rule_set", [])
+        referenced.update([tags] if isinstance(tags, str) else tags)
+    sets = [dict(r) for r in route.get("rule_set", []) if r.get("tag") in referenced]
+    if referenced != {r["tag"] for r in sets}:
+        fail("旧 WARP 规则引用的规则集缺失，请人工复核")
+    for item in sets:
+        url = urllib.parse.urlsplit(item.get("url", ""))
+        if (item.get("type") != "remote" or url.scheme != "https"
+                or url.netloc not in ("raw.githubusercontent.com", "cdn.jsdelivr.net")):
+            fail("旧 WARP 规则集仅支持受信 HTTPS 发布主机，请人工复核")
+        if item["url"] in (GEMINI_URL.format("sing"),
+                           "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite/google-gemini.srs"):
+            item["url"] = GEMINI_URL.format(SERVER_RULES_REVISION)
+    return rules, sets
+
+
 def legacy_warp_policy(route, policy_backup):
     if policy_backup is not None:
         if (not policy_backup.is_absolute() or policy_backup.is_symlink() or not policy_backup.is_file()
@@ -253,14 +289,7 @@ def legacy_warp_policy(route, policy_backup):
                 or policy_backup.stat().st_uid != os.getuid() or policy_backup.stat().st_mode & 0o077):
             fail("请提供本账户私有且来源已核实的旧配置备份绝对路径（0600，位于旧目录以外）")
         route = load(policy_backup).get("route", {})
-    rules = [r for r in route.get("rules", []) if r.get("outbound") == "wg"]
-    referenced = {tag for rule in rules for tag in rule.get("rule_set", [])}
-    sets = [r for r in route.get("rule_set", []) if r.get("tag") in referenced]
-    for item in sets:
-        if item.get("type") != "remote" or not item.get("url", "").startswith("https://"):
-            fail("旧 WARP 规则集需要人工迁移")
-    if any("override_address" in rule or rule.get("action", "route") != "route" for rule in rules):
-        fail("请手工复核旧 WARP 的目标地址改写或特殊动作，迁移已暂停")
+    rules, sets = checked_warp_policy(route)
     if rules and policy_backup is None:
         print("拟导入以下匹配条件和远程规则集。命中流量通过 wg，无独立密钥时拒绝。", file=sys.stderr)
         print(json.dumps({"rules": rules, "rule_set": sets}, indent=2, ensure_ascii=True), file=sys.stderr)
@@ -308,8 +337,7 @@ def acquire_state(old, migrate):
     if not isinstance(values, list) or not all(isinstance(x, str) for x in values):
         fail("restricted-cidrs.json 必须是 CIDR 字符串数组")
     state["restricted_cidrs"] = [str(ipaddress.ip_network(value, strict=True)) for value in values]
-    state.setdefault("sni", os.getenv("SERV00_TLS_NAME", SITE))
-    valid_host(state["sni"])
+    state["sni"] = valid_host(os.getenv("SERV00_TLS_NAME") or state.get("sni") or SITE)
     state["reality"] = valid_host(state.get("reality") or os.getenv("REALITY") or SITE)
     ip = state.get("ip") or os.getenv("IP")
     if not state.get("addresses"):
@@ -346,7 +374,30 @@ def acquire_state(old, migrate):
     return state
 
 
-def certificate(stage, previous, state):
+def issue_leaf(directory, name, days):
+    run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+         "-nodes", "-days", str(days), "-keyout", str(directory / "private.key"), "-out", str(directory / "cert.pem"),
+         "-subj", "/CN=" + name, "-addext", "subjectAltName=DNS:" + name,
+         "-addext", "basicConstraints=critical,CA:FALSE", "-addext", "keyUsage=critical,digitalSignature,keyEncipherment",
+         "-addext", "extendedKeyUsage=serverAuth"])
+
+
+def validate_leaf(directory, name):
+    cert = str(directory / "cert.pem")
+    key = str(directory / "private.key")
+    cert_pub = run(["openssl", "x509", "-in", cert, "-noout", "-pubkey"]).stdout
+    if cert_pub != run(["openssl", "pkey", "-in", key, "-pubout"]).stdout:
+        fail("TLS 证书与私钥不匹配")
+    details = run(["openssl", "x509", "-in", cert, "-noout", "-dates", "-ext", "subjectAltName",
+                   "-checkhost", name], text=True, check=False).stdout
+    if "DNS:" not in details or f"Hostname {name} does match certificate" not in details.splitlines():
+        fail("节点名称与 TLS 证书的 DNS SAN 不匹配")
+    dates = dict(re.findall(r"^(notBefore|notAfter)=(.+)$", details, re.M))
+    if not ssl.cert_time_to_seconds(dates["notBefore"]) <= time.time() < ssl.cert_time_to_seconds(dates["notAfter"]):
+        fail("TLS 证书不在有效期内")
+
+
+def certificate(stage, previous, state, rotate=False):
     cert, key = stage / "cert.pem", stage / "private.key"
     provided = [os.getenv("SERV00_TLS_CERT"), os.getenv("SERV00_TLS_KEY")]
     if any(provided):
@@ -354,41 +405,77 @@ def certificate(stage, previous, state):
             fail("请同时提供 TLS 证书和私钥文件")
         shutil.copyfile(provided[0], cert)
         shutil.copyfile(provided[1], key)
-        state["trusted_cert"] = True
     elif previous:
         shutil.copyfile(previous / "cert.pem", cert)
         shutil.copyfile(previous / "private.key", key)
     else:
-        run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
-             "-nodes", "-days", "365", "-keyout", str(key), "-out", str(cert), "-subj",
-             "/CN=" + state["sni"], "-addext", "subjectAltName=DNS:" + state["sni"]])
-        state["trusted_cert"] = False
-    run(["openssl", "verify", "-partial_chain", "-trusted", str(cert),
-         "-verify_hostname", state["sni"], str(cert)])
+        issue_leaf(stage, state["sni"], 365)
+    # The full chain may supply intermediates. Only OpenSSL's system trust store supplies roots.
+    state["trusted_cert"] = run(["openssl", "verify", "-purpose", "sslserver", "-verify_hostname", state["sni"],
+                                "-untrusted", str(cert), str(cert)], check=False).returncode == 0
+    if not state["trusted_cert"]:
+        is_ca = b"CA:TRUE" in run(["openssl", "x509", "-in", str(cert), "-noout", "-ext", "basicConstraints"]).stdout
+        if is_ca and any(provided):
+            fail("请提供节点叶证书；外部 CA 证书不能用于节点固定")
+        if previous and not any(provided) and (rotate or is_ca):
+            issue_leaf(stage, state["sni"], 365)
+        elif previous and rotate and run(["openssl", "pkey", "-in", str(previous / "private.key"), "-pubout"]).stdout == run(
+                ["openssl", "pkey", "-in", str(key), "-pubout"]).stdout:
+            fail("轮换时请提供新的非公共 TLS 私钥，或取消外部证书参数以生成新证书")
+    validate_leaf(stage, state["sni"])
     der = run(["openssl", "x509", "-in", str(cert), "-outform", "der"]).stdout
     return hashlib.sha256(der).hexdigest()
 
 
-def prepare_origin(state, prior):
-    directory = ROOT / "origin-tls"
-    if not directory.exists():
-        with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
-            pair = Path(tmp) / "pair"
-            pair.mkdir(mode=0o700)
-            run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
-                 "-nodes", "-days", "3650", "-keyout", str(pair / "private.key"), "-out", str(pair / "cert.pem"),
-                 "-subj", "/CN=" + ORIGIN_NAME, "-addext", "subjectAltName=DNS:" + ORIGIN_NAME])
-            os.replace(pair, directory)
+def prepare_origin(state, prior, stage=None, rotate=False):
+    directory = (stage or ROOT) / "origin-tls"
     cert = directory / "cert.pem"
-    run(["openssl", "verify", "-trusted", str(cert), "-verify_hostname", ORIGIN_NAME, str(cert)])
-    if state.get("argo_token") and (not prior.get("origin_https") or any(
-            state.get(k) != prior.get(k) for k in ("backend", "argo_token", "argo_domain"))):
-        url = f"https://127.0.0.1:{state['backend']}"
-        print(f"固定隧道控制台设置 Service={url}，Origin Server Name={ORIGIN_NAME}，CA Pool={cert}，关闭 No TLS Verify。",
-              file=sys.stderr)
-        if os.getenv("SERV00_FIXED_ORIGIN_CONFIRMED") != url and not (
-                sys.stdin.isatty() and input("保存控制台设置后，输入上述 HTTPS 地址：").strip() == url):
-            fail("固定隧道配置待确认。非交互操作请将 SERV00_FIXED_ORIGIN_CONFIRMED 设为已核对的完整 HTTPS 地址")
+    fixed = bool(state.get("argo_token"))
+    if not directory.exists():
+        previous = (ACTIVE if prior.get("origin_in_generation") else ROOT) / "origin-tls"
+        reusable = (not rotate and (previous / "cert.pem").is_file() and (previous / "private.key").is_file()
+                    and b"CA:TRUE" not in run(["openssl", "x509", "-in", str(previous / "cert.pem"),
+                                                "-noout", "-ext", "basicConstraints"]).stdout)
+        if reusable:
+            shutil.copytree(previous, directory)
+        elif fixed:
+            # Keep the same private candidate across noninteractive confirmation retries.
+            pending = ROOT / "pending-origin-tls"
+            if pending.is_dir() and previous.is_dir() and (previous / "cert.pem").is_file() and (
+                    pending / "cert.pem").read_bytes() == (previous / "cert.pem").read_bytes():
+                shutil.rmtree(pending)
+            if not pending.exists():
+                with tempfile.TemporaryDirectory(dir=ROOT) as tmp:
+                    pair = Path(tmp) / "pair"
+                    pair.mkdir(mode=0o700)
+                    issue_leaf(pair, ORIGIN_NAME, 3650)
+                    os.replace(pair, pending)
+            shutil.copytree(pending, directory)
+        else:
+            directory.mkdir(mode=0o700)
+            issue_leaf(directory, ORIGIN_NAME, 3650)
+    validate_leaf(directory, ORIGIN_NAME)
+    state["origin_in_generation"] = stage is not None
+    state["origin_cert_sha256"] = hashlib.sha256(ssl.PEM_cert_to_DER_cert(cert.read_text())).hexdigest()
+    if fixed:
+        fp = state["origin_cert_sha256"]
+        anchors = ROOT / "origin-tls-v2"
+        anchors.mkdir(mode=0o700, exist_ok=True)
+        anchor = anchors / (fp + ".pem")
+        leaf = cert.read_bytes()
+        if not anchor.exists() or anchor.read_bytes() != leaf:
+            with tempfile.NamedTemporaryFile(dir=anchors, delete=False) as out:
+                out.write(leaf)
+            os.replace(out.name, anchor)
+        changed = fp != prior.get("origin_cert_sha256")
+        if changed or any(state.get(k) != prior.get(k) for k in ("backend", "argo_token", "argo_domain")):
+            url = f"https://127.0.0.1:{state['backend']}"
+            confirm = url + "#sha256=" + fp if changed and prior.get("argo_token") else url
+            print(f"请在固定隧道控制台设置 Service={url}，Origin Server Name={ORIGIN_NAME}，CA Pool={anchor}，关闭 No TLS Verify。\n"
+                  f"核实后将 SERV00_FIXED_ORIGIN_CONFIRMED 设为 {confirm}", file=sys.stderr)
+            if os.getenv("SERV00_FIXED_ORIGIN_CONFIRMED") != confirm and not (
+                    sys.stdin.isatty() and input("保存控制台配置后输入上述确认值：").strip() == confirm):
+                fail("固定隧道配置待确认。当前配置仍保留，确认后请重试相同操作")
     state["origin_https"] = True
 
 
@@ -414,10 +501,11 @@ def server_config(s, private_key, warp, series="1.10.7"):
                masquerade="https://www.bing.com") for i, addr in enumerate(s.get("addresses", [listener]), 1)]
     route = {"final": "direct"}
     if "warp_rules" in s:
-        route.update(rules=s["warp_rules"], rule_set=s.get("warp_sets", []))
+        rules, sets = checked_warp_policy({"rules": s["warp_rules"], "rule_set": s.get("warp_sets", [])})
+        route.update(rules=rules, rule_set=sets)
     elif re.fullmatch(r"s(14|15)", HOST_ID):
         route.update(rule_set=[dict(type="remote", tag="google-gemini", format="binary",
-            url="https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/google-gemini.srs",
+            url=GEMINI_URL.format(SERVER_RULES_REVISION),
             download_detour="direct")],
             rules=[dict(domain=["jnn-pa.googleapis.com"], outbound="wg"),
                    dict(rule_set=["google-gemini"], outbound="wg")])
@@ -429,22 +517,26 @@ def server_config(s, private_key, warp, series="1.10.7"):
     for i, addr in enumerate(s.get("addresses", [listener])[1:], 2):
         others.extend([{**reality, "tag": f"vless-in{i}", "listen": addr},
                        {**ws, "tag": f"vmess-wss-in{i}", "listen": addr, "tls": shared_tls}])
+    origin = Path("origin-tls") if s.get("origin_in_generation") else ROOT / "origin-tls"
     inbounds = hy + others + [reality,
         {**ws, "tag": "vmess-ws-in", "tls": shared_tls},
         {**ws, "tag": "vmess-argo-in", "listen": "127.0.0.1", "listen_port": s["backend"],
-         "tls": dict(enabled=True, certificate_path=str(ROOT / "origin-tls" / "cert.pem"),
-                     key_path=str(ROOT / "origin-tls" / "private.key"))}]
+         "tls": dict(enabled=True, certificate_path=str(origin / "cert.pem"), key_path=str(origin / "private.key"))}]
     config = {"log": {"disabled": True}, "inbounds": inbounds,
               "outbounds": [{"type": "direct", "tag": "direct"}], "route": route}
     rules = list(route.get("rules", []))
-    restricted = RESTRICTED + s.get("restricted_cidrs", [])
+    local_addresses = [str(ipaddress.ip_network(ip)) for ip in [listener, *s.get("addresses", [])]]
+    restricted = list(dict.fromkeys(RESTRICTED + s.get("restricted_cidrs", []) + local_addresses))
     no_address = {"ip_cidr": ["0.0.0.0/0", "::/0"], "invert": True}
     if series.startswith("1.10."):
         for inbound in inbounds:
             inbound["domain_strategy"] = "prefer_ipv4"
         config["outbounds"].extend([{"tag": "block", "type": "block"}, warp or {"type": "block", "tag": "wg"}])
-        route["rules"] = [{"ip_cidr": restricted, "outbound": "block"}, {**no_address, "outbound": "block"}, *rules]
+        route["rules"] = [{"ip_cidr": restricted, "outbound": "block"}, {**no_address, "outbound": "block"},
+                          {"network": "udp", "outbound": "block"}, *rules]
     elif series.startswith("1.14."):
+        config["dns"] = {"servers": [{"type": "https", "tag": "resolver", "server": "1.1.1.1"}]}
+        route["default_domain_resolver"] = "resolver"
         if warp:
             peer = {"address": warp["server"], "port": warp["server_port"], "public_key": warp["peer_public_key"],
                     "allowed_ips": ["0.0.0.0/0", "::/0"]}
@@ -463,7 +555,8 @@ def server_config(s, private_key, warp, series="1.10.7"):
                               **({"http_client": "rules-" + rs["download_detour"]} if "download_detour" in rs else {})}
                              for rs in route.get("rule_set", [])]
         route["rules"] = [{"action": "resolve", "strategy": "prefer_ipv4"},
-                          {"ip_cidr": restricted, "action": "reject"}, {**no_address, "action": "reject"}, *rules]
+                          {"ip_cidr": restricted, "action": "reject"}, {**no_address, "action": "reject"},
+                          {"network": "udp", "action": "route-options", "udp_connect": True}, *rules]
     else:
         fail("未知服务端版本")
     return config
@@ -474,7 +567,9 @@ def emit_clients(dest, s, argo, cert, fingerprint):
     cert_tls = {"enabled": True, "server_name": name}
     pin = {} if s.get("trusted_cert") else {"fingerprint": fingerprint}
     if pin:
-        cert_tls["certificate"] = cert
+        # Retain only the leaf as this node's trust anchor, even for imported full chains.
+        leaf, end, _ = cert.partition("-----END CERTIFICATE-----")
+        cert_tls["certificate"] = leaf + end
     outbound = [
         dict(type="vless", tag="reality", server=addr, server_port=s["vless_port"], uuid=auth,
              flow="xtls-rprx-vision", tls=dict(enabled=True, server_name=s["reality"],
@@ -540,30 +635,38 @@ def emit_clients(dest, s, argo, cert, fingerprint):
     routes = full["route"]["rules"]
     routes[:0] = [{"clash_mode": "Direct", "outbound": "direct"}, {"clash_mode": "Global", "outbound": "select"}]
     if s.get("client_series") == "1.10":
-        dns["servers"] = [{"tag": "dns-cn", "address": "223.5.5.5", "detour": "direct"},
+        dns["rules"].insert(0, {"outbound": "any", "server": "dns-cn"})
+        for item in outbound:
+            item["domain_strategy"] = "prefer_ipv4"
+        dns["servers"] = [{"tag": "dns-cn", "address": "https://223.5.5.5/dns-query", "detour": "direct"},
                           {"tag": "dns-proxy", "address": "tls://8.8.8.8", "detour": "select"},
                           {"tag": "fakeip", "address": "fakeip"}]
         dns["fakeip"] = {"enabled": True, **ranges}
         full["experimental"]["cache_file"]["store_fakeip"] = True
         full["inbounds"][0]["sniff"] = True
         full["outbounds"].extend([{"type": "dns", "tag": "dns-out"}, {"type": "block", "tag": "block"}])
-        routes[:0] = [{"protocol": "dns", "outbound": "dns-out"}, {"network": "udp", "port": 443, "outbound": "block"}]
+        routes[:0] = [{"protocol": "dns", "outbound": "dns-out"}, {"port": 53, "outbound": "dns-out"},
+                      {"network": "udp", "port": 443, "outbound": "block"}]
     else:
-        dns["servers"] = [{"tag": "dns-cn", "type": "udp", "server": "223.5.5.5"},
+        dns["servers"] = [{"tag": "dns-cn", "type": "https", "server": "223.5.5.5"},
                           {"tag": "dns-proxy", "type": "tls", "server": "8.8.8.8", "detour": "select"},
                           {"tag": "fakeip", "type": "fakeip", **ranges}]
         full["route"]["default_domain_resolver"] = "dns-cn"
         routes[:0] = [{"inbound": "tun-in", "action": "sniff"}, {"protocol": "dns", "action": "hijack-dns"},
+                      {"port": 53, "action": "hijack-dns"},
                       {"network": "udp", "port": 443, "action": "reject"}]
     mihomo = {"port": 7890, "allow-lan": False, "bind-address": "127.0.0.1",
               "lan-allowed-ips": ["127.0.0.1/32", "::1/128"], "mode": "rule",
-              "dns": {"enable": False, "listen": "127.0.0.1:53"},
+              "dns": {"enable": True, "enhanced-mode": "fake-ip", "listen": "127.0.0.1:1053",
+                      "default-nameserver": ["https://223.5.5.5/dns-query"],
+                      "nameserver": ["https://1.1.1.1/dns-query"],
+                      "proxy-server-nameserver": ["https://223.5.5.5/dns-query"]},
               "proxies": proxies, "proxy-groups": [
                   {"name": "Balance", "type": "load-balance", "proxies": tags, "url": test_url,
                    "interval": 300, "strategy": "round-robin"},
                   {"name": "Auto", "type": "url-test", "proxies": tags, "url": test_url, "interval": 300},
                   {"name": "Select", "type": "select", "proxies": ["Balance", "Auto", "DIRECT"] + tags}],
-              "rules": ["GEOIP,LAN,DIRECT", "GEOIP,CN,DIRECT", "MATCH,Select"]}
+              "rules": ["GEOSITE,CN,DIRECT", "GEOIP,LAN,DIRECT,no-resolve", "GEOIP,CN,DIRECT,no-resolve", "MATCH,Select"]}
     (dest / PRODUCTS[0]).write_text("\n".join(links) + "\n", encoding="utf-8")
     write_json(dest / PRODUCTS[1], mihomo)  # JSON is also valid YAML.
     write_json(dest / PRODUCTS[2], full)
@@ -611,7 +714,7 @@ def temporary_tunnel_healthy(domain):
     if not re.fullmatch(r"[a-z0-9-]+\.trycloudflare\.com", domain):
         return False
     try:
-        with urllib.request.build_opener(HTTPSRedirect).open("https://" + domain, timeout=7) as response:
+        with urllib.request.build_opener(RejectRedirect).open("https://" + domain, timeout=7) as response:
             return response.status == 200
     except urllib.error.HTTPError as err:
         with err:
@@ -700,6 +803,8 @@ def ensure_running(directory, state):
     if state.get("warp_rules") and not state.get("warp_policy_reviewed"):
         stop("server")
         fail("旧 WARP 策略尚未确认。请在 SSH 使用 --update 核实策略后再启动；仅有旧 recovery 时重新执行 --migrate")
+    if state.get("warp_rules"):
+        checked_warp_policy({"rules": state["warp_rules"], "rule_set": state.get("warp_sets", [])})
     if not pid_of("sb"):
         start("sb", ["run", "-c", "config.json"], directory, env)
     if not pid_of("server"):
@@ -709,7 +814,7 @@ def ensure_running(directory, state):
             args += ["run"]
         else:
             args += ["--no-tls-verify=false", "--url", f"https://127.0.0.1:{state['backend']}", "--origin-server-name", ORIGIN_NAME,
-                     "--origin-ca-pool", str(ROOT / "origin-tls" / "cert.pem")]
+                     "--origin-ca-pool", str((directory if state.get("origin_in_generation") else ROOT) / "origin-tls" / "cert.pem")]
         start("server", args, directory, env, ROOT / "tunnel.log")
 
 
@@ -735,19 +840,25 @@ def new_public(directory, state):
     if any(x.name not in ("index.html", ".htaccess") and not
            (x.is_symlink() and re.fullmatch(r"[0-9a-f]{48}", x.name)) for x in entry.iterdir()):
         fail("订阅入口目录已有其他站点文件")
-    for name, body in (("index.html", ""), (".htaccess", "Options -Indexes\n")):
+    for name, body in (("index.html", ""), (".htaccess", HTTPS_ACCESS)):
         control = entry / name
-        if control.is_symlink() or (control.exists() and control.read_text() != body):
+        if control.is_symlink():
             fail("订阅入口控制文件归属无效")
-        if control.exists():
+        existing = control.read_text() if control.exists() else None
+        if existing == body:
             os.chown(control, -1, gid)
             control.chmod(0o640)
             continue
+        if existing is not None and not (name == ".htaccess" and existing == "Options -Indexes\n"):
+            fail("订阅入口控制文件归属无效")
         with tempfile.NamedTemporaryFile(dir=entry, mode="w", delete=False) as out:
             out.write(body)
-        os.chown(out.name, -1, gid)
-        os.chmod(out.name, 0o640)
-        os.replace(out.name, entry / name)
+        try:
+            os.chown(out.name, -1, gid)
+            os.chmod(out.name, 0o640)
+            os.replace(out.name, control)
+        finally:
+            Path(out.name).unlink(missing_ok=True)
     os.chown(entry, -1, gid)
     entry.chmod(0o710)
     public = Path(tempfile.mkdtemp(prefix=".sb-sub-", dir=store))
@@ -759,7 +870,7 @@ def new_public(directory, state):
             out.chmod(0o640)
         # For Apache-compatible virtual hosts, reject cleartext and folder indexes.
         htaccess = public / ".htaccess"
-        htaccess.write_text("Options -Indexes\nRewriteEngine On\nRewriteCond %{HTTPS} !=on\nRewriteRule ^ - [F,L]\n")
+        htaccess.write_text(HTTPS_ACCESS)
         os.chown(htaccess, -1, gid)
         htaccess.chmod(0o640)
         os.chown(public, -1, gid)
@@ -840,10 +951,10 @@ def configure(operation, requested_ports=None):
     stage = Path(tempfile.mkdtemp(dir=ROOT, prefix="generation-"))
     changed = False
     try:
-        fingerprint = certificate(stage, previous, state)
+        fingerprint = certificate(stage, previous, state, operation == "rotate")
         series = server_series()
-        prepare_origin(state, old)
-        if previous:
+        prepare_origin(state, old, stage, operation == "rotate")
+        if previous and operation != "rotate":
             private_key = (previous / "reality.key").read_text()
         else:
             pair = run([ROOT / "sb", "generate", "reality-keypair"], text=True).stdout
@@ -878,9 +989,11 @@ def configure(operation, requested_ports=None):
                 switch(ACTIVE, previous.name)
                 try:
                     previous_state = load(previous / "state.json")
-                    ensure_running(previous, previous_state)
-                    if not previous_state.get("argo_domain"):
-                        publish_tunnel_change(previous_state, running_argo(previous_state))
+                    # reset_ports restores the provider allocations before restarting the old daemon.
+                    if operation != "ports":
+                        ensure_running(previous, previous_state)
+                        if not previous_state.get("argo_domain"):
+                            publish_tunnel_change(previous_state, running_argo(previous_state))
                 except SetupError as err:
                     print(str(err), file=sys.stderr)
             elif ACTIVE.is_symlink():
@@ -894,6 +1007,9 @@ def configure(operation, requested_ports=None):
         raise
     if previous and old.get("token") != state["token"]:
         retire_token(old["token"])
+    pending = ROOT / "pending-origin-tls"
+    if state.get("argo_token") and pending.is_dir() and (pending / "cert.pem").read_bytes() == (stage / "origin-tls" / "cert.pem").read_bytes():
+        shutil.rmtree(pending)
     if operation == "migrate":
         (ROOT / "recovery").unlink(missing_ok=True)
         print("节点身份已轮换。请替换客户端订阅，验证后执行 --retire-legacy")
@@ -926,9 +1042,6 @@ def retire_legacy(state):
         url = "https://" + SITE + "/" + SUB_DIRECTORY + "/" + state["token"] + "/" + name
         request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
         # Never forward a subscription token through a redirect.
-        class RejectRedirect(urllib.request.HTTPRedirectHandler):
-            def redirect_request(self, *args):
-                fail("订阅发生重定向")
         with urllib.request.build_opener(RejectRedirect).open(request, timeout=10) as response:
             if response.status != 200 or response.read(len(expected) + 1) != expected:
                 fail("HTTPS 订阅内容不一致，保留旧入口")
@@ -945,28 +1058,37 @@ def reset_ports():
     ports = {}
     original = []
     added = []
-    for kind, key in (("tcp", "vless_port"), ("tcp", "vmess_port"), ("udp", "hy2_port")):
+    bindings = (("tcp", "vless_port"), ("tcp", "vmess_port"), ("udp", "hy2_port"))
+    dedicated = os.getenv("SERV00_ARGO_PORT") or state.get("argo_dedicated_port")
+    reserved = {port(dedicated)} if dedicated else set()
+    for kind, key in bindings:
         value = input(f"{key}（输入已分配端口，回车随机替换当前项目端口 {state[key]}）：").strip()
         if value and port(value) not in assigned[kind]:
             fail("目标端口不在宿主已分配列表")
         if not value and state[key] not in assigned[kind]:
             fail("旧端口归属需与宿主核对")
         ports[key] = port(value) if value else None
-    if ports["vless_port"] and ports["vless_port"] == ports["vmess_port"]:
-        fail("两个 TCP 入站需要不同的端口")
-    reconnect = bool(pid_of("server"))
-    stop("server")
+    selected = [n for n in ports.values() if n is not None]
+    released = {state[key] for _, key in bindings if ports[key] is None}
+    if len(selected) != len(set(selected)) or set(selected) & (reserved | released) or reserved & released:
+        fail("新端口必须互不相同，且不得与独立回源或待释放的端口冲突")
+    if dedicated and port(dedicated) not in assigned["tcp"]:
+        fail("独立回源端口未在宿主登记")
+    reserved.update(selected)
+    reserved.update(released)
+    reconnect = bool(pid_of("sb") or pid_of("server"))
     try:
-        for kind, key in (("tcp", "vless_port"), ("tcp", "vmess_port"), ("udp", "hy2_port")):
+        stop("server")
+        stop("sb")
+        for kind, key in bindings:
             if ports[key] is not None:
                 continue
             old = state[key]
-            if kind == "tcp" and old in (ports["vless_port"], ports["vmess_port"]):
-                fail("目标端口与另一项待回收的原端口冲突")
             run(["devil", "port", "del", kind, str(old)])
             original.append((kind, old))
-            ports[key] = allocate(kind)
+            ports[key] = allocate(kind, reserved)
             added.append((kind, ports[key]))
+            reserved.add(ports[key])
         configure("ports", ports)
     except BaseException:
         failed = False
@@ -1046,8 +1168,8 @@ def perform(op):
         retire_legacy(state)
     elif op == "show":
         if not state.get("trusted_cert"):
-            print("自签单节点 Hysteria2 URI 需先通过 SSH 取回并信任 ~/.sing-box-serv00/active/cert.pem；"
-                  "完整订阅内已包含证书或指纹。")
+            print("完整订阅按节点固定证书或指纹。导入单节点时请通过 SSH 核对该节点指纹，"
+                  "切勿将共享宿主机的证书导入系统或浏览器的全局根信任库。")
         for name in PRODUCTS:
             print("https://" + SITE + "/" + SUB_DIRECTORY + "/" + state["token"] + "/" + name)
         print((ACTIVE / PRODUCTS[0]).read_text())
@@ -1081,7 +1203,10 @@ def main():
     if args.account_file:
         if args.operation not in ("install", "update"):
             fail("--account-file 仅用于通过 SSH 部署受审版本")
-        values = load(args.account_file)
+        try:
+            values = load(args.account_file)
+        finally:
+            args.account_file.unlink(missing_ok=True)
         for key in ("SUUID", "REALITY", "IP", "TCP1_PORT", "TCP2_PORT", "UDP_PORT", "ARGO_DOMAIN", "ARGO_AUTH",
                     "SERV00_ARGO_PORT", "SERV00_LOOPBACK_PORT_CONFIRMED", "SERV00_FIXED_ORIGIN_CONFIRMED", "SERV00_CLIENT_RULES_REVISION"):
             if values.get(key):

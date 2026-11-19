@@ -1,5 +1,6 @@
 """Publishing with two dummy identities against a loopback Git HTTP server."""
 import base64
+import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 import shlex
@@ -30,7 +31,8 @@ class DistributionTests(ShellTestCase):
         storage = self.root
         statuses = []
         requests = []
-        visibility = [404]
+        metadata = {"visibility": "private", "path_with_namespace": "Group/Project"}
+        anonymous = [401]
         class GitHTTP(BaseHTTPRequestHandler):
             def log_message(self, *args):
                 pass
@@ -38,16 +40,17 @@ class DistributionTests(ShellTestCase):
             def handle_git(self):
                 path = urlsplit(self.path)
                 requests.append(path.path)
-                if path.path == "/api/v4/projects/group%2Fproject":
-                    self.send_response(visibility[0])
+                if path.path.startswith("/api/v4/projects/"):
+                    self.send_response(200 if self.headers.get("PRIVATE-TOKEN") in (read, write) else 401)
                     self.end_headers()
+                    self.wfile.write(json.dumps(metadata).encode())
                     return
                 auth = self.headers.get("Authorization", "")
                 creds = base64.b64decode(auth[6:]).decode() if auth.startswith("Basic ") else ""
                 identity = creds.partition(":")[2]
                 pushing = "git-receive-pack" in self.path
                 if identity not in (read, write) or (pushing and identity != write):
-                    status = 403 if identity in (read, write) else 401
+                    status = 403 if identity in (read, write) else anonymous[0]
                     self.send_response(status)
                     self.send_header("WWW-Authenticate", 'Basic realm="fixture"')
                     self.end_headers()
@@ -82,9 +85,12 @@ class DistributionTests(ShellTestCase):
         settings = self.box / "gitlab-publisher"
         functions = section("gitlab_settings_valid", "gitlab_clear_legacy").replace(
             "/etc/s-box", self.box.as_posix()).replace("https://gitlab.com/", base + "/")
-        def publish(secret, verify=False):
-            settings.write_text("group/project\nmain\n" + secret + "\n", encoding="utf-8", newline="\n")
-            test_source = functions.replace(") >/dev/null 2>&1", ")")
+        def publish(secret, verify=False, project="group/project"):
+            settings.write_text(project + "\nmain\n" + secret + "\n", encoding="utf-8", newline="\n")
+            # Only the loopback fixture uses HTTP. Keep the production HTTPS constraint explicit.
+            self.assertIn("--proto '=https'", functions)
+            test_source = functions.replace(") >/dev/null 2>&1", ")").replace("--proto '=https'", "--proto '=http'")
+            test_source = 'curl(){ printf "%s\\n" "$@" >> curl-args; command curl "$@"; }\n' + test_source
             if os.name == "nt":
                 # shell_testlib disables MSYS argument translation; curl.exe needs the Windows null device.
                 test_source = "flock(){ :; }\n" + test_source.replace("--output /dev/null", "--output NUL")
@@ -93,11 +99,20 @@ class DistributionTests(ShellTestCase):
                                     check=False, env={"NO_PROXY": "127.0.0.1",
                                                       "GIT_CONFIG_GLOBAL": global_git.as_posix()})
             self.assertNotIn(secret, result.stdout + result.stderr)
+            if (self.root / "curl-args").exists():
+                self.assertNotIn(secret, (self.root / "curl-args").read_text())
             self.git_status = f"{result.stderr} {requests} {statuses}"
             return result.returncode
-        visibility[0] = 200
-        self.assertNotEqual(publish(write), 0, "must reject anonymous project access")
-        visibility[0] = 404
+        for visibility, project in (("public", "group/project"), ("internal", "group/project"),
+                                    ("public", "group/project.json"), ("public", "group/project.git"),
+                                    ("private", "group/wrong-project")):
+            metadata["visibility"] = visibility
+            self.assertNotEqual(publish(write, project=project), 0)
+            self.assertFalse(any("git-receive-pack" in p for p in requests))
+        metadata["visibility"] = "private"
+        anonymous[0] = 200
+        self.assertNotEqual(publish(write), 0)
+        anonymous[0] = 401
         self.assertEqual(publish(write, verify=True), 0, self.git_status)
         self.assertNotEqual(publish(read, verify=True), 0, "read-only must fail even with unchanged files")
         (self.box / "clmi.yaml").write_text("updated\n", encoding="utf-8")

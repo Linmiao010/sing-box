@@ -4,6 +4,9 @@ tests/*
 !tests/shell_testlib.py
 !tests/test_security_*.py
 !tests/test_https_live.py
+!tests/test_network_probe.py
+!tests/test_ip_detection.py
+!tests/test_menu_input.py
 !tests/test_core_update.py
 !tests/test_serv00_recovery.py
 !tests/test_subscription_ui.py
