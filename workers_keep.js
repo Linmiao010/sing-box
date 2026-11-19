@@ -1,23 +1,22 @@
-addEventListener('scheduled', event => event.waitUntil(handleScheduled()));
-// 配合甬哥的serv00的SSH脚本或者Github/VPS/软路由脚本，生成保活网页与重启网页
-// 每个保活/up网页或每个重启/re网页之间用空格或者，或者,间隔开，网页前带http://
-const urlString = 'http://保活或重启网页1 http://保活或重启网页2 http://保活或重启网页3 ………';
-const urls = urlString.split(/[\s,，]+/);
-const TIMEOUT = 5000;
-async function fetchWithTimeout(url) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), TIMEOUT);
-  try {
-    await fetch(url, { signal: controller.signal });
-    console.log(`✅ 成功: ${url}`);
-  } catch (error) {
-    console.warn(`❌ 访问失败: ${url}, 错误: ${error.message}`);
-  } finally {
-    clearTimeout(timeout);
-  }
-}
-async function handleScheduled() {
-  console.log('⏳ 任务开始');
-  await Promise.all(urls.map(fetchWithTimeout));
-  console.log('📊 任务结束');
-}
+// HEALTH_URLS is a whitespace-separated list of HTTPS /health endpoints.
+export default {
+    async scheduled(_event, env) {
+        const urls = (env.HEALTH_URLS || '').trim().split(/\s+/).filter(Boolean);
+        if (!urls.length) throw new Error('health endpoints missing');
+        let failed = false;
+        for (const [i, raw] of urls.entries()) {
+            try {
+                const url = new URL(raw);
+                if (url.protocol !== 'https:' || url.username || url.password ||
+                    url.pathname !== '/health' || url.search || url.hash) throw new Error();
+                const res = await fetch(url, {redirect: 'error', signal: AbortSignal.timeout(15000)});
+                if (res.status !== 200 || await res.text() !== 'ok\n') throw new Error();
+                console.log('health', i + 1, 'ok');
+            } catch {
+                console.log('health', i + 1, 'failed');
+                failed = true;
+            }
+        }
+        if (failed) throw new Error('health check failed');
+    }
+};

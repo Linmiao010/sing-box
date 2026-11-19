@@ -6,9 +6,9 @@
 
 ## 主要功能
 
-- 部署 VLESS Reality Vision、VMess WebSocket（可选 TLS / Argo）、Hysteria2、TUIC v5、AnyTLS、Trojan + TLS 和 Snell。
+- 部署 VLESS Reality Vision、VMess 公网 WSS 或 Argo 回环源站、Hysteria2、TUIC v5、AnyTLS、Trojan + TLS 和 Snell。
 - 生成 sing-box、Clash/Mihomo 客户端配置及聚合节点链接，订阅内容在服务器本地生成。
-- 提供本地 IP HTTP 订阅、GitLab 订阅和自定义域名 HTTPS 订阅；域名模式支持令牌轮换和后台端口管理。
+- 公网客户端通过 Caddy HTTPS 读取三份订阅。HTTP 后端仅监听回环地址。GitLab 发布凭据只供服务器更新仓库。
 - 管理协议端口、证书、Argo 隧道、域名分流、Telegram 通知以及 sing-box 内核版本。
 - 适配 IPv4、IPv6 和双栈 VPS，包含 Debian、Ubuntu、CentOS、Alpine 安装分支，以及 amd64、arm64、armv7 架构识别。
 - 支持逐地址探测与 IPv4 / IPv6 出站源地址选择，入口为 **3 → 4**；绑定作用于脚本探测和 sing-box 原生直连，与地址族优先级、节点公布地址分别设置。
@@ -16,43 +16,46 @@
 
 ## 安装与更新
 
-在 VPS 上以 root 身份运行以下任一命令，需要 Bash 及对应的下载工具：
+从维护者或自己的代码审查渠道取得包含本次修复的 **40 位 Git 提交号**。在 VPS 的 root Bash 会话中运行下列命令。第一次安装选择菜单 **1**。从旧版迁移时，从新脚本进入菜单 **7**，输入同一提交号切换快捷命令。
 
 ```bash
-bash <(wget -qO- https://raw.githubusercontent.com/Linmiao010/sing-box/main/sb.sh)
+(
+  set -eu
+  umask 077
+  read -r -p '已核实的完整提交号：' REV
+  [[ "$REV" =~ ^[0-9a-f]{40}$ ]]
+  install -d -m 700 /etc/s-box/releases
+  tmp=$(mktemp -d /etc/s-box/releases/.stage.XXXXXX)
+  trap 'rm -rf -- "$tmp"' EXIT
+  git -C "$tmp" init -q
+  git -C "$tmp" fetch -q --depth=1 https://github.com/Linmiao010/sing-box.git "$REV"
+  test "$(git -C "$tmp" rev-parse 'FETCH_HEAD^{commit}')" = "$REV"
+  git -C "$tmp" fsck --strict --no-reflogs "$REV"
+  git -C "$tmp" archive -o "$tmp/release.tar" "$REV"
+  mkdir "$tmp/tree"
+  tar xf "$tmp/release.tar" -C "$tmp/tree"
+  chmod 700 "$tmp/tree/sb.sh"
+  release="/etc/s-box/releases/$REV"
+  if [[ ! -d "$release" ]]; then mv -T "$tmp/tree" "$release"; fi
+  bash "$release/sb.sh"
+)
 ```
 
-或：
+每次更新先按同样方式安装已核实的新提交，菜单 **7** 原子切换 `/usr/bin/sing_box`。切换前保留旧发布目录，回滚时可重新选择其提交号。运行用户提供的未提交补丁时，应先审查并生成自己的提交，从可信仓库地址获取。订阅迁移和凭据轮换见 [操作手册](docs/README.md)。
 
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Linmiao010/sing-box/main/sb.sh)
-```
+安装时防火墙默认沿用原策略。后续可用 `sing_box --firewall-enable` 按公网监听的实际协议、端口和地址族添加项目规则。firewalld 存在多个活动 zone 时需指定公网入口所属的 `--zone <zone>`。原生 nftables 有多个同族 input 基础链时，由管理员决定放行位置。UFW 与 iptables 的规则带项目 comment。管理员重新加载整套防火墙规则后，可运行 `sing_box --firewall-sync` 恢复项目条目。历史无标记的 DNAT 需对照原配置人工辨认。
 
-进入菜单后选择 **1** 安装。安装完成后运行 `sing_box` 打开管理菜单。已有安装升级后也使用该命令；旧 `sb` 入口作为兼容链接保留，供已有定时任务调用。
+`tools/releases.sha256` 与脚本一起由该提交固定，覆盖内核、Caddy、cloudflared、旧版地理数据库和随库的 sbwpph。内核支持清单中的 1.10.7 和 1.14.3。Caddy 采用清单中的官方发布归档。维护者更新清单时，从上游对应版本的 GitHub Releases 资产核实 SHA-256 或发布签名；1.10.7 发布页未提供资产摘要，本清单使用该官方固定标签对应三个归档的实测 SHA-256。仓库内的 sbwpph 直接核对同一受审树中的文件。新版本号、URL 与摘要一并审查提交，菜单中查询到更新版本后仍需等待清单覆盖。
 
-首次安装、`sing_box` 快捷命令的菜单 **7** 升级、版本检查和重新安装均使用本仓库 `Linmiao010/sing-box` 的 `main` 分支。本地修改必须先推送到该分支，远程安装或升级命令才能取得新版本。
+菜单 **12** 可通过发行版签名软件源安装 Certbot，支持独立 HTTP-01 和已安装的认证插件。也可自行准备 `/root/ygkkkca/{ca.log,cert.crt,private.key}`。菜单 **13** 可从已配置的受信软件源安装系统 WARP 客户端，并通过 warp-cli 注册、连接、断开或查看状态。菜单 **11** 为当前已支持 BBR 的内核启用该算法。[Cloudflare 官方软件源](https://pkg.cloudflareclient.com/) · [Linux WARP 命令](https://developers.cloudflare.com/warp-client/get-started/linux/)
 
 ## 常用快捷操作
 
 以下命令用于已完成安装的 VPS。
 
-创建本地 IP HTTP 订阅，将示例令牌替换为自己的令牌：
+在 **3 → 10** 输入订阅域名，完成 Caddy HTTPS 配置。在 **3 → 8** 管理订阅令牌和仅供本机使用的 HTTP 后端。
 
-```bash
-printf '3\n8\n1\nmy_subscription_token_123\n\n' | sing_box
-```
-
-启用 Argo 临时隧道：
-
-```bash
-printf '3\n3\n1\n1' | sing_box
-```
-
-启用 Argo 固定隧道，替换示例中的密钥与域名：
-
-```bash
-printf '3\n3\n2\n1\n固定密钥\n固定域名' | sing_box
-```
+启用 Argo 前，先在 **3 → 1 → 2** 将 VMess 切换为回环源站。再进入 **3 → 3** 选择临时或固定隧道；固定隧道在交互菜单中输入 Cloudflare 提供的隧道令牌和域名。
 
 设置域名分流，替换示例中的域名后缀：
 
@@ -62,7 +65,7 @@ printf '5\n2\n1\n后缀域名1 后缀域名2' | sing_box
 
 ## 附带脚本
 
-仓库还包含 [`serv00.sh`](serv00.sh) 和 [`serv00keep.sh`](serv00keep.sh)，用于 Serv00/Hostuno 环境下的部署与保活，支持 VLESS Reality、VMess WS/Argo 和 Hysteria2。这些脚本有各自的运行环境和外部资源依赖，不适用上面的 VPS 安装与更新流程。
+Serv00/Hostuno 使用同一受审提交的完整检出。在自己的 SSH 账户下从该检出运行 `bash serv00.sh`，并按操作手册设置保活。
 
 ## 许可证
 

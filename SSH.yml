@@ -1,49 +1,36 @@
-name: Keep Servers serv00
+name: Serv00 SSH login
 on:
   schedule:
-   - cron: '0 15 */8 * *'
-  workflow_dispatch: 
+    - cron: '0 15 */8 * *'
+  workflow_dispatch:
 
+permissions:
+  contents: read
 jobs:
-  keep_servers_alive:
+  run:
     runs-on: ubuntu-latest
-    env:
-      ACCOUNTS: >
-        [
-        {"SSH_USER":"123456789", "SSH_PASS":"123456", "HOST":"sxxx.serv00.com"}
-        ]
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4.2.2
-
-      - name: Install required packages
+      - name: Validate reviewed commit
+        env:
+          REVIEWED_COMMIT: ${{ vars.SERV00_REVIEWED_COMMIT }}
+        run: '[[ "$REVIEWED_COMMIT" =~ ^[0-9a-f]{40}$ ]]'
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+          ref: ${{ vars.SERV00_REVIEWED_COMMIT }}
+      - run: sudo apt-get install -y sshpass jq
+      - name: Run verified SSH connections
+        env:
+          ACCOUNTS: ${{ secrets.SERV00_ACCOUNTS }}
+          KNOWN_HOSTS: ${{ secrets.SERV00_KNOWN_HOSTS }}
+          SSH_PRIVATE_KEY: ${{ secrets.SERV00_SSH_PRIVATE_KEY }}
         run: |
-          sudo apt-get update
-          sudo apt-get install -y sshpass jq
-
-      - name: Process each account
-        run: |
-           echo "*****************************************************"
-           echo "*****************************************************"
-           echo "甬哥Github项目  ：github.com/yonggekkk"
-           echo "甬哥Blogger博客 ：ygkkk.blogspot.com"
-           echo "甬哥YouTube频道 ：www.youtube.com/@ygkkk"
-           echo "vps服务器远程登录一次SSH脚本【Github】"
-           echo "*****************************************************"
-           echo "*****************************************************"
-            count=0  
-           for account in $(echo "${ACCOUNTS}" | jq -c '.[]'); do
-              count=$((count+1))
-              SSH_USER=$(echo $account | jq -r '.SSH_USER')
-              SSH_PASS=$(echo $account | jq -r '.SSH_PASS')
-              HOST=$(echo $account | jq -r '.HOST')
-           if sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no "$SSH_USER@$HOST" -q exit; then
-            echo "🎉恭喜！✅第【$count】台服务器连接成功！🚀服务器地址：$HOST ，账户名：$SSH_USER" 
-           else
-            echo "===================================================="
-            echo "💥杯具！❌第【$count】台服务器连接失败！🚀服务器地址：$HOST ，账户名：$SSH_USER"
-            echo "⚠️可能账号名、密码、服务器名称输入错误，或者当前服务器在维护中"  
-            echo "===================================================="
-           fi
-           sleep 10
-            done
+          umask 077
+          export SSH_KNOWN_HOSTS_FILE="$RUNNER_TEMP/serv00_known_hosts"
+          printf '%s\n' "$KNOWN_HOSTS" > "$SSH_KNOWN_HOSTS_FILE"
+          if [[ -n "$SSH_PRIVATE_KEY" ]]; then
+            eval "$(ssh-agent -s)" >/dev/null
+            trap 'ssh-agent -k >/dev/null' EXIT
+            ssh-add - <<< "$SSH_PRIVATE_KEY" >/dev/null 2>&1
+          fi
+          bash kp.sh --login

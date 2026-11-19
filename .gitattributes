@@ -1,1 +1,4 @@
-/sb.sh text eol=lf
+*.sh text eol=lf
+*.js text eol=lf
+*.py text eol=lf
+*.sha256 text eol=lf

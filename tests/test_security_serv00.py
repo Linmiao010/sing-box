@@ -1,0 +1,477 @@
+"""Offline Serv00 deployment, SSH identity and generation regressions."""
+import base64
+import contextlib
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from unittest.mock import Mock, patch
+
+REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO))
+import serv00_runtime as runtime
+
+
+def shell_tools():
+    bash = os.getenv("SERV00_TEST_BASH") or shutil.which("bash") or r"C:\Program Files\Git\bin\bash.exe"
+    ssh = os.getenv("SERV00_TEST_SSH") or shutil.which("ssh")
+    jq = os.getenv("SERV00_TEST_JQ") or shutil.which("jq")
+    if os.name == "nt":
+        if not os.getenv("SERV00_TEST_SSH") and Path(bash).is_file():
+            # kp.sh runs in Bash. Select the OpenSSH implementation on its PATH;
+            # native Windows OpenSSH uses a different null file / ACL convention.
+            found = subprocess.run([bash, "-c", 'p=$(type -P ssh) && cygpath -aw "$p"'], capture_output=True, text=True)
+            if found.returncode == 0:
+                value = Path(found.stdout.strip())
+                ssh = str(value if value.exists() else value.with_suffix(".exe"))
+        jq = jq or REPO / ".test-tools/jq.exe"
+    return bash, ssh, jq
+
+
+class Serv00Security(unittest.TestCase):
+    def setUp(self):
+        self.work = tempfile.TemporaryDirectory()
+        self.addCleanup(self.work.cleanup)
+        self.dir = Path(self.work.name)
+
+    def test_new_old_and_custom_identity(self):
+        old = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        for path in (old + "-vm", "/" + old + "-vm?ed=2048"):
+            with self.assertRaises(runtime.SetupError):
+                runtime.identity({"uuid": old, "path": path})
+        for path, migrate in (("", False), (old + "-vm", True), ("/custom?q", True), ("/custom", True)):
+            if path == "/custom?q":
+                with self.assertRaises(runtime.SetupError):
+                    runtime.identity({"uuid": old, "path": path}, migrate)
+                continue
+            user, ws = runtime.identity({"uuid": old, "path": path}, migrate)
+            if migrate:
+                self.assertNotEqual(user, old)
+            self.assertNotIn(user, ws)
+            if path == "/custom":
+                self.assertEqual(ws, path)
+            s = dict(uuid=user, path=ws, ip="127.0.0.1", reality="reality.example",
+                     vless_port=23401, vmess_port=23402, hy2_port=23403, backend=23404,
+                     public_key="test", sni="cert.example", trusted_cert=False)
+            self.assertEqual(runtime.identity(s), (user, ws))
+            server = runtime.server_config(s, "dummy", None)
+            tls_ws, argo_ws = server["inbounds"][-2:]
+            self.assertTrue(tls_ws["tls"]["enabled"])
+            self.assertEqual((argo_ws["listen"], argo_ws["listen_port"]), ("127.0.0.1", 23404))
+            self.assertEqual(argo_ws["transport"]["path"], ws)
+            self.assertEqual(tls_ws["transport"]["path"], ws)
+            runtime.emit_clients(self.dir, s, "argo.example", "test PEM", "c0ffee")
+            sub = json.loads((self.dir / "singbox.txt").read_text())
+            for out in [o for o in sub["outbounds"] if o["type"] == "vmess"]:
+                self.assertEqual(out["transport"]["path"], ws)
+                self.assertTrue(out["tls"]["enabled"])
+            hy = next(o for o in sub["outbounds"] if o["type"] == "hysteria2")
+            self.assertEqual(hy["tls"]["certificate"], "test PEM")
+            mh = json.loads((self.dir / "clashmeta.txt").read_text())
+            self.assertFalse(mh["allow-lan"])
+            self.assertEqual(mh["dns"], {"enable": False, "listen": "127.0.0.1:53"})
+            uris = (self.dir / "v2sub.txt").read_text().splitlines()
+            self.assertTrue(any("pinSHA256=c0ffee" in u for u in uris))
+            for u in [u for u in uris if u.startswith("vmess://")]:
+                vm = json.loads(base64.b64decode(u.split("://")[1]))
+                self.assertEqual((vm["path"], vm["tls"]), (ws, "tls"))
+            if migrate:
+                self.assertNotIn(old, json.dumps(server))
+                self.assertNotIn(old, json.dumps(sub))
+
+    def test_public_index_hides_tokens_and_snapshot_is_outside_webroot(self):
+        public = self.dir / "public_html"
+        public.mkdir()
+        inputs = self.dir / "input"
+        inputs.mkdir()
+        for name in (*runtime.PRODUCTS, "private.key"):
+            (inputs / name).write_text("sample")
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(runtime, "PUBLIC", public))
+            if os.name == "nt":
+                stack.enter_context(patch.object(os, "getuid", return_value=0, create=True))
+                stack.enter_context(patch.object(os, "chown", create=True))
+            stage = runtime.new_public(inputs, {})
+        self.assertNotIn(public, stage.parents)
+        self.assertEqual({x.name for x in stage.iterdir()}, {*runtime.PRODUCTS, ".htaccess"})
+        self.assertEqual((public / runtime.SUB_DIRECTORY / "index.html").read_text(), "")
+        self.assertEqual((public / runtime.SUB_DIRECTORY / ".htaccess").read_text(), "Options -Indexes\n")
+
+    def test_missing_warp_key_blocks_preserved_routes(self):
+        state = dict(uuid="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", path="/custom", ip="127.0.0.1",
+                     reality="example.test", hy2_port=24401, vless_port=24402, vmess_port=24403,
+                     backend=24404, warp_rules=[{"domain":["test.invalid"],"outbound":"wg"}], warp_sets=[])
+        with patch.object(runtime, "ROOT", self.dir):
+            config = runtime.server_config(state, "dummy", runtime.warp_outbound())
+        self.assertEqual(config["route"]["rules"], state["warp_rules"])
+        self.assertEqual(next(o for o in config["outbounds"] if o["tag"] == "wg")["type"], "block")
+
+    def test_checksum_blocks_execution_and_replacement(self):
+        dest = self.dir / "core"
+        dest.write_text("original")
+        def fetched(_, path):
+            path.write_bytes(b"replacement")
+        for digest in ("", "0" * 64):
+            with self.assertRaises(runtime.SetupError):
+                runtime.install_asset(dest, "sb", digest, fetched)
+            self.assertEqual(dest.read_text(), "original")
+        runtime.install_asset(dest, "sb", hashlib.sha256(b"replacement").hexdigest(), fetched)
+        self.assertEqual(dest.read_text(), "replacement")
+
+    def test_invalid_candidate_preserves_active_and_never_restarts(self):
+        previous = self.dir / "active"
+        previous.mkdir()
+        state = dict(uuid="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee", path="/custom",
+                     public_key="pub", ip="127.0.0.1", addresses=["127.0.0.1"])
+        runtime.write_json(previous / "state.json", state)
+        (previous / "reality.key").write_text("private")
+        (previous / "config.json").write_text("old config")
+        with contextlib.ExitStack() as stack:
+            for key, value in dict(ROOT=self.dir, ACTIVE=previous).items():
+                stack.enter_context(patch.object(runtime, key, value))
+            for key, value in dict(acquire_state=state, warp_outbound=None, prepare_assets=None,
+                                   certificate="fingerprint", server_config={}).items():
+                stack.enter_context(patch.object(runtime, key, return_value=value))
+            stack.enter_context(patch.object(runtime, "run", side_effect=subprocess.CalledProcessError(1, "check")))
+            startup = stack.enter_context(patch.object(runtime, "ensure_running"))
+            stop = stack.enter_context(patch.object(runtime, "stop"))
+            with self.assertRaises(subprocess.CalledProcessError):
+                runtime.configure("refresh")
+            startup.assert_not_called()
+            stop.assert_not_called()
+        self.assertEqual((previous / "config.json").read_text(), "old config")
+
+    def test_deployed_panel_only_health_and_no_operations(self):
+        panel = self.dir / "public_nodejs"
+        root = self.dir / "private"
+        root.mkdir()
+        with contextlib.ExitStack() as stack:
+            for key, value in dict(ROOT=root, HOME=self.dir, PANEL=panel, SITE="test.serv00.net",
+                                  HOST="s1.serv00.com", HOST_ID="s1").items():
+                stack.enter_context(patch.object(runtime, key, value))
+            devil = stack.enter_context(patch.object(runtime, "run", return_value=Mock(stdout="")))
+            if os.name == "nt":
+                # Windows hosts can lack the FreeBSD symlink privilege. The actual
+                # installer still creates the private release, shortcut and Node app.
+                stack.enter_context(patch.object(runtime, "switch"))
+            runtime.install_release()
+            self.assertIn(["devil", "www", "restart", "s1.test.serv00.net"], [c.args[0] for c in devil.call_args_list])
+        self.assertEqual((panel / "app.js").read_bytes(), (REPO / "app.js").read_bytes())
+        sentinel = "test-token-never-echo"
+        (panel / "probe.cjs").write_text(
+            "const cp=require('child_process');const fs=require('fs');"
+            "for(const n of ['exec','execFile','spawn','execSync','spawnSync'])"
+            "cp[n]=()=>{fs.appendFileSync('ops','called');throw Error('blocked')};")
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        proc = subprocess.Popen(["node", "--require", "./probe.cjs", "-e", "require('./app.js')"], cwd=panel,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                env={**os.environ, "PORT": str(port), "ARGO_AUTH": sentinel})
+        try:
+            base = f"http://127.0.0.1:{port}"
+            for _ in range(80):
+                try:
+                    urllib.request.urlopen(base + "/health", timeout=1).close()
+                    break
+                except urllib.error.URLError:
+                    time.sleep(.05)
+            for method, path, status in [
+                ("GET", "/health", 200), ("GET", "/up", 404), ("GET", "/jc", 404),
+                ("GET", "/re", 404), ("GET", "/rp", 404), ("POST", "/rp", 404),
+                ("GET", "/list/" + sentinel, 404), ("POST", "/health", 404)
+            ]:
+                req = urllib.request.Request(base + path, method=method)
+                try:
+                    response = urllib.request.urlopen(req, timeout=3)
+                except urllib.error.HTTPError as err:
+                    response = err
+                with response:
+                    self.assertEqual(response.status, status)
+                    self.assertIn(response.read(), (b"ok\n", b"not found\n"))
+            self.assertFalse((panel / "ops").exists())
+        finally:
+            proc.terminate()
+            logs = proc.communicate(timeout=5)[0]
+        self.assertEqual(logs, b"")
+
+    def test_cert_embed_accepts_only_original_leaf_and_hostname(self):
+        openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
+        if not Path(openssl).exists():
+            self.skipTest("OpenSSL unavailable")
+        with patch.dict(os.environ, PATH=str(Path(openssl).parent) + os.pathsep + os.environ["PATH"]):
+            certificates = []
+            for i in range(2):
+                here = self.dir / str(i)
+                here.mkdir()
+                state = {"sni": "host.example"}
+                fp = runtime.certificate(here, None, state)
+                der = ssl.PEM_cert_to_DER_cert((here / "cert.pem").read_text())
+                self.assertEqual(hashlib.sha256(der).hexdigest(), fp)
+                certificates.append(here)
+        for i, here in enumerate(certificates):
+            server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            server.load_cert_chain(here / "cert.pem", here / "private.key")
+            client = ssl.create_default_context(cafile=str(certificates[0] / "cert.pem"))
+            with socket.socket() as listener:
+                listener.bind(("127.0.0.1", 0))
+                listener.listen()
+                def serve():
+                    sock, _ = listener.accept()
+                    with sock, contextlib.suppress(OSError), server.wrap_socket(sock, server_side=True):
+                        pass
+                thread = threading.Thread(target=serve, daemon=True)
+                thread.start()
+                with socket.create_connection(listener.getsockname(), 2) as conn:
+                    if i == 0:
+                        with client.wrap_socket(conn, server_hostname="host.example"):
+                            pass
+                    else:
+                        with self.assertRaises(ssl.SSLCertVerificationError):
+                            client.wrap_socket(conn, server_hostname="host.example")
+                thread.join(3)
+
+    @unittest.skipUnless(os.name == "posix" and getattr(os, "geteuid", lambda: 1)() == 0,
+                         "run as root in an isolated POSIX test container")
+    def test_publisher_and_unrelated_account_permissions(self):
+        import grp
+        import pwd
+        actors = [p for p in pwd.getpwall() if p.pw_uid != 0 and p.pw_gid != 0]
+        reader = actors[0]
+        stranger = next(p for p in actors if p.pw_gid != reader.pw_gid and p.pw_uid != reader.pw_uid)
+        self.dir.chmod(0o711)
+        public = self.dir / "public_html"
+        public.mkdir(mode=0o711)
+        private = self.dir / "private"
+        private.mkdir(mode=0o700)
+        for file in (*runtime.PRODUCTS, "private.key", "start.sh"):
+            (private / file).write_text("test")
+            (private / file).chmod(0o600)
+        with patch.object(runtime, "PUBLIC", public), patch.dict(os.environ, SERV00_WEB_GROUP=grp.getgrgid(reader.pw_gid).gr_name):
+            runtime.publish(private, {"token": "f"*48})
+        token_dir = public / runtime.SUB_DIRECTORY / ("f"*48)
+        self.assertNotEqual(token_dir.resolve().parent, public)
+        self.assertEqual(list(public.iterdir()), [public / runtime.SUB_DIRECTORY])
+        self.assertEqual((token_dir.parent / ".htaccess").read_text(), "Options -Indexes\n")
+        for p, is_reader in ((reader, True), (stranger, False)):
+            def drop():
+                os.setgroups([])
+                os.setgid(p.pw_gid)
+                os.setuid(p.pw_uid)
+            for path, access, allowed in [(private/"private.key", "r", False), (private/"start.sh", "w", False)] + [
+                (token_dir/f, "r", is_reader) for f in runtime.PRODUCTS]:
+                r = subprocess.run([sys.executable, "-c", "import sys;open(sys.argv[1],sys.argv[2]).close()",
+                                    str(path), access], preexec_fn=drop, stderr=subprocess.DEVNULL)
+                self.assertEqual(r.returncode == 0, allowed)
+
+    def test_ssh_install_stream_contains_only_reviewed_bundle_and_deploy_inputs(self):
+        import tarfile
+        bash, _, jq = shell_tools()
+        if not all(p and Path(p).is_file() for p in (bash,jq)):
+            self.skipTest("Bash or jq missing")
+        fake = self.dir / "ssh"
+        fake.write_text('#!/usr/bin/env bash\ncat > "$ARCHIVE"\nprintf "%s\\n" "$@" > "$ARGS"\n', newline="\n")
+        fake.chmod(0o700)
+        known = self.dir / "known"
+        known.write_text("fixture")
+        archive = self.dir / "archive"
+        args = self.dir / "args"
+        marker = "fixture-argo-token"
+        env = dict(os.environ, ACCOUNTS=json.dumps([{"SSH_USER":"fake","HOST":"host.test","ARGO_AUTH":marker}]),
+                   SSH_KNOWN_HOSTS_FILE=known.as_posix(), TEST_BIN=self.dir.as_posix(), JQ_BIN=Path(jq).parent.as_posix(),
+                   SCRIPT=(REPO/"kp.sh").as_posix(), ARCHIVE=archive.as_posix(), ARGS=args.as_posix())
+        code = 'if command -v cygpath >/dev/null; then TEST_BIN=$(cygpath -u "$TEST_BIN"); JQ_BIN=$(cygpath -u "$JQ_BIN"); fi; '
+        r = subprocess.run([bash, "-c", code + 'export PATH="$TEST_BIN:$JQ_BIN:$PATH"; bash "$SCRIPT" --install'],
+                           env=env, capture_output=True, timeout=20)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), b"account 1 ok")
+        self.assertNotIn(marker, args.read_text())
+        self.assertNotIn(marker.encode(), r.stderr)
+        with tarfile.open(archive) as tf:
+            self.assertEqual(set(tf.getnames()), set(runtime.BUNDLE) | {"input.json"})
+            for name in runtime.BUNDLE:
+                self.assertEqual(tf.extractfile(name).read(), (REPO/name).read_bytes())
+            data = json.load(tf.extractfile("input.json"))
+            self.assertEqual(data["ARGO_AUTH"], marker)
+            self.assertNotIn("SSH_PASS", data)
+
+    def test_native_clients_on_loopback(self):
+        """Use actual emitted protocol blocks, with a loopback mixed inbound in place of TUN."""
+        import http.server
+        sb, mh = os.getenv("SERV00_TEST_SB"), os.getenv("SERV00_TEST_MH")
+        if not sb or not mh:
+            self.skipTest("set SERV00_TEST_SB and SERV00_TEST_MH to run native clients")
+        openssl = shutil.which("openssl") or r"C:\Program Files\Git\usr\bin\openssl.exe"
+        def free():
+            with socket.socket() as sock:
+                sock.bind(("127.0.0.1", 0))
+                return sock.getsockname()[1]
+        class Target(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"generated-config-proof")
+            def log_message(self, *args):
+                pass
+        def start(binpath, *args):
+            with (self.dir / "native.log").open("a") as log:
+                return subprocess.Popen([binpath, *args], cwd=self.dir, stdout=log, stderr=subprocess.STDOUT)
+        def finish(proc):
+            proc.terminate()
+            proc.wait(timeout=8)
+        port, user = free(), "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+        pair = subprocess.check_output([sb, "generate", "reality-keypair"], text=True)
+        public_key = re.search(r"PublicKey:\s*(\S+)", pair).group(1)
+        version = subprocess.check_output([sb, "version"], text=True).splitlines()[0]
+        s = dict(ip="127.0.0.1", uuid=user, path="/fixture", reality="example.com", sni="host.example",
+                 vmess_port=port, backend=free(), vless_port=free(), hy2_port=free(), public_key=public_key,
+                 client_series="1.10" if "1.10." in version else "modern")
+        certs = []
+        for i in range(2):
+            d = self.dir / str(i)
+            d.mkdir()
+            with patch.dict(os.environ, PATH=str(Path(openssl).parent) + os.pathsep + os.environ["PATH"]):
+                fp = runtime.certificate(d, None, s)
+            certs.append(((d / "cert.pem").read_text(), fp))
+        for f in ("cert.pem", "private.key"):
+            shutil.copyfile(self.dir / "0" / f, self.dir / f)
+        runtime.emit_clients(self.dir, s, "argo.example.com", *certs[0])
+        checked = subprocess.run([sb, "check", "-c", "singbox.txt"], cwd=self.dir, capture_output=True)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        incoming = runtime.server_config(s, "unused", None)["inbounds"]
+        runtime.write_json(self.dir / "server.json", {"inbounds": [i for i in incoming if i["tag"] in
+            ("vmess-ws-in", "hysteria-in1")], "outbounds": [{"type":"direct","tag":"direct"}]})
+        server = start(sb, "run", "-c", "server.json")
+        self.addCleanup(finish, server)
+        target = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Target)
+        threading.Thread(target=target.serve_forever, daemon=True).start()
+        self.addCleanup(target.server_close)
+        self.addCleanup(target.shutdown)
+        target_url = "http://127.0.0.1:" + str(target.server_port) + "/proof"
+        for engine in ("singbox", "mihomo"):
+            for tag in ("wss", "hy2"):
+                for mode in ("valid", "wrong-cert", "revoked-user"):
+                    with self.subTest(engine=engine, tag=tag, mode=mode):
+                        state = dict(s)
+                        if mode == "revoked-user":
+                            state["uuid"] = "bbbbbbbb-aaaa-4ccc-8ddd-eeeeeeeeeeee"
+                        runtime.emit_clients(self.dir, state, "", *certs[mode == "wrong-cert"])
+                        proxy_port = free()
+                        if engine == "singbox":
+                            out = next(o for o in runtime.load(self.dir / "singbox.txt")["outbounds"] if o["tag"] == tag)
+                            conf = {"inbounds": [{"type":"mixed","listen":"127.0.0.1","listen_port":proxy_port}],
+                                    "outbounds": [out]}
+                            runtime.write_json(self.dir / "client.json", conf)
+                            client = start(sb, "run", "-c", "client.json")
+                        else:
+                            conf = runtime.load(self.dir / "clashmeta.txt")
+                            conf.update({"mixed-port":proxy_port,"port":0,"proxies":[o for o in conf["proxies"] if o["name"] == tag],
+                                         "proxy-groups":[],"rules":["MATCH," + tag]})
+                            runtime.write_json(self.dir / "client.yaml", conf)
+                            client = start(mh, "-d", str(self.dir), "-f", str(self.dir / "client.yaml"))
+                        try:
+                            deadline = time.monotonic() + 6
+                            while time.monotonic() < deadline:
+                                if client.poll() is not None:
+                                    self.fail("native client exited before accepting connections")
+                                try:
+                                    sock = socket.create_connection(("127.0.0.1", proxy_port), .2)
+                                    break
+                                except OSError:
+                                    time.sleep(.08)
+                            else:
+                                self.fail("native client did not start")
+                            data = b""
+                            with sock, contextlib.suppress(OSError):
+                                sock.settimeout(2)
+                                sock.sendall(f"GET {target_url} HTTP/1.0\r\nHost: 127.0.0.1:{target.server_port}\r\nConnection: close\r\n\r\n".encode())
+                                while part := sock.recv(1024):
+                                    data += part
+                            self.assertEqual(b"generated-config-proof" in data, mode == "valid",
+                                             (self.dir / "native.log").read_text(errors="replace")[-2200:])
+                        finally:
+                            finish(client)
+
+    def test_known_hosts_with_real_ssh_client(self):
+        try:
+            import paramiko
+        except ImportError:
+            self.skipTest("install Paramiko for the isolated SSH server test")
+        import logging
+        transport_log = logging.getLogger("paramiko.transport")
+        level = transport_log.level
+        transport_log.setLevel(logging.CRITICAL)
+        self.addCleanup(transport_log.setLevel, level)
+        bash, ssh, jq = shell_tools()
+        if not all(p and Path(p).is_file() for p in (bash, ssh, jq)):
+            self.skipTest("Bash, OpenSSH or jq unavailable")
+        host_key = paramiko.RSAKey.generate(2048)
+        changed = paramiko.RSAKey.generate(2048)
+        client_key = paramiko.RSAKey.generate(2048)
+        key = self.dir / "client"
+        client_key.write_private_key_file(str(key))
+        ssh_exec = Path(ssh).as_posix()
+        endpoints = []
+        class Server(paramiko.ServerInterface):
+            def check_auth_publickey(self, username, key):
+                return paramiko.AUTH_SUCCESSFUL if key == client_key else paramiko.AUTH_FAILED
+            def get_allowed_auths(self, _):
+                return "publickey"
+            def check_channel_request(self, kind, _):
+                return paramiko.OPEN_SUCCEEDED
+            def check_channel_exec_request(self, channel, command):
+                endpoints.append(command)
+                return True
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            listener.listen()
+            num = listener.getsockname()[1]
+            wrapper = self.dir / "ssh"
+            wrapper.write_text(f'#!/usr/bin/env bash\nexec "{ssh_exec}" -i "{key.as_posix()}" -p {num} "$@"\n',
+                               newline="\n")
+            wrapper.chmod(0o700)
+            known = self.dir / "known_hosts"
+            for mode in ("match", "unknown", "changed"):
+                saved = changed if mode == "changed" else host_key
+                alias = "elsewhere.example" if mode == "unknown" else "127.0.0.1"
+                known.write_text(f"[{alias}]:{num} {saved.get_name()} {saved.get_base64()}\n")
+                def serve():
+                    conn, _ = listener.accept()
+                    with conn, paramiko.Transport(conn) as transport:
+                        transport.add_server_key(host_key)
+                        with contextlib.suppress(EOFError, OSError, paramiko.SSHException):
+                            transport.start_server(server=Server())
+                            chan = transport.accept(3)
+                            if chan:
+                                time.sleep(.15)
+                                chan.send_exit_status(0)
+                                chan.close()
+                t = threading.Thread(target=serve, daemon=True)
+                t.start()
+                env = dict(os.environ, ACCOUNTS='[{"SSH_USER":"fake-user","HOST":"127.0.0.1"}]',
+                           SSH_KNOWN_HOSTS_FILE=known.as_posix(), TEST_BIN=self.dir.as_posix(),
+                           JQ_BIN=Path(jq).parent.as_posix(), SCRIPT=(REPO / "kp.sh").as_posix())
+                setup = 'if command -v cygpath >/dev/null; then TEST_BIN=$(cygpath -u "$TEST_BIN"); JQ_BIN=$(cygpath -u "$JQ_BIN"); fi; '
+                r = subprocess.run([bash, "-c", setup + 'export PATH="$TEST_BIN:$JQ_BIN:$PATH"; bash "$SCRIPT" --login'],
+                                   capture_output=True, timeout=20, env=env)
+                self.assertEqual(r.returncode == 0, mode == "match", (r.stdout, r.stderr))
+                self.assertNotIn(b"fake-user", r.stdout + r.stderr)
+                self.assertIn(("account 1 " + ("ok" if mode == "match" else "failed")).encode(), r.stdout + r.stderr)
+                t.join(4)
+        self.assertEqual(endpoints, [b"exit 0"])
+
+
+if __name__ == "__main__":
+    unittest.main()
